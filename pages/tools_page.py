@@ -130,33 +130,9 @@ class ToolsPage(BasePage):
                 w.deleteLater()
         self._build()
 
-    # ── 消息转发给所有已打开的工具 ──────────────
+    # ── 消息：工具已由 App 单通道 dispatch；此处不再二次转发 ──
     def on_message(self, msg):
-        seen: set[int] = set()
-
-        def _dispatch(win):
-            if not win or id(win) in seen:
-                return
-            seen.add(id(win))
-            if not hasattr(win, "process_message"):
-                return
-            try:
-                win.process_message(msg)
-            except Exception as e:
-                tool_name = type(win).__name__
-                logger.error("工具 %s 消息处理异常: %s", tool_name, e, exc_info=True)
-
-        for win in self._open_wins.values():
-            _dispatch(win)
-
-        from tools.memo_tool import MemoTool
-        from tools.danmu_tool import DanmuTool
-        from tools.overtime_tool import OvertimeTool
-
-        for tool_cls in (MemoTool, DanmuTool, OvertimeTool):
-            inst = getattr(tool_cls, "_instance", None)
-            if inst is not None:
-                _dispatch(inst)
+        return
 
 
 class ToolsSettings(BaseSetting):

@@ -20,8 +20,6 @@ from typing import Callable, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from util.log_util import get_listener_logger, on_connect_success
-from util.models import CONTROL_STATUS_FINISH, ControlMessage
-from listener.LiveProtobuf import try_parse_frame
 
 logger = get_listener_logger(4)
 
@@ -53,29 +51,28 @@ _HEALTH_TIMEOUT = 3.0
 _HEALTH_BUFFER = 5.0
 _HEALTH_POLL_INTERVAL = 0.25
 
-_IPC_SESSION: dict = {"writer": None, "loop": None, "user_stop": False}
+_IPC_SESSION: dict = {"writer": None, "loop": None, "user_stop": False, "shutdown": None}
 
 
 def request_listener_stop() -> bool:
-    """请求线路 4 listener 优雅退出（关闭 IPC 连接，不波及 main）。"""
+    """请求线路 4 挂起任务退出（core 负责听帧）。"""
     _IPC_SESSION["user_stop"] = True
     loop = _IPC_SESSION.get("loop")
-    writer = _IPC_SESSION.get("writer")
-    if writer is None and loop is None:
-        return False
-
-    def _close_writer() -> None:
-        if writer is not None and not writer.is_closing():
-            writer.close()
-
-    if loop is not None and loop.is_running():
-        loop.call_soon_threadsafe(_close_writer)
-    elif writer is not None and not writer.is_closing():
+    shutdown = _IPC_SESSION.get("shutdown")
+    if loop is not None and shutdown is not None and loop.is_running():
         try:
-            writer.close()
+            asyncio.run_coroutine_threadsafe(shutdown(), loop)
+            return True
         except Exception:
             pass
-    return True
+    writer = _IPC_SESSION.get("writer")
+    if writer is not None and not writer.is_closing():
+        try:
+            writer.close()
+            return True
+        except Exception:
+            pass
+    return loop is not None
 
 _AIO_DIR = Path.home() / ".liveaio"
 _LEGACY_DIR = Path.home() / ".livehelper"
@@ -1057,163 +1054,22 @@ async def start_listener(
             on_status(False)
         return
 
-    on_air, qerr = await query_live_on_air()
-    if qerr:
-        logger.error(f"proxy_shell未启动或异常 ({qerr})")
-        if on_status:
-            on_status(False)
-        return
-    if not on_air:
-        logger.warning("直播间未开播")
-        if on_status:
-            on_status(False)
-        return
-
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", IPC_PORT),
-            timeout=10,
-        )
-    except Exception as e:
-        logger.error(f"proxy_shell未启动或异常 (IPC 连接失败: {e})")
-        if on_status:
-            on_status(False)
-        return
-
-    # Send auth token for IPC handshake.
-    try:
-        token = _ipc_token_path().read_text(encoding="ascii").strip()
-        writer.write(token.encode("ascii") + b"\n")
-        await writer.drain()
-    except Exception as e:
-        logger.error(f"发送 IPC 令牌失败: {e}")
-        writer.close()
-        if on_status:
-            on_status(False)
-        return
-
-    logger.info(f"已连接 proxy_shell IPC（端口 {IPC_PORT}），等待 WebSocket…")
-
+    # 听帧/解析已迁到 liveaio-core（shellipc）；此处只保证伴侣+proxy_shell 就绪后挂起。
+    logger.info("proxy_shell 就绪；听帧由 core 接管（勿再占 IPC 流）")
     _IPC_SESSION["user_stop"] = False
     _IPC_SESSION["loop"] = asyncio.get_running_loop()
-    _IPC_SESSION["writer"] = writer
+    stop_ev = asyncio.Event()
 
-    ws_active = False
-    connected = False
+    async def _shutdown():
+        stop_ev.set()
 
-    async def _read_packet(timeout: float | None) -> bytes:
-        if timeout is not None:
-            hdr = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
-        else:
-            hdr = await reader.readexactly(4)
-        length = struct.unpack(">I", hdr)[0]
-        return await reader.readexactly(length)
-
-    async def _recv() -> None:
-        nonlocal ws_active
-        live_confirmed = False
-        loop = asyncio.get_running_loop()
-
-        def _confirm_live() -> None:
-            nonlocal live_confirmed, connected
-            ws_active = True
-            if live_confirmed:
-                return
-            live_confirmed = True
-            connected = True
-            on_connect_success("listener4")
-            logger.info("✅ 直播间正在直播（enter.status=2）")
-            if on_status:
-                on_status(True)
-
-        class _WsDisconnected(Exception):
-            pass
-
-        def _handle_live_off() -> None:
-            nonlocal ws_active, connected, live_confirmed
-            ws_active = False
-            notify = connected or live_confirmed
-            connected = False
-            live_confirmed = False
-            logger.warning("直播间已下播")
-            if notify and on_status:
-                on_status(False)
-            raise _WsDisconnected()
-
-        def _handle_data(data: bytes) -> None:
-            nonlocal ws_active
-            if data.startswith(_IPC_CTRL_PREFIX):
-                ctrl = data[len(_IPC_CTRL_PREFIX):].strip()
-                if ctrl == _IPC_CTRL_LIVE_ON:
-                    # proxy_shell 在 room/enter status==2 时推送
-                    _confirm_live()
-                elif ctrl == _IPC_CTRL_LIVE_OFF:
-                    _handle_live_off()
-                elif ctrl == _IPC_CTRL_WS_OPEN:
-                    logger.info("IPC: WebSocket 已建立，等待进房开播状态…")
-                    ws_active = True
-                elif ctrl == _IPC_CTRL_WS_DATA:
-                    # 兼容旧控制字：不再用 WS 首包确认开播
-                    ws_active = True
-                elif ctrl == _IPC_CTRL_WS_DOWN:
-                    logger.warning("IPC: WebSocket 已断开")
-                    _handle_live_off()
-                return
-
-            _, msgs = try_parse_frame(data)
-            if not live_confirmed:
-                return
-            for msg in msgs:
-                if isinstance(msg, ControlMessage) and msg.status == CONTROL_STATUS_FINISH:
-                    logger.info("收到下播控制消息，结束监听")
-                    _handle_live_off()
-                    return
-                try:
-                    callback(msg)
-                except Exception as e:
-                    logger.debug(f"回调异常: {e}")
-
-        # 等待 room/enter status=2（经 LIVE_ON_AIR 推送）
-        deadline = loop.time() + _ENTER_TIMEOUT
-        while not live_confirmed:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError()
-            data = await _read_packet(remaining)
-            try:
-                _handle_data(data)
-            except _WsDisconnected:
-                return
-
-        # 持续收消息
-        while True:
-            data = await _read_packet(None)
-            try:
-                _handle_data(data)
-            except _WsDisconnected:
-                return
-
+    _IPC_SESSION["shutdown"] = _shutdown
     try:
-        await _recv()
-    except asyncio.TimeoutError:
-        logger.warning("直播间未开播（未收到 enter.status=2）")
-    except asyncio.IncompleteReadError:
-        if ws_active:
-            logger.warning("IPC 连接断开（直播通道已中断）")
-        else:
-            logger.info("IPC 连接已断开")
+        await stop_ev.wait()
     except asyncio.CancelledError:
         pass
-    except Exception as e:
-        logger.error(f"IPC 接收异常: {e}")
     finally:
-        _IPC_SESSION["writer"] = None
+        _IPC_SESSION["shutdown"] = None
         _IPC_SESSION["loop"] = None
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
-        if on_status and connected and not _IPC_SESSION["user_stop"]:
-            on_status(False)
+        _IPC_SESSION["writer"] = None
         _IPC_SESSION["user_stop"] = False

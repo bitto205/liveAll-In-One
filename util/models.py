@@ -1,4 +1,8 @@
-"""直播间消息数据类型（基于当前抖音 Webcast 实际样本）"""
+"""直播间消息数据类型（基于当前抖音 Webcast 实际样本）。
+
+与 Go core 字段对齐；改字段必须同步：
+  core/CONTRACT.md、protocol_examples.md、internal/listener/parse、bridge/message_codec
+"""
 
 from dataclasses import dataclass, field
 from typing import Any, Literal

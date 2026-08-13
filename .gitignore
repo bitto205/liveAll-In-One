@@ -11,6 +11,11 @@ msg_log/
 config.json
 browsers/
 build/
+core/dist/
+core/tools/
+*.exe
+!listener/proxy_shell.exe
+
 0000.py
 ws_dump.py
 ws_samples/

@@ -37,9 +37,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from playwright.async_api import async_playwright
 
 from util.playwright_bootstrap import launch_chromium
-from listener.LiveProtobuf import try_parse_frame
 from util.log_util import get_listener_logger, make_msg_logger, on_connect_success
-from util.models import CONTROL_STATUS_FINISH, ControlMessage, LiveMessage, is_living_enter_status
+from util.models import LiveMessage, is_living_enter_status
 from util.room_enter import (
     describe_enter_status,
     extract_room_status_from_page,
@@ -232,22 +231,11 @@ async def _run(
                 return
 
             def on_frame(raw: bytes):
-                _, msgs = try_parse_frame(raw)
                 if not _state["live_confirmed"]:
                     return
-                for msg in msgs:
-                    try:
-                        if isinstance(msg, ControlMessage) and msg.status == CONTROL_STATUS_FINISH:
-                            if not _state["stopped"]:
-                                asyncio.ensure_future(
-                                    _disconnect_clean("收到下播控制消息，结束监听")
-                                )
-                            return
-                        if msg_logger:
-                            msg_logger.info(msg)
-                        callback(msg)
-                    except Exception as e:
-                        logger.error(f"回调异常: {e}")
+                # 解析已迁到 Go core：只喂原始帧
+                from listener.core_feed import push_frame
+                push_frame(raw)
 
             def on_ws_close():
                 if _state["stopped"]:

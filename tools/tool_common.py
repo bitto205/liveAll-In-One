@@ -1,4 +1,4 @@
-"""工具模块公共：单例守卫、礼物图标/名称缓存、应用退出。"""
+"""工具模块公共：单例、礼物图标、退出、按 iface 派发 core 事件。"""
 from __future__ import annotations
 
 import os
@@ -7,6 +7,7 @@ from typing import Callable
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 
+from tools.iface import CORE_TOOL_EVENT_OPS
 from util.log_util import get_tagged_logger
 from util.paths import gift_dir
 
@@ -80,21 +81,91 @@ def shutdown_all_tools() -> None:
         logger.info("已关闭 %d 个工具窗口", closed)
 
 
-def _force_close_all_tool_windows() -> int:
+def _iter_loaded_tool_instances():
+    """只遍历已 import 且已实例化的工具。"""
+    import sys
     from tools import get_tools
 
-    closed = 0
     for meta in get_tools():
-        inst = getattr(meta.cls, "_instance", None)
-        if inst is None:
+        mod = sys.modules.get(meta.module_name)
+        if mod is None:
             continue
+        cls = getattr(mod, meta.attr_name, None)
+        if cls is None:
+            continue
+        inst = getattr(cls, "_instance", None)
+        if inst is not None:
+            yield meta, cls, inst
+
+
+def any_tool_ui_visible() -> bool:
+    """是否仍有 Qt 工具窗/悬浮窗需要 UI 进程（UI 需求例外）。"""
+    for _meta, _cls, inst in _iter_loaded_tool_instances():
+        if getattr(inst, "isVisible", lambda: False)():
+            return True
+        for attr in ("_danmu_win", "_overtime_win", "_user_time_win"):
+            sub = getattr(inst, attr, None)
+            if sub is not None and getattr(sub, "isVisible", lambda: False)():
+                return True
+    return False
+
+
+def dispatch_status_to_open_tools(connected: bool) -> int:
+    n = 0
+    for _meta, _cls, inst in _iter_loaded_tool_instances():
+        fn = getattr(inst, "on_status_change", None)
+        if not callable(fn):
+            continue
+        try:
+            fn(connected)
+            n += 1
+        except Exception as e:
+            logger.error("工具 %s 状态处理异常: %s", type(inst).__name__, e, exc_info=True)
+    return n
+
+
+def dispatch_core_tick(env: dict) -> int:
+    """Core op=tick → ToolUI.on_core_tick。"""
+    n = 0
+    for _meta, _cls, inst in _iter_loaded_tool_instances():
+        fn = getattr(inst, "on_core_tick", None)
+        if not callable(fn):
+            continue
+        try:
+            fn(env)
+            n += 1
+        except Exception as e:
+            logger.error("工具 %s tick 异常: %s", type(inst).__name__, e, exc_info=True)
+    return n
+
+
+def dispatch_core_tool_event(env: dict) -> int:
+    """Core op ∈ {ledger, danmu.show, memo.item} → ToolUI.on_core_event。"""
+    if not isinstance(env, dict) or env.get("op") not in CORE_TOOL_EVENT_OPS:
+        return 0
+    n = 0
+    for _meta, _cls, inst in _iter_loaded_tool_instances():
+        fn = getattr(inst, "on_core_event", None)
+        if not callable(fn):
+            continue
+        try:
+            fn(env)
+            n += 1
+        except Exception as e:
+            logger.error("工具 %s core 事件异常: %s", type(inst).__name__, e, exc_info=True)
+    return n
+
+
+def _force_close_all_tool_windows() -> int:
+    closed = 0
+    for meta, cls, inst in list(_iter_loaded_tool_instances()):
         cleanup = getattr(inst, "_cleanup_for_release", None)
         for attr in ("_danmu_win", "_overtime_win", "_user_time_win"):
             sub = getattr(inst, attr, None)
             if sub is not None:
                 sub.close()
         inst.close()
-        release_tool_singleton(meta.cls, cleanup=cleanup)
+        release_tool_singleton(cls, cleanup=cleanup)
         unregister_tool_from_page(meta.name)
         closed += 1
     return closed
@@ -142,7 +213,6 @@ def load_gift_pixmap(gift_name: str, side: int, *, tool_id: str = "overtime") ->
     if src is None or src.isNull():
         src = QPixmap(path)
         if src.isNull():
-            # 部分 webp：Pillow 解码一次，按 DPR=1 缓存源图，后续 Qt 缩放
             from resources.skin.media import load_still
             still = load_still(path, max(side, 168), dpr=1.0, scale="smooth")
             if still.pixmap.isNull():

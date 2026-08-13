@@ -1,63 +1,97 @@
 """
-tools/__init__.py — 工具注册表
+tools/__init__.py — 工具注册表（懒加载）
 
-新增工具只需两步：
-  1. 在 tools/ 下新建 xxx_tool.py，用 @register_tool 装饰工具类
-  2. 在这里加一行 import
+契约：core/CONTRACT.md；UI 接口：tools/iface.ToolUI。
+业务过滤/倒计时在 Go；本包只注册 Qt 工具窗。
 
-tools_page.py 读 get_tools() 自动渲染工具卡片，不需要改其他任何地方。
+新增工具：
+  1. 实现 ToolUI（on_core_event / on_core_tick / on_status_change）
+  2. 在 tools/ 下新建 xxx_tool.py，用 @register_tool
+  3. 在下方 _CATALOG 加一行（不要在本文件顶层 import 工具模块）
+  4. 若有新 core 事件，同步 CONTRACT + ops.go + bridge/protocol
 """
-import sys, os
+from __future__ import annotations
+
+import importlib
+import sys
+import os
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# module, attr, name, desc, icon, order — 打开时才 import module
+_CATALOG: list[tuple[str, str, str, str, str, int]] = [
+    ("tools.memo_tool", "MemoTool", "备忘录",
+     "将礼物、关注、点赞记录为可消除的列表条目", "📋", 0),
+    ("tools.danmu_tool", "DanmuTool", "弹幕机",
+     "透明悬浮弹幕显示窗口", "💬", 1),
+    ("tools.overtime_tool", "OvertimeTool", "加班机",
+     "透明悬浮加班显示窗口", "⏱", 2),
+]
 
-# ─────────────────────────────────────────────
-# 注册表
-# ─────────────────────────────────────────────
+
 class _ToolMeta:
-    def __init__(self, cls: type, name: str, desc: str,
-                 icon: str, order: int):
-        self.cls   = cls
-        self.name  = name
-        self.desc  = desc
-        self.icon  = icon
+    def __init__(
+        self,
+        module: str,
+        attr: str,
+        name: str,
+        desc: str,
+        icon: str,
+        order: int,
+    ):
+        self._module = module
+        self._attr = attr
+        self.name = name
+        self.desc = desc
+        self.icon = icon
         self.order = order
+        self._cls: type | None = None
+
+    @property
+    def cls(self) -> type:
+        """首次访问时才 import 工具模块。"""
+        if self._cls is None:
+            mod = importlib.import_module(self._module)
+            self._cls = getattr(mod, self._attr)
+        return self._cls
+
+    @property
+    def module_name(self) -> str:
+        return self._module
+
+    @property
+    def attr_name(self) -> str:
+        return self._attr
 
 
-_REGISTRY: list[_ToolMeta] = []
+_METAS: list[_ToolMeta] | None = None
 
 
 def register_tool(name: str, desc: str = "",
                   icon: str = "🔧", order: int = 99):
-    """
-    工具注册装饰器。
-
-    用法::
-
-        @register_tool(name="备忘录", desc="记录直播事件", icon="📋", order=0)
-        class MemoTool(QMainWindow): ...
-    """
+    """装饰器：保留兼容；真实目录在 _CATALOG，避免顶层 import。"""
     def decorator(cls):
-        _REGISTRY.append(_ToolMeta(cls, name, desc, icon, order))
+        cls._tool_name = name
+        cls._tool_desc = desc
+        cls._tool_icon = icon
+        cls._tool_order = order
         return cls
     return decorator
 
 
 def get_tools() -> list[_ToolMeta]:
-    """按 order 排序后返回所有已注册工具。"""
-    return sorted(_REGISTRY, key=lambda t: t.order)
+    """按 order 返回工具元数据（不触发工具模块 import）。"""
+    global _METAS
+    if _METAS is None:
+        _METAS = [_ToolMeta(*row) for row in _CATALOG]
+    return sorted(_METAS, key=lambda t: t.order)
 
 
-# ─────────────────────────────────────────────
-# 注册所有工具（在这里 import 触发 @register_tool）
-# ─────────────────────────────────────────────
-from tools.memo_tool     import MemoTool     # noqa
-from tools.danmu_tool    import DanmuTool    # noqa
-from tools.overtime_tool import OvertimeTool # noqa
+def shutdown_all_tools() -> None:
+    from tools.tool_common import shutdown_all_tools as _shutdown
+    _shutdown()
 
-from tools.tool_common import shutdown_all_tools  # noqa: E402
 
 __all__ = [
-    "MemoTool", "DanmuTool", "OvertimeTool",
     "get_tools", "register_tool", "shutdown_all_tools",
 ]

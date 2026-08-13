@@ -18,7 +18,6 @@ from PySide6.QtGui  import QColor
 import util.theme as _theme
 import config as _cfg
 from util.widgets import ThemedToggle
-from util.models import GiftMessage, FollowMessage, LikeMessage, FansclubMessage
 
 
 # ─────────────────────────────────────────────
@@ -68,18 +67,6 @@ def _qss():
 
 
 # _Toggle 已移至 widgets.ThemedToggle，下面直接使用
-
-
-def _gift_diamonds(msg: GiftMessage) -> int | None:
-    from resources.gift.gift_info import get_diamonds, all_gifts
-    d = get_diamonds(msg.gift)
-    if d is not None:
-        return d
-    if msg.gift_id:
-        for info in all_gifts().values():
-            if info.get("gift_id") == msg.gift_id:
-                return info.get("price")
-    return None
 
 
 def _row(label_text: str, widget: QWidget) -> QHBoxLayout:
@@ -167,6 +154,13 @@ class _SettingsTab(QWidget):
         super().__init__(parent)
         self._build()
 
+    def _push_memo_core(self) -> None:
+        try:
+            from bridge.tool_sync import push_memo_settings
+            push_memo_settings()
+        except Exception:
+            pass
+
     def _build(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -178,25 +172,30 @@ class _SettingsTab(QWidget):
         lay.setContentsMargins(24, 20, 24, 20)
         lay.setSpacing(12)
 
+        def _memo_toggle(key: str, default: bool = True) -> ThemedToggle:
+            t = ThemedToggle(key, default=default)
+            t.toggled.connect(lambda _v: self._push_memo_core())
+            return t
+
         # ── 礼物 ──
         lay.addWidget(self._section(
             "礼物",
             [
-                ("启用", ThemedToggle(_K["gift_on"])),
-                ("叠加", ThemedToggle(_K["gift_stack"])),
+                ("启用", _memo_toggle(_K["gift_on"])),
+                ("叠加", _memo_toggle(_K["gift_stack"])),
                 ("最低钻石数", self._make_diamond_input()),
             ]
         ))
 
         # ── 关注 ──
         lay.addWidget(self._section("关注", [
-            ("启用", ThemedToggle(_K["follow_on"])),
+            ("启用", _memo_toggle(_K["follow_on"])),
         ]))
 
         # ── 点赞 ──
         lay.addWidget(self._section("点赞", [
-            ("启用", ThemedToggle(_K["like_on"])),
-            ("叠加", ThemedToggle(_K["like_stack"])),
+            ("启用", _memo_toggle(_K["like_on"])),
+            ("叠加", _memo_toggle(_K["like_stack"])),
         ]))
 
         # ── 自定义 ──
@@ -274,6 +273,11 @@ class _SettingsTab(QWidget):
                 val = 0
             inp.setText(str(val))
             _cfg.set(_K["gift_min_dia"], val)
+            try:
+                from bridge.tool_sync import push_memo_settings
+                push_memo_settings()
+            except Exception:
+                pass
 
         inp.editingFinished.connect(_save)
         row.addWidget(inp)
@@ -376,15 +380,13 @@ from tools.tool_common import ToolSingleton
 @register_tool(name="备忘录", desc="将礼物、关注、点赞记录为可消除的列表条目",
                icon="📋", order=0)
 class MemoTool(ToolSingleton, QMainWindow):
-    """
-    备忘录工具窗口。
-    外部调用 process_message(msg) 传入直播消息。
-    """
+    """备忘录 UI：只消费 core 的 memo.item（ToolUI）。"""
 
     def __init__(self, parent=None):
         if not ToolSingleton.guard_init(self):
             return
         super().__init__(parent, Qt.Window)
+        self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowTitle("备忘录")
         self.setMinimumSize(380, 560)
         self.resize(420, 620)
@@ -446,76 +448,33 @@ class MemoTool(ToolSingleton, QMainWindow):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
-    # ── 消息处理 ──────────────────────────────
-    def process_message(self, msg):
-        if isinstance(msg, GiftMessage):
-            self._handle_gift(msg)
-        elif isinstance(msg, FollowMessage):
-            self._handle_follow(msg)
-        elif isinstance(msg, LikeMessage):
-            self._handle_like(msg)
-        elif isinstance(msg, FansclubMessage):
-            self._handle_fansclub(msg)
-
-    def _handle_gift(self, msg):
-        if not _cfg.get(_K["gift_on"], True):
+    # ── ToolUI（业务在 Go；见 tools/iface + core/CONTRACT.md）──
+    def on_core_event(self, env: dict) -> None:
+        if env.get("op") != "memo.item":
             return
-
-        # 钻石过滤
-        min_dia = _cfg.get(_K["gift_min_dia"], 0)
-        if min_dia > 0:
-            diamonds = _gift_diamonds(msg)
-            if diamonds is not None and diamonds < min_dia:
-                return
-
-        stack = _cfg.get(_K["gift_stack"], True)
-        key   = f"gift:{msg.user}:{msg.gift}"
-        fmt   = f"[{msg.user}] 送了 {{count}} 个 {msg.gift}"
-        text  = fmt.format(count=msg.count)
-
+        text = str(env.get("text") or "")
+        user = str(env.get("user") or "")
+        kind = str(env.get("kind") or "")
+        if not text and user:
+            text = f"[{user}] {kind}"
+        key = str(env.get("stack_key") or "custom")
+        stack = bool(env.get("stack"))
         if stack and key in self._item_map:
             w = self._item_map[key]
             if w.parent():
-                w.add_count(msg.count)
+                w.add_count(1)
                 return
-            else:
-                del self._item_map[key]
-
-        item = _MemoItem(text, stackable=stack, count=msg.count, fmt=fmt)
-        self._item_map[key] = item
+            del self._item_map[key]
+        item = _MemoItem(text if text.startswith("[") else f"[{user}] {text}", stackable=stack, count=1)
+        if stack:
+            self._item_map[key] = item
         self._main_tab.add_item(item)
 
-    def _handle_follow(self, msg):
-        if not _cfg.get(_K["follow_on"], True):
-            return
-        text = f"[{msg.user}] 关注了"
-        self._main_tab.add_item(_MemoItem(text))
+    def on_core_tick(self, env: dict) -> None:
+        return
 
-    def _handle_fansclub(self, msg):
-        if not _cfg.get(_K["follow_on"], True):   # 和关注共用同一开关
-            return
-        text = f"[{msg.user}] 加入了粉丝团"
-        self._main_tab.add_item(_MemoItem(text))
-
-    def _handle_like(self, msg):
-        if not _cfg.get(_K["like_on"], True):
-            return
-        stack = _cfg.get(_K["like_stack"], True)
-        key   = f"like:{msg.user}"
-        fmt   = f"[{msg.user}] 点了 {{count}} 个赞"
-        text  = fmt.format(count=msg.count)
-
-        if stack and key in self._item_map:
-            w = self._item_map[key]
-            if w.parent():
-                w.add_count(msg.count)
-                return
-            else:
-                del self._item_map[key]
-
-        item = _MemoItem(text, stackable=stack, count=msg.count, fmt=fmt)
-        self._item_map[key] = item
-        self._main_tab.add_item(item)
+    def on_status_change(self, connected: bool) -> None:
+        return
 
     def _add_item(self, key: str, text: str):
         """自定义条目（由 _SettingsTab 调用）。"""

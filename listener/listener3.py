@@ -16,9 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if TYPE_CHECKING:
     from mitmproxy import http
 
-from listener.LiveProtobuf import try_parse_frame
 from util.log_util import get_listener_logger, on_connect_success, ensure_console_logging
-from util.models import CONTROL_STATUS_FINISH, ControlMessage, is_living_enter_status
+from util.models import is_living_enter_status
 from util.room_enter import describe_enter_status, is_room_enter_url, parse_room_enter_payload
 
 logger = get_listener_logger(3)
@@ -246,18 +245,12 @@ class _DouyinWsAddon:
         if message.from_client:
             return
 
-        _, msgs = try_parse_frame(message.content)
         if not self._live_confirmed:
             return
 
-        for msg in msgs:
-            if isinstance(msg, ControlMessage) and msg.status == CONTROL_STATUS_FINISH:
-                self._end_session("收到下播控制消息，结束监听")
-                return
-            try:
-                self.callback(msg)
-            except Exception as e:
-                logger.error(f"回调异常: {e}")
+        # 解析在 Go：只喂原始帧
+        from listener.core_feed import push_frame
+        push_frame(message.content)
 
     def websocket_end(self, flow: http.HTTPFlow):
         if not _is_webcast_flow(flow):

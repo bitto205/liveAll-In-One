@@ -225,6 +225,11 @@ def _next_unused_gift(used: set[str], *, prefer_index: int) -> str:
 
 def save_settings(data: dict) -> None:
     _cfg.set(CFG_KEY, copy.deepcopy(data))
+    try:
+        from bridge.tool_sync import push_overtime_settings
+        push_overtime_settings(data)
+    except Exception:
+        pass
 
 
 def _clamp_int(v, lo: int, hi: int) -> int:
@@ -2312,7 +2317,7 @@ class OvertimeWindow(OverlayFrameMixin, QMainWindow):
     def __init__(self, parent=None):
         super().__init__(
             parent,
-            Qt.FramelessWindowHint,
+            Qt.FramelessWindowHint | Qt.Window,
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_QuitOnClose, False)
@@ -2337,6 +2342,7 @@ class OvertimeWindow(OverlayFrameMixin, QMainWindow):
         self._tick = QTimer(self)
         self._tick.setInterval(1000)
         self._tick.timeout.connect(self._on_tick)
+        self._core_driven = True
 
         self._setup_anim()
         _theme.on_change(lambda _: self._root.update())
@@ -2423,7 +2429,10 @@ class OvertimeWindow(OverlayFrameMixin, QMainWindow):
         self._root.block.apply_settings(settings)
         self._refresh_timer_display()
         self._root.layout_block()
-        if self.isVisible():
+        if self._core_driven:
+            if self._tick.isActive():
+                self._tick.stop()
+        elif self.isVisible():
             self._tick.start()
         else:
             self._tick.stop()
@@ -2433,7 +2442,17 @@ class OvertimeWindow(OverlayFrameMixin, QMainWindow):
         for lbl in self._root.block.findChildren(OvertimeTextLabel):
             lbl.refresh_skin()
 
+    def apply_core_remaining(self, seconds: int) -> None:
+        """Go core tick：以 core 剩余秒为准，本地停表。"""
+        self._core_driven = True
+        if self._tick.isActive():
+            self._tick.stop()
+        self._remaining_seconds = max(0, int(seconds))
+        self._refresh_timer_display()
+
     def handle_gift(self, msg) -> bool:
+        if self._core_driven:
+            return False
         rules = self._settings.get("rules", _DEFAULT_RULES)
         rule = find_rule_for_gift(rules, msg.gift)
         if not rule:
@@ -2846,7 +2865,11 @@ class OvertimeTool(ToolSingleton, QMainWindow):
         from util.models import GiftMessage
         if not isinstance(msg, GiftMessage):
             return
-        self.process_message(msg)
+        try:
+            from bridge.tool_sync import sim_overtime_gift
+            sim_overtime_gift(msg.gift, msg.count, user=msg.user or "sim")
+        except Exception:
+            pass
 
     def _toggle_overtime_win(self):
         if self._overtime_win_pending:
@@ -2918,14 +2941,20 @@ class OvertimeTool(ToolSingleton, QMainWindow):
                 QPushButton:hover {{ background: {C['hover']}; }}
             """)
 
-    def process_message(self, msg):
-        from util.models import GiftMessage
-        if not isinstance(msg, GiftMessage):
-            return
+    # ── ToolUI（业务在 Go；见 tools/iface + core/CONTRACT.md）──
+    def on_core_tick(self, env: dict) -> None:
         win = self._overtime_win
         if win is None or not win.isVisible():
             return
-        win.handle_gift(msg)
+        win.apply_core_remaining(int(env.get("remaining_seconds") or 0))
+
+    def on_core_event(self, env: dict) -> None:
+        if env.get("op") != "ledger":
+            return
+        return
+
+    def on_status_change(self, connected: bool) -> None:
+        return
 
     def _on_overlay_closed(self):
         self._refresh_btn()

@@ -119,7 +119,7 @@ class SystemSettings(BaseSetting):
 
         row2 = QHBoxLayout()
         row2.setSpacing(12)
-        lbl2 = QLabel("关闭时缩小到托盘")
+        lbl2 = QLabel("关闭主窗退出界面（系统托盘在内核）")
         lbl2.setStyleSheet("background: transparent; font-size: 14px;")
         row2.addWidget(lbl2)
         row2.addStretch()
@@ -129,6 +129,7 @@ class SystemSettings(BaseSetting):
         row2.addWidget(self._tray_toggle)
 
         inner2.addLayout(row2)
+
         lay.addWidget(card2)
 
         lay.addStretch()

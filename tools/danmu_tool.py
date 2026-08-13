@@ -324,7 +324,7 @@ class DanmuWindow(OverlayFrameMixin, QMainWindow):
     def __init__(self, parent=None):
         super().__init__(
             parent,
-            Qt.FramelessWindowHint,
+            Qt.FramelessWindowHint | Qt.Window,
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_QuitOnClose, False)
@@ -337,7 +337,7 @@ class DanmuWindow(OverlayFrameMixin, QMainWindow):
         self._shown         = True    # 初始展开
         self._anim_r        = 0.0
         self._first_show    = True    # 第一次 show 后初始化到展开状态
-        self._active_bubbles: list[_DanmuBubble] = []
+        self._active_bubbles: list[QWidget] = []
         self._pending_msgs: list[tuple] = []
 
         self._root = _DanmuRoot(self)
@@ -997,6 +997,11 @@ class DanmuTool(ToolSingleton, QMainWindow):
         _cfg.set("danmu_chat_suffix", suffix)
         self._active["danmu_chat_on"] = on
         self._active["danmu_chat_suffix"] = suffix
+        try:
+            from bridge.tool_sync import push_danmu_settings
+            push_danmu_settings()
+        except Exception:
+            pass
 
     def _apply_gift(self) -> None:
         import config as _cfg
@@ -1009,6 +1014,11 @@ class DanmuTool(ToolSingleton, QMainWindow):
         self._active["danmu_gift_on"] = on
         self._active["danmu_gift_min_diamonds"] = min_d
         self._active["danmu_gift_suffix"] = suffix
+        try:
+            from bridge.tool_sync import push_danmu_settings
+            push_danmu_settings()
+        except Exception:
+            pass
 
     def _apply_follow(self) -> None:
         import config as _cfg
@@ -1018,6 +1028,11 @@ class DanmuTool(ToolSingleton, QMainWindow):
         _cfg.set("danmu_follow_suffix", suffix)
         self._active["danmu_follow_on"] = on
         self._active["danmu_follow_suffix"] = suffix
+        try:
+            from bridge.tool_sync import push_danmu_settings
+            push_danmu_settings()
+        except Exception:
+            pass
 
     def _apply_like(self) -> None:
         import config as _cfg
@@ -1037,6 +1052,11 @@ class DanmuTool(ToolSingleton, QMainWindow):
         self._active["danmu_like_suffix"] = suffix
         if threshold != old_th or accum != old_acc:
             self._like_accum.clear()
+        try:
+            from bridge.tool_sync import push_danmu_settings
+            push_danmu_settings()
+        except Exception:
+            pass
 
     def _active_on(self, cfg_key: str) -> bool:
         return bool(self._active.get(cfg_key, True))
@@ -1197,51 +1217,27 @@ class DanmuTool(ToolSingleton, QMainWindow):
         for btn in self._apply_btns:
             self._style_apply_btn(btn)
 
-    def process_message(self, msg):
+    # ── ToolUI（业务在 Go；见 tools/iface + core/CONTRACT.md）──
+    def on_core_event(self, env: dict) -> None:
+        if env.get("op") != "danmu.show":
+            return
         from util.models import ChatMessage, GiftMessage, FollowMessage, LikeMessage
+        kind = env.get("kind")
+        user = str(env.get("user") or "")
+        if kind == "chat":
+            self._send_to_danmu(ChatMessage(user=user, content=str(env.get("text") or "")))
+        elif kind == "gift":
+            self._send_to_danmu(GiftMessage(user=user, gift=str(env.get("gift") or env.get("text") or ""), count=1, repeat_end=1))
+        elif kind == "follow":
+            self._send_to_danmu(FollowMessage(user=user))
+        elif kind == "like":
+            self._send_to_danmu(LikeMessage(user=user, count=int(env.get("count") or 1)))
 
-        if isinstance(msg, ChatMessage):
-            if not self._active_on("danmu_chat_on"):
-                return
-            self._send_to_danmu(msg)
+    def on_core_tick(self, env: dict) -> None:
+        return
 
-        elif isinstance(msg, GiftMessage):
-            if not self._active_on("danmu_gift_on"):
-                return
-            min_d = int(self._active.get("danmu_gift_min_diamonds", 0) or 0)
-            if min_d > 0:
-                from resources.gift.gift_info import get_diamonds
-                if (get_diamonds(msg.gift) or 0) < min_d:
-                    return
-            self._send_to_danmu(msg)
-
-        elif isinstance(msg, FollowMessage):
-            if not self._active_on("danmu_follow_on"):
-                return
-            self._send_to_danmu(msg)
-
-        elif isinstance(msg, LikeMessage):
-            if not self._active_on("danmu_like_on"):
-                return
-            threshold = max(1, int(self._active.get("danmu_like_threshold", 1) or 1))
-            if self._active.get("danmu_like_accumulate", False):
-                user_key = self._like_user_key(msg)
-                entry = self._like_accum.setdefault(
-                    user_key, {"user": msg.user, "count": 0}
-                )
-                entry["user"]   = msg.user
-                entry["count"] += msg.count
-                if entry["count"] >= threshold:
-                    fire = LikeMessage(
-                        user=msg.user, user_id=msg.user_id,
-                        count=entry["count"],
-                    )
-                    entry["count"] = 0
-                    self._send_to_danmu(fire)
-            else:
-                if msg.count < threshold:
-                    return
-                self._send_to_danmu(msg)
+    def on_status_change(self, connected: bool) -> None:
+        return
 
     def showEvent(self, event):
         super().showEvent(event)

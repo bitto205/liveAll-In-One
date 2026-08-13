@@ -347,7 +347,7 @@ class Sidebar(QWidget):
       → 文字完全静止，边界线像遮板一样从右向左扫过来盖住文字。
     """
 
-    def __init__(self, page_metas, settings_cls, parent=None):
+    def __init__(self, page_metas, settings_cls=None, parent=None):
         super().__init__(parent)
         self.setObjectName("Sidebar")
         self.setFixedWidth(SIDEBAR_W_EXPANDED)
@@ -422,12 +422,13 @@ class Sidebar(QWidget):
         outer.addWidget(scroll, stretch=1)
         outer.addSpacing(4)
 
-        # ── 设置按钮（固定底部）──
-        self._settings_btn = NavButton(
-            settings_cls.PAGE_ICON,
-            settings_cls.PAGE_NAME,
-            obj_name="SettingsBtn",
-        )
+        # ── 设置按钮（固定底部；不 import SettingsPage）──
+        if settings_cls is not None:
+            icon = settings_cls.PAGE_ICON
+            name = settings_cls.PAGE_NAME
+        else:
+            icon, name = "⚙", "设置"
+        self._settings_btn = NavButton(icon, name, obj_name="SettingsBtn")
         outer.addWidget(self._settings_btn)
 
     def resizeEvent(self, event):
@@ -482,8 +483,10 @@ class Sidebar(QWidget):
 # 主窗口
 # ─────────────────────────────────────────────
 class MainPage(QMainWindow):
-    def __init__(self):
+    def __init__(self, on_hide_callback=None):
         super().__init__()
+        # 托盘模式下：关闭到托盘时由 App 释放页面，避免“隐藏但仍占用 UI 内存”
+        self._on_hide_callback = on_hide_callback
         self.setWindowTitle("LiveAIO")
         self.setMinimumSize(900 + WIN_SHADOW_MARGIN * 2,
                             600 + WIN_SHADOW_MARGIN * 2)
@@ -494,22 +497,23 @@ class MainPage(QMainWindow):
         self.setAttribute(Qt.WA_TranslucentBackground)
 
         self._metas = get_pages()
-        self._pages: list[BasePage] = [m.cls() for m in self._metas]
+        # 按需创建：切到某页才 import/实例化对应页面模块
+        self._pages: list[BasePage | None] = [None] * len(self._metas)
+        self._settings_page: BasePage | None = None
+        self._settings_idx = len(self._metas)
 
-        settings_cls = pages.SETTINGS_PAGE
-        self._settings_page: BasePage = settings_cls()
-        self._settings_idx = len(self._pages)
-
-        self._build_ui(settings_cls)
+        self._build_ui()
         self._connect()
         self._navigate_main(0)
 
         self.setStyleSheet(build_qss())
         _theme.on_change(lambda _: self.setStyleSheet(build_qss()))
-        self._setup_tray()
-        self.apply_minimize_to_tray_setting(bool(_cfg.get("minimize_to_tray", True)))
+        # 托盘由 liveaio-core 原生托管；UI 壳不再建第二套。
+        if not bool(_cfg.get("minimize_to_tray", True)):
+            self._setup_tray()
+            self.apply_minimize_to_tray_setting(False)
 
-    def _build_ui(self, settings_cls):
+    def _build_ui(self):
         # 最外层透明（留出阴影空间）
         root = QWidget()
         self.setCentralWidget(root)
@@ -548,7 +552,8 @@ class MainPage(QMainWindow):
         body_lay.setContentsMargins(0, 0, 0, 0)
         body_lay.setSpacing(0)
 
-        self._sidebar = Sidebar(self._metas, settings_cls)
+        # Sidebar 只需 meta（icon/name）；设置页类延迟到真正点开再加载
+        self._sidebar = Sidebar(self._metas, settings_cls=None)
         body_lay.addWidget(self._sidebar)
 
         # 物理分隔线：1px 宽，不会被子组件遮挡
@@ -558,12 +563,35 @@ class MainPage(QMainWindow):
 
         self._stack = QStackedWidget()
         self._stack.setObjectName("ContentArea")
-        for page in self._pages:
-            self._stack.addWidget(page)
-        self._stack.addWidget(self._settings_page)
+        # 占位：真正导航时再替换成页面实例
+        for _ in self._metas:
+            self._stack.addWidget(QWidget())
+        self._stack.addWidget(QWidget())
         body_lay.addWidget(self._stack)
 
         card_lay.addWidget(body)
+
+    def _replace_stack_widget(self, index: int, widget: QWidget) -> None:
+        old = self._stack.widget(index)
+        self._stack.removeWidget(old)
+        if old is not None:
+            old.deleteLater()
+        self._stack.insertWidget(index, widget)
+
+    def _ensure_page(self, index: int) -> BasePage | None:
+        if index == self._settings_idx:
+            if self._settings_page is None:
+                page = pages.SETTINGS_PAGE()
+                self._replace_stack_widget(index, page)
+                self._settings_page = page
+            return self._settings_page
+        if index < 0 or index >= len(self._metas):
+            return None
+        if self._pages[index] is None:
+            page = self._metas[index].cls()
+            self._replace_stack_widget(index, page)
+            self._pages[index] = page
+        return self._pages[index]
 
     def _connect(self):
         for i, btn in enumerate(self._sidebar.nav_buttons):
@@ -572,27 +600,47 @@ class MainPage(QMainWindow):
             self._sidebar.settings_button.clicked.connect(self._navigate_settings)
 
     def _navigate_main(self, index: int):
+        self._ensure_page(index)
         self._stack.setCurrentIndex(index)
         self._sidebar.set_active_main(index)
 
     def _navigate_settings(self):
+        self._ensure_page(self._settings_idx)
         self._stack.setCurrentIndex(self._settings_idx)
         self._sidebar.set_active_settings()
 
     def broadcast_message(self, msg):
-        for page in self._pages + [self._settings_page]:
-            try: page.on_message(msg)
-            except Exception: pass
+        for page in self._pages:
+            if page is None:
+                continue
+            try:
+                page.on_message(msg)
+            except Exception:
+                pass
+        if self._settings_page is not None:
+            try:
+                self._settings_page.on_message(msg)
+            except Exception:
+                pass
 
     def broadcast_status(self, connected: bool):
-        for page in self._pages + [self._settings_page]:
-            try: page.on_status_change(connected)
-            except Exception: pass
+        for page in self._pages:
+            if page is None:
+                continue
+            try:
+                page.on_status_change(connected)
+            except Exception:
+                pass
+        if self._settings_page is not None:
+            try:
+                self._settings_page.on_status_change(connected)
+            except Exception:
+                pass
 
     def get_page(self, page_type: type):
-        """按类型返回已注册的 page 实例，找不到返回 None。"""
+        """按类型返回已创建的 page 实例；未创建则返回 None。"""
         for page in self._pages:
-            if isinstance(page, page_type):
+            if page is not None and isinstance(page, page_type):
                 return page
         return None
 
@@ -638,9 +686,19 @@ class MainPage(QMainWindow):
         self.raise_()
 
     def apply_minimize_to_tray_setting(self, enabled: bool) -> None:
-        app = QApplication.instance()
-        if app is not None:
-            app.setQuitOnLastWindowClosed(not enabled)
+        # 托盘由 App 统一管理时，转发给 App
+        app_obj = QApplication.instance()
+        if app_obj is not None:
+            app_obj.setQuitOnLastWindowClosed(not enabled)
+        # 尝试通知 App（通过父链找不到时只改 QuitOnLastWindowClosed）
+        try:
+            from ui_shell import get_running_app
+            live = get_running_app()
+            if live is not None:
+                live.apply_minimize_to_tray_setting(enabled)
+                return
+        except Exception:
+            pass
         if not hasattr(self, "_tray"):
             return
         if enabled:
@@ -649,7 +707,15 @@ class MainPage(QMainWindow):
             self._tray.hide()
 
     def _quit_application(self):
-        """完全退出：关闭所有工具窗并结束主进程。"""
+        """完全退出：转交 App（停 core）。"""
+        try:
+            from ui_shell import get_running_app
+            live = get_running_app()
+            if live is not None:
+                live._quit_application()
+                return
+        except Exception:
+            pass
         if hasattr(self, "_tray"):
             self._tray.hide()
         from tools.tool_common import shutdown_all_tools
@@ -657,11 +723,16 @@ class MainPage(QMainWindow):
         QApplication.instance().quit()
 
     def closeEvent(self, event):
-        """关闭按钮：开启托盘模式时仅隐藏主窗口，工具窗继续独立运行。"""
+        """关闭按钮：托盘模式隐藏并回调 App 释放主窗；工具透明窗继续独立运行。"""
         if _cfg.get("minimize_to_tray", True):
             event.ignore()
             self.hide()
-            if hasattr(self, "_tray"):
+            if self._on_hide_callback is not None:
+                try:
+                    self._on_hide_callback()
+                except Exception:
+                    pass
+            elif hasattr(self, "_tray"):
                 if not self._tray.isVisible():
                     self._tray.show()
                 self._tray.showMessage(
