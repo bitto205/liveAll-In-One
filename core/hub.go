@@ -1,0 +1,400 @@
+package core
+
+import (
+	"context"
+	"encoding/base64"
+	"log/slog"
+	"sync"
+
+	"liveaio/listener"
+)
+
+type hub struct {
+	mu        sync.Mutex
+	conns     map[*Conn]struct{}
+	root      string
+	route     string
+	liveID    string
+	connected bool
+	forceMode bool
+	overtime  *Engine
+	danmu     *Danmu
+	memo      *Memo
+	config    *ConfigStore
+	log       *slog.Logger
+	shutdown  func()
+	showUI    func()
+	capture   *listener.Manager
+	shell     *listener.Shell
+}
+
+func startHub(ctx context.Context, root, tcp string, log *slog.Logger, shutdown func()) (*hub, *Server) {
+	if err := LoadGifts(root); err != nil {
+		log.Warn("gift catalog", "err", err)
+	} else {
+		log.Info("gift catalog loaded", "count", len(Names()))
+	}
+
+	h := &hub{
+		root:     root,
+		log:      log,
+		shutdown: shutdown,
+		conns:    map[*Conn]struct{}{},
+		config:   NewConfigStore(root),
+		capture: listener.NewCapture(root, tcp, func(msg string, kv ...any) {
+			log.Info(msg, kv...)
+		}),
+	}
+	h.capture.OnFrame = func(raw []byte) { h.ingestFrame(raw) }
+	h.capture.OnMessage = func(m listener.Msg) { h.afterMessage(m) }
+	h.capture.OnStatus = func(connected bool) {
+		h.connected = connected
+		h.send(h.statusEnvelope())
+	}
+	h.overtime = NewOvertime(
+		func(rem int, running bool) {
+			h.send(Envelope{"op": OpTick, "remaining_seconds": rem, "running": running})
+		},
+		func(entries []LedgerEntry) {
+			h.send(Envelope{"op": OpLedger, "entries": entries})
+		},
+	)
+	h.danmu = NewDanmu()
+	h.memo = NewMemo()
+	h.overtime.StartTicker()
+
+	srv := &Server{
+		TCPAddr: tcp,
+		Handler: h.handle,
+		Log:     log,
+		OnConnect: func(c *Conn) {
+			h.addConn(c)
+		},
+		OnDisconnect: func(c *Conn) {
+			h.removeConn(c)
+		},
+	}
+	go func() {
+		log.Info("core listening", "root", root, "version", Version, "tcp", tcp)
+		if err := srv.Serve(ctx); err != nil {
+			log.Error("serve ended", "err", err)
+			if shutdown != nil {
+				shutdown()
+			}
+		}
+	}()
+	return h, srv
+}
+
+func (h *hub) addConn(c *Conn) {
+	h.mu.Lock()
+	if h.conns == nil {
+		h.conns = map[*Conn]struct{}{}
+	}
+	h.conns[c] = struct{}{}
+	h.mu.Unlock()
+	_ = c.Send(Envelope{"op": OpCapabilities, "capabilities": DefaultCapabilities(), "features": DefaultFeatures()})
+	_ = c.Send(h.statusEnvelope())
+}
+
+func (h *hub) removeConn(c *Conn) {
+	h.mu.Lock()
+	delete(h.conns, c)
+	h.mu.Unlock()
+}
+
+func (h *hub) send(env Envelope) {
+	h.mu.Lock()
+	conns := make([]*Conn, 0, len(h.conns))
+	for c := range h.conns {
+		conns = append(conns, c)
+	}
+	h.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Send(env)
+	}
+}
+
+func (h *hub) ingestFrame(raw []byte) {
+	ok, msgs := listener.TryParseFrame(raw)
+	if !ok {
+		return
+	}
+	if !h.connected {
+		h.connected = true
+		h.send(h.statusEnvelope())
+	}
+	for _, m := range msgs {
+		out := Envelope{"op": OpMessage}
+		for k, v := range m {
+			out[k] = v
+		}
+		h.send(out)
+		h.afterMessage(m)
+	}
+}
+
+func (h *hub) stopCapture() {
+	if h.shell != nil {
+		h.shell.Stop()
+		h.shell = nil
+	}
+	if h.capture != nil {
+		h.capture.Stop()
+	}
+}
+
+func (h *hub) startRoute4() {
+	cl := &listener.Shell{
+		OnCtrl: func(ctrl string) {
+			switch ctrl {
+			case listener.CtrlLiveOn:
+				h.connected = true
+				h.send(h.statusEnvelope())
+				h.log.Info("route4 live on")
+			case listener.CtrlLiveOff, listener.CtrlWSDown:
+				h.connected = false
+				h.send(h.statusEnvelope())
+				h.log.Info("route4 live off", "ctrl", ctrl)
+			}
+		},
+		OnFrame: func(raw []byte) {
+			if !h.connected {
+				return
+			}
+			h.ingestFrame(raw)
+		},
+		OnErr: func(err error) {
+			h.log.Warn("shellipc", "err", err)
+		},
+	}
+	if err := cl.Start(); err != nil {
+		h.log.Error("shellipc start", "err", err)
+		h.send(Envelope{"op": OpError, "code": "shellipc", "msg": err.Error()})
+		return
+	}
+	h.shell = cl
+	h.log.Info("route4 shellipc listening")
+}
+
+func (h *hub) startListen(route string, forceSystem bool) error {
+	if h.capture == nil {
+		return nil
+	}
+	if err := h.capture.Start(route, h.liveID, forceSystem); err != nil {
+		h.log.Error("listen", "route", route, "err", err)
+		h.send(Envelope{"op": OpError, "code": "listen", "route": route, "msg": err.Error()})
+		return err
+	}
+	return nil
+}
+
+func (h *hub) handle(c *Conn, env Envelope) {
+	switch env.Op() {
+	case OpPing:
+		out := Envelope{"op": OpPong}
+		if id, ok := env["id"]; ok {
+			out["id"] = id
+		}
+		_ = c.Send(out)
+
+	case OpShutdown:
+		_ = c.Send(Envelope{"op": OpReady, "bye": true})
+		h.stopCapture()
+		if h.shutdown != nil {
+			h.shutdown()
+		}
+
+	case OpConnect:
+		liveID, _ := env["live_id"].(string)
+		route, _ := env["route"].(string)
+		forceSystem := false
+		if v, ok := env["force_system"].(bool); ok {
+			forceSystem = v
+		}
+		h.liveID = liveID
+		h.route = route
+		h.connected = false
+		h.forceMode = forceSystem
+		h.log.Info("connect", "live_id", liveID, "route", route)
+		h.stopCapture()
+
+		switch route {
+		case "4":
+			if err := h.startListen("4", false); err != nil {
+				return
+			}
+			h.startRoute4()
+		case "1", "2":
+			_ = h.startListen(route, forceSystem)
+		case "3":
+			if err := h.startListen("3", false); err != nil {
+				return
+			}
+			h.log.Info("route3 started")
+		}
+
+	case OpDisconnect:
+		h.stopCapture()
+		h.connected = false
+		h.send(h.statusEnvelope())
+
+	case OpStatus:
+		conn := false
+		if v, ok := env["connected"].(bool); ok {
+			conn = v
+		}
+		h.connected = conn
+		out := h.statusEnvelope()
+		out["connected"] = conn
+		if r, ok := env["route"].(string); ok && r != "" {
+			out["route"] = r
+		}
+		h.send(out)
+
+	case OpFramePush:
+		b64, _ := env["payload_b64"].(string)
+		raw, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			_ = c.Send(Envelope{"op": OpError, "code": "bad_b64", "msg": err.Error()})
+			return
+		}
+		h.ingestFrame(raw)
+
+	case OpMessageIngest:
+		m := listener.Msg{}
+		for k, v := range env {
+			if k == "op" {
+				continue
+			}
+			m[k] = v
+		}
+		if _, ok := m["type"].(string); !ok {
+			_ = c.Send(Envelope{"op": OpError, "code": "bad_ingest", "msg": "missing type"})
+			return
+		}
+		h.afterMessage(m)
+
+	case OpToolOvertimeSet:
+		s := NormalizeOvertimeSettings(env["settings"])
+		h.overtime.SetSettings(s)
+
+	case OpToolOvertimeCmd:
+		cmd, _ := env["cmd"].(string)
+		h.overtime.Cmd(cmd)
+
+	case OpToolOvertimeSim:
+		gift, _ := env["gift"].(string)
+		count := 1
+		switch v := env["count"].(type) {
+		case float64:
+			count = int(v)
+		case int:
+			count = v
+		}
+		user, _ := env["user"].(string)
+		if user == "" {
+			user = "sim"
+		}
+		h.overtime.HandleGift(user, user, gift, count)
+
+	case OpToolDanmuSet:
+		s := NormalizeDanmuSettings(env["settings"])
+		h.danmu.Set(s)
+
+	case OpToolMemoSet:
+		s := NormalizeMemoSettings(env["settings"])
+		h.memo.Set(s)
+
+	case OpConfigSet:
+		key, _ := env["key"].(string)
+		if key == "" {
+			_ = c.Send(Envelope{"op": OpError, "code": "bad_config_key", "msg": "missing key"})
+			return
+		}
+		if err := h.config.Set(key, env["value"]); err != nil {
+			_ = c.Send(Envelope{"op": OpError, "code": "config_set_failed", "msg": err.Error(), "key": key})
+			return
+		}
+		_ = c.Send(Envelope{"op": OpConfigOk, "key": key, "value": env["value"]})
+
+	case OpConfigGet:
+		key, _ := env["key"].(string)
+		if key == "" {
+			all, err := h.config.ReadAll()
+			if err != nil {
+				_ = c.Send(Envelope{"op": OpError, "code": "config_get_failed", "msg": err.Error()})
+				return
+			}
+			_ = c.Send(Envelope{"op": OpConfigValue, "values": all})
+			return
+		}
+		value, ok, err := h.config.Get(key)
+		if err != nil {
+			_ = c.Send(Envelope{"op": OpError, "code": "config_get_failed", "msg": err.Error(), "key": key})
+			return
+		}
+		_ = c.Send(Envelope{"op": OpConfigValue, "key": key, "value": value, "exists": ok})
+
+	case OpUICommand:
+		h.handleUICommand(c, env)
+
+	default:
+		_ = c.Send(Envelope{
+			"op": OpError, "code": "unsupported",
+			"msg": "unknown op: " + env.Op(),
+		})
+	}
+}
+
+func (h *hub) statusEnvelope() Envelope {
+	driver := "listener"
+	if h.route == "4" {
+		driver = "shellipc"
+	}
+	status := RouteStatus{
+		Route:       h.route,
+		Connected:   h.connected,
+		LiveID:      h.liveID,
+		Driver:      driver,
+		Health:      "ok",
+		ForceSystem: h.forceMode,
+	}
+	return Envelope{
+		"op":           OpStatus,
+		"connected":    status.Connected,
+		"route":        status.Route,
+		"live_id":      status.LiveID,
+		"driver":       status.Driver,
+		"health":       status.Health,
+		"force_system": status.ForceSystem,
+		"status":       status,
+	}
+}
+
+func (h *hub) afterMessage(m listener.Msg) {
+	t, _ := m["type"].(string)
+	diamonds := 0
+	if t == "gift" {
+		gift, _ := m["gift"].(string)
+		user, _ := m["user"].(string)
+		uid, _ := m["user_id"].(string)
+		count := 1
+		switch v := m["count"].(type) {
+		case float64:
+			count = int(v)
+		case int:
+			count = v
+		case int64:
+			count = int(v)
+		}
+		diamonds = Diamonds(gift)
+		h.overtime.HandleGift(user, uid, gift, count)
+	}
+	if show := h.danmu.Accept(m, diamonds); show != nil {
+		h.send(Envelope(show))
+	}
+	if item := h.memo.Accept(m, diamonds); item != nil {
+		h.send(Envelope(item))
+	}
+}

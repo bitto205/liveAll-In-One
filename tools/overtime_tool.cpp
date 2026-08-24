@@ -1,0 +1,2538 @@
+// tools/overtime_tool.cpp — 加班机，对齐旧 PySide overtime_tool.py。
+// 控制面板（设置 / 加班机两页）+ 用户时长统计窗 + 透明悬浮倒计时窗。
+
+namespace liveaio::tools {
+namespace ot {
+
+// ═══════════════════════════════════════════
+// 配置 / 规则
+// ═══════════════════════════════════════════
+
+static const QString kCfgKey = QStringLiteral("overtime.settings");
+static constexpr int kRuleCount = 6;
+
+static const QStringList& units() {
+    static const QStringList v = {QStringLiteral("时"), QStringLiteral("分"), QStringLiteral("秒")};
+    return v;
+}
+static const QStringList& modes() {
+    static const QStringList v = {QStringLiteral("加"), QStringLiteral("减"), QStringLiteral("随机")};
+    return v;
+}
+static const QStringList& aligns() {
+    static const QStringList v = {QStringLiteral("居左"), QStringLiteral("居中"),
+                                  QStringLiteral("居右")};
+    return v;
+}
+static const QStringList& defaultGifts() {
+    static const QStringList v = {
+        QStringLiteral("小心心"), QStringLiteral("玫瑰"), QStringLiteral("大啤酒"),
+        QStringLiteral("鲜花"), QStringLiteral("热气球"), QStringLiteral("嘉年华")};
+    return v;
+}
+
+struct Rule {
+    QString gift = QStringLiteral("小心心");
+    QString mode = QStringLiteral("加");
+    int value = 1;
+    QString unit = QStringLiteral("分");
+    int randomNeg = 0;
+    int randomPos = 1;
+    QString randomUnit = QStringLiteral("分");
+};
+
+struct Settings {
+    int hours = 2;
+    int minutes = 0;
+    int seconds = 0;
+    QVector<Rule> rules;
+    QString customText = QStringLiteral("可以输入自定义的文字");
+    QString customAlign = QStringLiteral("居中");
+};
+
+static int clampInt(const QVariant& raw, int lo, int hi) {
+    bool ok = false;
+    int n = raw.toInt(&ok);
+    if (!ok) n = lo;
+    return std::clamp(n, lo, hi);
+}
+
+static QString sanitizeDigits(const QString& text, int maxVal, int width = 3) {
+    QString digits;
+    for (const QChar& c : text) {
+        if (c.isDigit()) digits.append(c);
+        if (digits.size() >= width) break;
+    }
+    if (digits.isEmpty()) return QStringLiteral("0");
+    return QString::number(clampInt(digits, 0, maxVal));
+}
+
+static QVector<Rule> defaultRules() {
+    QVector<Rule> out;
+    for (const QString& gift : defaultGifts()) {
+        Rule r;
+        r.gift = gift;
+        out.append(r);
+    }
+    return out;
+}
+
+static Rule normalizeRule(const QVariantMap& raw) {
+    Rule r;
+    const QString gift = raw.value(QStringLiteral("gift")).toString().trimmed();
+    if (!gift.isEmpty()) r.gift = gift;
+    const QString mode = raw.value(QStringLiteral("mode")).toString();
+    if (modes().contains(mode)) r.mode = mode;
+    r.value = clampInt(raw.value(QStringLiteral("value")), 0, 999);
+    const QString unit = raw.value(QStringLiteral("unit")).toString();
+    if (units().contains(unit)) r.unit = unit;
+    r.randomNeg = clampInt(raw.value(QStringLiteral("random_neg")), 0, 999);
+    r.randomPos = clampInt(raw.value(QStringLiteral("random_pos")), 0, 999);
+    const QString ru = raw.value(QStringLiteral("random_unit")).toString();
+    r.randomUnit = units().contains(ru) ? ru : r.unit;
+    return r;
+}
+
+static QVariantMap ruleToMap(const Rule& r) {
+    return QVariantMap{
+        {QStringLiteral("gift"), r.gift},
+        {QStringLiteral("mode"), r.mode},
+        {QStringLiteral("value"), r.value},
+        {QStringLiteral("unit"), r.unit},
+        {QStringLiteral("random_neg"), r.randomNeg},
+        {QStringLiteral("random_pos"), r.randomPos},
+        {QStringLiteral("random_unit"), r.randomUnit},
+    };
+}
+
+static QString nextUnusedGift(const QSet<QString>& used, int preferIndex) {
+    const QStringList pool = defaultGifts();
+    if (preferIndex >= 0 && preferIndex < pool.size() && !used.contains(pool.at(preferIndex))) {
+        return pool.at(preferIndex);
+    }
+    for (const QString& g : pool) {
+        if (!used.contains(g)) return g;
+    }
+    for (const QString& g : liveaio::resources::giftNamesCached(g_appRoot)) {
+        if (!used.contains(g)) return g;
+    }
+    int n = 1;
+    while (true) {
+        const QString fallback = QStringLiteral("礼物%1").arg(n);
+        if (!used.contains(fallback)) return fallback;
+        ++n;
+    }
+}
+
+// 6 格礼物必须互不相同；冲突格自动换成未占用礼物，preferIndex 优先保留。
+static QVector<Rule> dedupeRules(const QVector<Rule>& rules, int preferIndex = -1) {
+    QVector<Rule> out;
+    const QVector<Rule> fallback = defaultRules();
+    for (int i = 0; i < kRuleCount; ++i) {
+        out.append(i < rules.size() ? rules.at(i) : fallback.at(i));
+    }
+    QVector<int> order;
+    for (int i = 0; i < kRuleCount; ++i) order.append(i);
+    if (preferIndex >= 0 && preferIndex < kRuleCount) {
+        order.removeAll(preferIndex);
+        order.prepend(preferIndex);
+    }
+    QSet<QString> used;
+    for (int i : order) {
+        QString gift = out[i].gift.trimmed();
+        if (gift.isEmpty() || used.contains(gift)) gift = nextUnusedGift(used, i);
+        out[i].gift = gift;
+        used.insert(gift);
+    }
+    return out;
+}
+
+static Settings loadSettings() {
+    Settings out;
+    out.rules = defaultRules();
+    const QVariantMap raw = configValue(kCfgKey).toMap();
+    if (raw.isEmpty()) return out;
+    out.hours = clampInt(raw.value(QStringLiteral("hours")), 0, 999);
+    out.minutes = clampInt(raw.value(QStringLiteral("minutes")), 0, 60);
+    out.seconds = clampInt(raw.value(QStringLiteral("seconds")), 0, 60);
+    const QVariant text = raw.value(QStringLiteral("custom_text"));
+    if (text.typeId() == QMetaType::QString) out.customText = text.toString().left(80);
+    const QString align = raw.value(QStringLiteral("custom_align")).toString();
+    if (aligns().contains(align)) out.customAlign = align;
+
+    const QVariantList rules = raw.value(QStringLiteral("rules")).toList();
+    if (!rules.isEmpty()) {
+        QVector<Rule> merged;
+        for (int i = 0; i < kRuleCount; ++i) {
+            if (i < rules.size() && rules.at(i).canConvert<QVariantMap>()) {
+                merged.append(normalizeRule(rules.at(i).toMap()));
+            } else {
+                merged.append(out.rules.at(i));
+            }
+        }
+        out.rules = dedupeRules(merged);
+    }
+    return out;
+}
+
+static QVariantMap settingsToMap(const Settings& s) {
+    QVariantList rules;
+    for (const Rule& r : s.rules) rules.append(ruleToMap(r));
+    return QVariantMap{
+        {QStringLiteral("hours"), s.hours},
+        {QStringLiteral("minutes"), s.minutes},
+        {QStringLiteral("seconds"), s.seconds},
+        {QStringLiteral("rules"), rules},
+        {QStringLiteral("custom_text"), s.customText},
+        {QStringLiteral("custom_align"), s.customAlign},
+    };
+}
+
+static void saveSettings(const Settings& s) {
+    writeConfigValue(kCfgKey, settingsToMap(s));
+}
+
+static int totalSeconds(int h, int m, int s) {
+    return std::clamp(h, 0, 999) * 3600 + std::clamp(m, 0, 60) * 60 + std::clamp(s, 0, 60);
+}
+
+static int unitToSeconds(int value, const QString& unit) {
+    const int v = std::clamp(value, 0, 999);
+    if (unit == QStringLiteral("时")) return v * 3600;
+    if (unit == QStringLiteral("分")) return v * 60;
+    return v;
+}
+
+static QString formatTimerDisplay(int totalSec) {
+    const int total = std::max(0, totalSec);
+    const int h = total / 3600;
+    const int m = (total % 3600) / 60;
+    const int s = total % 60;
+    if (h >= 1) {
+        return QStringLiteral("%1:%2:%3")
+            .arg(h)
+            .arg(m, 2, 10, QLatin1Char('0'))
+            .arg(s, 2, 10, QLatin1Char('0'));
+    }
+    return QStringLiteral("%1:%2")
+        .arg(m, 2, 10, QLatin1Char('0'))
+        .arg(s, 2, 10, QLatin1Char('0'));
+}
+
+static QString formatDeltaLog(int deltaSeconds) {
+    const QString sign = deltaSeconds >= 0 ? QStringLiteral("+") : QStringLiteral("-");
+    const int total = std::abs(deltaSeconds);
+    const int h = total / 3600;
+    const int m = (total % 3600) / 60;
+    const int s = total % 60;
+    QStringList parts;
+    if (h > 0) parts << QStringLiteral("%1小时").arg(h);
+    if (m > 0) parts << QStringLiteral("%1分钟").arg(m);
+    if (s > 0 || parts.isEmpty()) parts << QStringLiteral("%1秒").arg(s);
+    return sign + parts.join(QString());
+}
+
+// 统计窗专用：固定 时/分/秒 三段，便于列宽对齐。
+static QString formatStatsDuration(int seconds, const QString& forcedSign = QString(),
+                                   bool signed_ = false) {
+    if (seconds == 0) return QStringLiteral("—");
+    QString sign = forcedSign;
+    if (sign.isEmpty() && signed_) {
+        sign = seconds > 0 ? QStringLiteral("+") : QStringLiteral("-");
+    }
+    const int total = std::abs(seconds);
+    const int h = std::min(total / 3600, 999);
+    const int m = (total % 3600) / 60;
+    const int s = total % 60;
+    return QStringLiteral("%1%2时%3分%4秒")
+        .arg(sign)
+        .arg(h)
+        .arg(m, 2, 10, QLatin1Char('0'))
+        .arg(s, 2, 10, QLatin1Char('0'));
+}
+
+static QString ruleSlotLabel(const Rule& r) {
+    if (r.mode == QStringLiteral("随机")) {
+        return QStringLiteral("随机-%1~+%2%3").arg(r.randomNeg).arg(r.randomPos).arg(r.randomUnit);
+    }
+    const QString sign = r.mode == QStringLiteral("加") ? QStringLiteral("+") : QStringLiteral("-");
+    return QStringLiteral("%1%2%3").arg(sign).arg(r.value).arg(r.unit);
+}
+
+static QString giftLogLeft(const QString& user, const QString& gift, int count) {
+    const QString u = user.trimmed().isEmpty() ? QStringLiteral("观众") : user.trimmed();
+    const QString g = gift.trimmed().isEmpty() ? QStringLiteral("礼物") : gift.trimmed();
+    const int n = std::max(1, count);
+    if (n > 1) return QStringLiteral("%1 送出了 %2 ×%3").arg(u, g).arg(n);
+    return QStringLiteral("%1 送出了 %2").arg(u, g);
+}
+
+static Qt::Alignment alignToQt(const QString& align) {
+    if (align == QStringLiteral("居左")) return Qt::AlignLeft | Qt::AlignVCenter;
+    if (align == QStringLiteral("居右")) return Qt::AlignRight | Qt::AlignVCenter;
+    return Qt::AlignHCenter | Qt::AlignVCenter;
+}
+
+static ToolSkin activeOvertimeSkin() {
+    const QString id = configValue(liveaio::resources::skinConfigKey(QStringLiteral("overtime")),
+                                  QStringLiteral("default")).toString();
+    return ToolSkin::load(g_appRoot, QStringLiteral("overtime"),
+                          id.isEmpty() ? QStringLiteral("default") : id);
+}
+
+// ═══════════════════════════════════════════
+// 设置页尺寸（贴内容宽度，避免礼物格左右留白）
+// ═══════════════════════════════════════════
+
+static constexpr int kGiftIcon = 48;
+static constexpr int kGiftPick = 48;
+static constexpr int kGiftLeftW = kGiftPick + 3 + kGiftIcon;
+static constexpr int kCtrlH = 24;
+static constexpr int kCtrlGap = 2;
+static constexpr int kModeW = 56;
+static constexpr int kUnitW = 52;
+static constexpr int kValW = 42;
+static constexpr int kValWTime = 52;
+static constexpr int kLblNegW = 14;
+static constexpr int kLblToW = 24;
+static constexpr int kLblPosW = 14;
+static constexpr int kRandomRowW = kLblNegW + kValW + kLblToW + kLblPosW + kValW;
+static constexpr int kRightW = kRandomRowW > kModeW ? kRandomRowW : kModeW;
+static constexpr int kModuleW = kGiftLeftW + kRightW + 8;
+static constexpr int kModuleH = kCtrlH * 3 + kCtrlGap * 2 + 8;
+static constexpr int kGridGap = 8;
+static constexpr int kSectionBodyMx = 16;
+static constexpr int kGridContentW = kModuleW * 2 + kGridGap;
+static constexpr int kPanelW = kGridContentW + kSectionBodyMx;
+static constexpr int kSide = 24;
+static constexpr int kScrollGutter = 8;
+static constexpr int kPagePad = kSide + kScrollGutter / 2;
+static constexpr int kToolWinW = kPanelW + 2 * kPagePad;
+static constexpr int kToolWinH = 720;
+
+static constexpr int kPickerCols = 4;
+static constexpr int kPickerRows = 4;
+static constexpr int kPickerCell = 64;
+static constexpr int kPickerGutter = 16;
+static constexpr int kPickerW =
+    10 + kPickerCell * kPickerCols + 6 * (kPickerCols - 1) + 10 + kPickerGutter;
+static constexpr int kPickerH = 10 + 34 + 8 + kPickerRows * (kPickerCell + 18) + 10;
+
+static constexpr int kSimPickW = 90;
+static constexpr int kSimBtnH = 32;
+static constexpr int kSimBtnGap = 12;
+
+// ═══════════════════════════════════════════
+// 基础控件
+// ═══════════════════════════════════════════
+
+// 非负整数输入；失焦 clamp 并回调。
+class IntField final : public QLineEdit {
+public:
+    IntField(int maxVal, int charW, int height = kCtrlH, int minWidth = -1,
+             QWidget* parent = nullptr)
+        : QLineEdit(parent), max_(maxVal) {
+        const QFontMetrics fm(QFont(QStringLiteral("Microsoft YaHei"), 11));
+        int w = fm.horizontalAdvance(QString(charW, QLatin1Char('8'))) + 16;
+        if (minWidth > 0) w = std::max(w, minWidth);
+        else if (charW >= 3) w = std::max(w, kValW);
+        else w = std::max(w, 36);
+        setFixedSize(w, height);
+        setAlignment(Qt::AlignCenter);
+        setText(QStringLiteral("0"));
+        QObject::connect(this, &QLineEdit::textChanged, this, [this](const QString& text) {
+            QString cleaned;
+            for (const QChar& c : text) {
+                if (c.isDigit()) cleaned.append(c);
+            }
+            if (cleaned != text) {
+                const QSignalBlocker blocker(this);
+                setText(cleaned.isEmpty() ? QStringLiteral("0") : cleaned);
+            }
+        });
+        QObject::connect(this, &QLineEdit::editingFinished, this, [this]() {
+            const QSignalBlocker blocker(this);
+            setText(sanitizeDigits(text(), max_));
+            if (onCommit_) onCommit_();
+        });
+    }
+
+    void setOnCommit(std::function<void()> cb) { onCommit_ = std::move(cb); }
+    int value() const { return sanitizeDigits(text(), max_).toInt(); }
+    void setValue(int n) { setText(sanitizeDigits(QString::number(n), max_)); }
+
+private:
+    int max_;
+    std::function<void()> onCommit_;
+};
+
+// 分区：居中加粗标题 + 无底色内容区。
+class SectionBlock final : public QFrame {
+public:
+    explicit SectionBlock(const QString& title, QWidget* parent = nullptr) : QFrame(parent) {
+        setObjectName(QStringLiteral("OvertimeSection"));
+        setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        auto* root = new QVBoxLayout(this);
+        root->setContentsMargins(0, 0, 0, 0);
+        root->setSpacing(6);
+
+        auto* bar = new QLabel(title, this);
+        bar->setObjectName(QStringLiteral("OvertimeSectionTitle"));
+        bar->setAlignment(Qt::AlignCenter);
+        root->addWidget(bar);
+
+        auto* body = new QFrame(this);
+        body->setObjectName(QStringLiteral("OvertimeSectionBody"));
+        content = new QVBoxLayout(body);
+        content->setContentsMargins(8, 0, 8, 8);
+        content->setSpacing(6);
+        root->addWidget(body);
+    }
+
+    QVBoxLayout* content = nullptr;
+};
+
+// 礼物选择栏：已挂在 6 格上的礼物不出现在列表中。
+class GiftPickerPopup final : public QFrame {
+public:
+    explicit GiftPickerPopup(QWidget* parent = nullptr)
+        : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint) {
+        setFixedSize(kPickerW, kPickerH);
+        allNames_ = liveaio::resources::giftNamesCached(g_appRoot);
+
+        auto* lay = new QVBoxLayout(this);
+        lay->setContentsMargins(8, 8, 8, 8);
+        lay->setSpacing(8);
+
+        auto* sr = new QHBoxLayout;
+        sr->setSpacing(6);
+        search_ = new QLineEdit(this);
+        search_->setPlaceholderText(QStringLiteral("搜索礼物"));
+        search_->setFixedHeight(30);
+        QObject::connect(search_, &QLineEdit::textChanged, this, [this]() { refreshGrid(); });
+        auto* sbtn = new QPushButton(QStringLiteral("搜索"), this);
+        sbtn->setFixedSize(52, 30);
+        sbtn->setCursor(Qt::PointingHandCursor);
+        QObject::connect(sbtn, &QPushButton::clicked, this, [this]() { refreshGrid(); });
+        sr->addWidget(search_, 1);
+        sr->addWidget(sbtn);
+        lay->addLayout(sr);
+
+        auto* scroll = new QScrollArea(this);
+        scroll->setWidgetResizable(true);
+        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        scroll->setFixedHeight(kPickerRows * (kPickerCell + 18));
+        scroll->setStyleSheet(
+            QStringLiteral("QScrollArea { border: none; background: transparent; }"));
+        auto* host = new QWidget(scroll);
+        grid_ = new QGridLayout(host);
+        grid_->setContentsMargins(0, 0, 2, 0);
+        grid_->setHorizontalSpacing(6);
+        grid_->setVerticalSpacing(6);
+        scroll->setWidget(host);
+        lay->addWidget(scroll);
+
+        refreshTheme();
+        liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
+    }
+
+    void setOnPicked(std::function<void(const QString&)> cb) { onPicked_ = std::move(cb); }
+
+    // showAll=true：模拟区，展示全部礼物；否则隐藏 blocked 中已占用的礼物。
+    void openAt(QWidget* anchor, const QSet<QString>& blocked, bool showAll) {
+        showAll_ = showAll;
+        blocked_ = showAll ? QSet<QString>() : blocked;
+        move(anchor->mapToGlobal(QPoint(anchor->width() + 6, 0)));
+        search_->clear();
+        refreshGrid();
+        show();
+        search_->setFocus();
+    }
+
+    void refreshTheme() {
+        const auto& C = theme();
+        setStyleSheet(QStringLiteral(
+            "QFrame { background: %1; border: 1px solid %2; border-radius: 4px; }"
+            "QLineEdit { background: %1; color: %3; border: 1px solid %4;"
+            " border-radius: 6px; padding: 0 8px; font-size: 12px; }"
+            "QPushButton { background: transparent; color: %3; border: 1px solid %4;"
+            " border-radius: 4px; font-size: 12px; }"
+            "QPushButton:hover { border-color: %2; }"
+            "QLabel { background: transparent; border: none; color: %3; }"
+        ).arg(C.card, C.activeLine, C.text, C.border));
+        refreshGrid();
+    }
+
+private:
+    static bool fuzzyMatch(const QString& name, const QString& query) {
+        const QString q = query.trimmed().toLower();
+        if (q.isEmpty()) return true;
+        const QString n = name.toLower();
+        if (n.contains(q)) return true;
+        int i = 0;
+        for (const QChar& c : n) {
+            if (i < q.size() && c == q.at(i)) ++i;
+        }
+        return i == q.size();
+    }
+
+    void refreshGrid() {
+        const QString q = search_ ? search_->text() : QString();
+        QStringList names;
+        for (const QString& n : allNames_) {
+            if (!blocked_.contains(n) && fuzzyMatch(n, q)) names << n;
+        }
+        while (grid_->count() > 0) {
+            QLayoutItem* item = grid_->takeAt(0);
+            if (QWidget* w = item->widget()) w->deleteLater();
+            delete item;
+        }
+        if (names.isEmpty()) {
+            auto* hint = new QLabel(
+                showAll_ || !q.trimmed().isEmpty() ? QStringLiteral("无匹配礼物")
+                                                   : QStringLiteral("暂无其它礼物可选"));
+            hint->setAlignment(Qt::AlignCenter);
+            QFont f(QStringLiteral("Microsoft YaHei"));
+            f.setPixelSize(11);
+            hint->setFont(f);
+            hint->setStyleSheet(QStringLiteral("color: %1; background: transparent;")
+                                    .arg(theme().textMuted));
+            grid_->addWidget(hint, 0, 0, 1, kPickerCols);
+            return;
+        }
+        for (int i = 0; i < names.size(); ++i) {
+            grid_->addWidget(makeCell(names.at(i)), i / kPickerCols, i % kPickerCols);
+        }
+    }
+
+    QPushButton* makeCell(const QString& name) {
+        const auto& C = theme();
+        auto* btn = new QPushButton;
+        btn->setFixedSize(kPickerCell, kPickerCell + 16);
+        btn->setCursor(Qt::PointingHandCursor);
+        // 无障碍名 = 礼物名，方便 UI Automation / 测试脚本按名点击。
+        btn->setAccessibleName(name);
+        btn->setStyleSheet(QStringLiteral(
+            "QPushButton { background: transparent; border: 1px solid transparent;"
+            " border-radius: 4px; padding: 0; }"
+            "QPushButton:hover { background: transparent; border-color: %1; }"
+        ).arg(C.activeLine));
+
+        auto* lay = new QVBoxLayout(btn);
+        lay->setContentsMargins(2, 2, 2, 2);
+        lay->setSpacing(0);
+
+        auto* icon = new QLabel(btn);
+        icon->setFixedSize(kPickerCell - 4, kPickerCell - 4);
+        icon->setAlignment(Qt::AlignCenter);
+        const QPixmap px = liveaio::resources::loadGiftPixmap(g_appRoot, name, kPickerCell - 8);
+        if (!px.isNull()) icon->setPixmap(px);
+        icon->setStyleSheet(QStringLiteral("background: transparent; border: none;"));
+
+        auto* nameLbl = new QLabel(name, btn);
+        nameLbl->setFixedSize(kPickerCell - 4, 14);
+        nameLbl->setAlignment(Qt::AlignCenter);
+        QFont f(QStringLiteral("Microsoft YaHei"));
+        f.setPixelSize(10);
+        nameLbl->setFont(f);
+        nameLbl->setStyleSheet(QStringLiteral("background: transparent; border: none;"));
+
+        lay->addWidget(icon, 0, Qt::AlignHCenter);
+        lay->addWidget(nameLbl, 0, Qt::AlignHCenter);
+        QObject::connect(btn, &QPushButton::clicked, this, [this, name]() {
+            if (onPicked_) onPicked_(name);
+            hide();
+        });
+        return btn;
+    }
+
+    QStringList allNames_;
+    QSet<QString> blocked_;
+    bool showAll_ = false;
+    QLineEdit* search_ = nullptr;
+    QGridLayout* grid_ = nullptr;
+    std::function<void(const QString&)> onPicked_;
+};
+
+// 单个礼物规则（对应悬浮窗上的一格）。
+class GiftRuleModule final : public QFrame {
+public:
+    GiftRuleModule(int index, const Rule& rule, QWidget* parent = nullptr)
+        : QFrame(parent), index_(index), rule_(rule) {
+        setObjectName(QStringLiteral("OvertimeGiftModule"));
+        setFixedSize(kModuleW, kModuleH);
+        build();
+        loadRule(rule_);
+    }
+
+    void setPickerCallback(std::function<void(GiftRuleModule*)> cb) { pickerCb_ = std::move(cb); }
+    void setBlockedFn(std::function<QSet<QString>()> fn) { blockedFn_ = std::move(fn); }
+    void setOnChanged(std::function<void(int)> cb) { onChanged_ = std::move(cb); }
+    QPushButton* pickAnchor() const { return pickBtn_; }
+    QString currentGift() const { return rule_.gift; }
+
+    void applyGift(const QString& name) {
+        if (blockedFn_ && blockedFn_().contains(name)) return;
+        rule_.gift = name;
+        showIcon(name);
+        emitChange();
+    }
+
+    Rule toRule() const {
+        Rule r;
+        r.gift = rule_.gift.isEmpty() ? QStringLiteral("小心心") : rule_.gift;
+        r.mode = mode_->currentText();
+        r.value = value_->value();
+        r.unit = unit_->currentText();
+        r.randomNeg = randNeg_->value();
+        r.randomPos = randPos_->value();
+        r.randomUnit = r.unit;
+        return normalizeRule(ruleToMap(r));
+    }
+
+    void loadRule(const Rule& rule) {
+        rule_ = rule;
+        loading_ = true;
+        mode_->setCurrentText(rule.mode);
+        value_->setValue(rule.value);
+        unit_->setCurrentText(rule.mode == QStringLiteral("随机") ? rule.randomUnit : rule.unit);
+        randNeg_->setValue(rule.randomNeg);
+        randPos_->setValue(rule.randomPos);
+        loading_ = false;
+        showIcon(rule.gift);
+        syncMode();
+    }
+
+    void refreshTheme() {
+        const auto& C = theme();
+        pickBtn_->setStyleSheet(QStringLiteral(
+            "QPushButton { background: transparent; color: %1; border: 1px solid %2;"
+            " border-radius: 3px; font-size: 10px; padding: 0 1px; }"
+            "QPushButton:hover { background: transparent; color: %2; }"
+        ).arg(C.text, C.activeLine));
+        iconLbl_->setStyleSheet(
+            QStringLiteral("QLabel#OvertimeGiftIcon { background: transparent; border: none; }"));
+        mode_->refreshTheme();
+        unit_->refreshTheme();
+    }
+
+private:
+    static QLabel* smallLabel(const QString& text) {
+        auto* lb = new QLabel(text);
+        lb->setStyleSheet(QStringLiteral("background: transparent;"));
+        int w = 20;
+        if (text == QStringLiteral("负")) w = kLblNegW;
+        else if (text == QStringLiteral("正")) w = kLblPosW;
+        else if (text == QStringLiteral("到 ")) w = kLblToW;
+        lb->setFixedSize(w, kCtrlH);
+        QFont f(QStringLiteral("Microsoft YaHei"));
+        f.setPixelSize(11);
+        lb->setFont(f);
+        lb->setAlignment(Qt::AlignCenter);
+        return lb;
+    }
+
+    void build() {
+        auto* root = new QHBoxLayout(this);
+        root->setContentsMargins(4, 4, 4, 4);
+        root->setSpacing(0);
+
+        auto* leftWrap = new QWidget(this);
+        leftWrap->setAttribute(Qt::WA_TranslucentBackground);
+        leftWrap->setFixedSize(kGiftLeftW, kGiftIcon);
+        auto* left = new QHBoxLayout(leftWrap);
+        left->setContentsMargins(0, 0, 0, 0);
+        left->setSpacing(3);
+        pickBtn_ = new QPushButton(QStringLiteral("礼物\n选择"), leftWrap);
+        pickBtn_->setFixedSize(kGiftPick, kGiftPick);
+        pickBtn_->setCursor(Qt::PointingHandCursor);
+        QObject::connect(pickBtn_, &QPushButton::clicked, this, [this]() {
+            if (pickerCb_) pickerCb_(this);
+        });
+        left->addWidget(pickBtn_);
+
+        iconLbl_ = new QLabel(leftWrap);
+        iconLbl_->setObjectName(QStringLiteral("OvertimeGiftIcon"));
+        iconLbl_->setFixedSize(kGiftIcon, kGiftIcon);
+        iconLbl_->setAlignment(Qt::AlignCenter);
+        left->addWidget(iconLbl_);
+        root->addWidget(leftWrap, 0, Qt::AlignTop);
+
+        auto* rightWrap = new QWidget(this);
+        rightWrap->setAttribute(Qt::WA_TranslucentBackground);
+        rightWrap->setFixedSize(kRightW, kCtrlH * 3 + kCtrlGap * 2);
+        auto* right = new QVBoxLayout(rightWrap);
+        right->setContentsMargins(0, 0, 0, 0);
+        right->setSpacing(kCtrlGap);
+        right->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+
+        mode_ = new ThemedComboBox(rightWrap);
+        mode_->setCompact(true);
+        mode_->addItems(modes());
+        mode_->setFixedSize(kModeW, kCtrlH);
+        mode_->setOnChange([this](const QString&) {
+            syncMode();
+            emitChange();
+        });
+        right->addWidget(mode_, 0, Qt::AlignLeft);
+
+        rowStack_ = new QStackedWidget(rightWrap);
+        rowStack_->setFixedSize(kValW, kCtrlH);
+
+        auto* simple = new QWidget(rowStack_);
+        simple->setFixedSize(kValW, kCtrlH);
+        auto* sr = new QHBoxLayout(simple);
+        sr->setContentsMargins(0, 0, 0, 0);
+        sr->setSpacing(0);
+        sr->setAlignment(Qt::AlignLeft);
+        value_ = new IntField(999, 3, kCtrlH, kValW, simple);
+        value_->setOnCommit([this]() { emitChange(); });
+        sr->addWidget(value_, 0, Qt::AlignLeft);
+        rowStack_->addWidget(simple);
+
+        auto* random = new QWidget(rowStack_);
+        random->setFixedSize(kRandomRowW, kCtrlH);
+        auto* rr = new QHBoxLayout(random);
+        rr->setContentsMargins(0, 0, 0, 0);
+        rr->setSpacing(0);
+        rr->setAlignment(Qt::AlignLeft);
+        rr->addWidget(smallLabel(QStringLiteral("负")));
+        randNeg_ = new IntField(999, 3, kCtrlH, kValW, random);
+        randNeg_->setOnCommit([this]() { emitChange(); });
+        rr->addWidget(randNeg_, 0, Qt::AlignLeft);
+        rr->addWidget(smallLabel(QStringLiteral("到 ")));
+        rr->addWidget(smallLabel(QStringLiteral("正")));
+        randPos_ = new IntField(999, 3, kCtrlH, kValW, random);
+        randPos_->setOnCommit([this]() { emitChange(); });
+        rr->addWidget(randPos_, 0, Qt::AlignLeft);
+        rowStack_->addWidget(random);
+        right->addWidget(rowStack_, 0, Qt::AlignLeft);
+
+        auto* unitRow = new QWidget(rightWrap);
+        unitRow->setFixedHeight(kCtrlH);
+        auto* ur = new QHBoxLayout(unitRow);
+        ur->setContentsMargins(0, 0, 0, 0);
+        ur->setSpacing(0);
+        unit_ = new ThemedComboBox(unitRow);
+        unit_->setCompact(true);
+        unit_->addItems(units());
+        unit_->setFixedSize(kUnitW, kCtrlH);
+        unit_->setOnChange([this](const QString&) { emitChange(); });
+        ur->addWidget(unit_, 0, Qt::AlignLeft);
+        right->addWidget(unitRow);
+
+        root->addWidget(rightWrap, 0, Qt::AlignTop | Qt::AlignLeft);
+        refreshTheme();
+        liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
+    }
+
+    void showIcon(const QString& name) {
+        const QPixmap px = liveaio::resources::loadGiftPixmap(g_appRoot, name, kGiftIcon - 6);
+        if (!px.isNull()) {
+            iconLbl_->setPixmap(px);
+            iconLbl_->setText(QString());
+        } else {
+            iconLbl_->setPixmap(QPixmap());
+            iconLbl_->setText(QStringLiteral("·"));
+        }
+    }
+
+    void syncMode() {
+        const bool isRand = mode_->currentText() == QStringLiteral("随机");
+        rowStack_->setCurrentIndex(isRand ? 1 : 0);
+        rowStack_->setFixedSize(isRand ? kRandomRowW : kValW, kCtrlH);
+    }
+
+    void emitChange() {
+        if (loading_) return;
+        rule_ = toRule();
+        if (onChanged_) onChanged_(index_);
+    }
+
+    int index_ = 0;
+    Rule rule_;
+    bool loading_ = false;
+    QPushButton* pickBtn_ = nullptr;
+    QLabel* iconLbl_ = nullptr;
+    ThemedComboBox* mode_ = nullptr;
+    ThemedComboBox* unit_ = nullptr;
+    QStackedWidget* rowStack_ = nullptr;
+    IntField* value_ = nullptr;
+    IntField* randNeg_ = nullptr;
+    IntField* randPos_ = nullptr;
+    std::function<void(GiftRuleModule*)> pickerCb_;
+    std::function<QSet<QString>()> blockedFn_;
+    std::function<void(int)> onChanged_;
+};
+
+// 设置页：模拟推送礼物（礼物选择 + 数量 + 推送）。
+class SimGiftWidget final : public QFrame {
+public:
+    explicit SimGiftWidget(QWidget* parent = nullptr) : QFrame(parent) {
+        setObjectName(QStringLiteral("OvertimeSimGift"));
+        setAttribute(Qt::WA_TranslucentBackground);
+        gift_ = QStringLiteral("小心心");
+        picker_ = new GiftPickerPopup(this);
+        picker_->setOnPicked([this](const QString& name) {
+            gift_ = name;
+            showIcon(name);
+        });
+        build();
+        showIcon(gift_);
+        liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
+    }
+
+    void setOnPush(std::function<void(const QString&, int)> cb) { onPush_ = std::move(cb); }
+
+    void setPushEnabled(bool enabled) {
+        pushBtn_->setEnabled(enabled);
+        pushBtn_->setToolTip(enabled ? QString() : QStringLiteral("请先打开加班机悬浮窗"));
+    }
+
+    void refreshTheme() {
+        const auto& C = theme();
+        pickBtn_->setStyleSheet(QStringLiteral(
+            "QPushButton#OvertimeSimPickBtn { background: transparent; color: %1;"
+            " border: 1.5px solid %1; border-radius: 6px; font-size: 12px; font-weight: 600;"
+            " padding: 0 10px; min-height: %2px; max-height: %2px; }"
+            "QPushButton#OvertimeSimPickBtn:hover { background: transparent; color: %3; }"
+        ).arg(C.activeLine, QString::number(kSimBtnH), C.text));
+        iconLbl_->setStyleSheet(QStringLiteral(
+            "QLabel#OvertimeSimGiftIcon { background: transparent; border: none; }"));
+        pushBtn_->setStyleSheet(QStringLiteral(
+            "QPushButton { background: %1; color: #fff; border: none; border-radius: 6px;"
+            " font-size: 13px; font-weight: 600; }"
+            "QPushButton:hover { background: %2; color: %3; }"
+            "QPushButton:disabled { background: %4; color: %5; }"
+        ).arg(C.activeLine, C.hover, C.text, C.border, C.textMuted));
+        picker_->refreshTheme();
+    }
+
+private:
+    void build() {
+        setFixedHeight(kGiftIcon);
+        auto* root = new QHBoxLayout(this);
+        root->setContentsMargins(0, 0, 0, 0);
+        root->setSpacing(10);
+
+        auto* leftWrap = new QWidget(this);
+        leftWrap->setObjectName(QStringLiteral("OvertimeSimLeft"));
+        leftWrap->setAttribute(Qt::WA_TranslucentBackground);
+        leftWrap->setFixedSize(kSimPickW + kSimBtnGap + kGiftIcon, kGiftIcon);
+        auto* left = new QHBoxLayout(leftWrap);
+        left->setContentsMargins(0, 0, 0, 0);
+        left->setSpacing(kSimBtnGap);
+
+        pickBtn_ = new QPushButton(QStringLiteral("选择礼物"), leftWrap);
+        pickBtn_->setObjectName(QStringLiteral("OvertimeSimPickBtn"));
+        pickBtn_->setFlat(true);
+        pickBtn_->setFixedSize(kSimPickW, kSimBtnH);
+        pickBtn_->setCursor(Qt::PointingHandCursor);
+        QObject::connect(pickBtn_, &QPushButton::clicked, this, [this]() {
+            picker_->openAt(pickBtn_, {}, true);
+        });
+        left->addWidget(pickBtn_, 0, Qt::AlignVCenter);
+
+        iconLbl_ = new QLabel(leftWrap);
+        iconLbl_->setObjectName(QStringLiteral("OvertimeSimGiftIcon"));
+        iconLbl_->setFixedSize(kGiftIcon, kGiftIcon);
+        iconLbl_->setAlignment(Qt::AlignCenter);
+        iconLbl_->setAttribute(Qt::WA_TranslucentBackground);
+        left->addWidget(iconLbl_, 0, Qt::AlignVCenter);
+        root->addWidget(leftWrap);
+
+        auto* qtyRow = new QHBoxLayout;
+        qtyRow->setSpacing(6);
+        auto* qtyLbl = new QLabel(QStringLiteral("数量"), this);
+        qtyLbl->setFixedHeight(kGiftIcon);
+        qtyLbl->setAlignment(Qt::AlignCenter);
+        count_ = new IntField(9999, 4, 28, 52, this);
+        count_->setValue(1);
+        qtyRow->addWidget(qtyLbl);
+        qtyRow->addWidget(count_);
+        root->addLayout(qtyRow);
+        root->addStretch();
+
+        pushBtn_ = new QPushButton(QStringLiteral("推送"), this);
+        pushBtn_->setFixedSize(72, 34);
+        pushBtn_->setCursor(Qt::PointingHandCursor);
+        QObject::connect(pushBtn_, &QPushButton::clicked, this, [this]() {
+            const int count = count_->value();
+            if (count <= 0) return;
+            if (onPush_) onPush_(gift_, count);
+        });
+        root->addWidget(pushBtn_);
+        refreshTheme();
+    }
+
+    void showIcon(const QString& name) {
+        const QPixmap px = liveaio::resources::loadGiftPixmap(g_appRoot, name, kGiftIcon - 6);
+        if (!px.isNull()) {
+            iconLbl_->setPixmap(px);
+            iconLbl_->setText(QString());
+        } else {
+            iconLbl_->setPixmap(QPixmap());
+            iconLbl_->setText(QStringLiteral("·"));
+        }
+    }
+
+    QString gift_;
+    GiftPickerPopup* picker_ = nullptr;
+    QPushButton* pickBtn_ = nullptr;
+    QLabel* iconLbl_ = nullptr;
+    IntField* count_ = nullptr;
+    QPushButton* pushBtn_ = nullptr;
+    std::function<void(const QString&, int)> onPush_;
+};
+
+// 加班机设置面板：剩余时间 / 礼物设置 / 自定义信息三块。
+class SettingsPanel final : public QWidget {
+public:
+    explicit SettingsPanel(QWidget* parent = nullptr) : QWidget(parent) {
+        data_ = loadSettings();
+        setFixedWidth(kPanelW);
+        setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Maximum);
+        picker_ = new GiftPickerPopup(this);
+        picker_->setOnPicked([this](const QString& name) {
+            if (pickTarget_) pickTarget_->applyGift(name);
+        });
+        build();
+        liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
+    }
+
+    void setOnTimeApply(std::function<void(const Settings&)> cb) { onTimeApply_ = std::move(cb); }
+    void setOnOtherApply(std::function<void(const Settings&)> cb) { onOtherApply_ = std::move(cb); }
+    void setOnSaved(std::function<void(const Settings&)> cb) { onSaved_ = std::move(cb); }
+    const Settings& currentSettings() const { return data_; }
+
+    void refreshTheme() {
+        styleApplyBtn(timeApplyBtn_);
+        styleApplyBtn(otherApplyBtn_);
+        for (auto* row : ruleRows_) row->refreshTheme();
+        align_->refreshTheme();
+        picker_->refreshTheme();
+    }
+
+private:
+    void build() {
+        auto* root = new QVBoxLayout(this);
+        root->setContentsMargins(0, 0, 0, 0);
+        root->setSpacing(12);
+
+        timeApplyBtn_ = new QPushButton(QStringLiteral("应用"), this);
+        timeApplyBtn_->setFixedSize(72, 34);
+        timeApplyBtn_->setCursor(Qt::PointingHandCursor);
+        QObject::connect(timeApplyBtn_, &QPushButton::clicked, this, [this]() {
+            saveTime();
+            if (onTimeApply_) onTimeApply_(data_);
+        });
+
+        otherApplyBtn_ = new QPushButton(QStringLiteral("应用"), this);
+        otherApplyBtn_->setFixedSize(72, 34);
+        otherApplyBtn_->setCursor(Qt::PointingHandCursor);
+        QObject::connect(otherApplyBtn_, &QPushButton::clicked, this, [this]() {
+            saveRules(-1);
+            saveCustom();
+            if (onOtherApply_) onOtherApply_(data_);
+        });
+
+        root->addWidget(blockTime());
+        root->addWidget(blockGifts());
+        root->addWidget(blockCustom());
+        refreshTheme();
+    }
+
+    void styleApplyBtn(QPushButton* btn) {
+        const auto& C = theme();
+        btn->setStyleSheet(QStringLiteral(
+            "QPushButton { background: %1; color: #fff; border: none; border-radius: 6px;"
+            " font-size: 13px; font-weight: 600; }"
+            "QPushButton:hover { background: %2; color: %3; }"
+        ).arg(C.activeLine, C.hover, C.text));
+    }
+
+    SectionBlock* blockTime() {
+        auto* sec = new SectionBlock(QStringLiteral("剩余时间设置"), this);
+        sec->setFixedWidth(kPanelW);
+        auto* row = new QHBoxLayout;
+        row->setSpacing(4);
+        h_ = new IntField(999, 3, 28, kValWTime);
+        m_ = new IntField(60, 2, 28, 40);
+        s_ = new IntField(60, 2, 28, 40);
+        h_->setValue(data_.hours);
+        m_->setValue(data_.minutes);
+        s_->setValue(data_.seconds);
+
+        auto* inner = new QHBoxLayout;
+        inner->setSpacing(4);
+        const QVector<QPair<IntField*, QString>> fields = {
+            {h_, QStringLiteral("时")}, {m_, QStringLiteral("分")}, {s_, QStringLiteral("秒")}};
+        for (const auto& item : fields) {
+            item.first->setOnCommit([this]() { saveTime(); });
+            inner->addWidget(item.first);
+            auto* lb = new QLabel(item.second);
+            lb->setFixedHeight(28);
+            lb->setAlignment(Qt::AlignCenter);
+            inner->addWidget(lb);
+        }
+        row->addStretch();
+        row->addLayout(inner);
+        row->addSpacing(8);
+        row->addWidget(timeApplyBtn_);
+        row->addStretch();
+        sec->content->addLayout(row);
+        return sec;
+    }
+
+    SectionBlock* blockGifts() {
+        auto* sec = new SectionBlock(QStringLiteral("礼物设置"), this);
+        sec->setFixedWidth(kPanelW);
+        auto* gridHost = new QWidget(sec);
+        gridHost->setFixedWidth(kGridContentW);
+        auto* gh = new QHBoxLayout(gridHost);
+        gh->setContentsMargins(0, 0, 0, 0);
+        auto* grid = new QGridLayout;
+        grid->setHorizontalSpacing(kGridGap);
+        grid->setVerticalSpacing(6);
+        gh->addLayout(grid);
+
+        for (int i = 0; i < data_.rules.size(); ++i) {
+            auto* mod = new GiftRuleModule(i, data_.rules.at(i), gridHost);
+            mod->setBlockedFn([this]() { return assignedGifts(); });
+            mod->setPickerCallback([this](GiftRuleModule* target) {
+                pickTarget_ = target;
+                picker_->openAt(target->pickAnchor(), assignedGifts(), false);
+            });
+            mod->setOnChanged([this](int idx) { saveRules(idx); });
+            ruleRows_.append(mod);
+            grid->addWidget(mod, i / 2, i % 2);
+        }
+        sec->content->addWidget(gridHost);
+        return sec;
+    }
+
+    SectionBlock* blockCustom() {
+        auto* sec = new SectionBlock(QStringLiteral("自定义信息设置"), this);
+        sec->setFixedWidth(kPanelW);
+        custom_ = new QTextEdit(sec);
+        custom_->setPlaceholderText(QStringLiteral("最多两行"));
+        custom_->setFixedHeight(48);
+        custom_->setAcceptRichText(false);
+        custom_->setLineWrapMode(QTextEdit::WidgetWidth);
+        custom_->setPlainText(data_.customText);
+        QObject::connect(custom_, &QTextEdit::textChanged, this, [this]() { saveCustom(); });
+        sec->content->addWidget(custom_);
+
+        auto* ar = new QHBoxLayout;
+        ar->addWidget(new QLabel(QStringLiteral("对齐"), sec));
+        align_ = new ThemedComboBox(sec);
+        align_->setCompact(true);
+        align_->addItems(aligns());
+        align_->setFixedSize(kUnitW + 20, kCtrlH + 4);
+        align_->setCurrentText(data_.customAlign);
+        align_->setOnChange([this](const QString&) { saveCustom(); });
+        ar->addWidget(align_);
+        ar->addStretch();
+        sec->content->addLayout(ar);
+
+        auto* applyRow = new QHBoxLayout;
+        applyRow->setContentsMargins(0, 6, 0, 0);
+        applyRow->addStretch();
+        applyRow->addWidget(otherApplyBtn_);
+        sec->content->addLayout(applyRow);
+        return sec;
+    }
+
+    QSet<QString> assignedGifts() const {
+        QSet<QString> names;
+        for (auto* row : ruleRows_) {
+            const QString g = row->currentGift().trimmed();
+            if (!g.isEmpty()) names.insert(g);
+        }
+        return names;
+    }
+
+    void saveTime() {
+        data_.hours = h_->value();
+        data_.minutes = m_->value();
+        data_.seconds = s_->value();
+        persist();
+    }
+
+    void saveRules(int preferIndex) {
+        QVector<Rule> raw;
+        for (auto* row : ruleRows_) raw.append(row->toRule());
+        data_.rules = dedupeRules(raw, preferIndex);
+        for (int i = 0; i < ruleRows_.size() && i < data_.rules.size(); ++i) {
+            if (ruleRows_[i]->currentGift() != data_.rules[i].gift) {
+                ruleRows_[i]->loadRule(data_.rules[i]);
+            }
+        }
+        persist();
+    }
+
+    void saveCustom() {
+        QString text = custom_->toPlainText();
+        QStringList lines = text.split(QLatin1Char('\n'));
+        if (lines.size() > 2) {
+            text = QStringList(lines.mid(0, 2)).join(QLatin1Char('\n'));
+            const QSignalBlocker blocker(custom_);
+            custom_->setPlainText(text);
+        }
+        data_.customText = text.left(80);
+        data_.customAlign = align_->currentText();
+        persist();
+    }
+
+    void persist() {
+        saveSettings(data_);
+        if (onSaved_) onSaved_(data_);
+    }
+
+    Settings data_;
+    GiftPickerPopup* picker_ = nullptr;
+    GiftRuleModule* pickTarget_ = nullptr;
+    QVector<GiftRuleModule*> ruleRows_;
+    IntField* h_ = nullptr;
+    IntField* m_ = nullptr;
+    IntField* s_ = nullptr;
+    QTextEdit* custom_ = nullptr;
+    ThemedComboBox* align_ = nullptr;
+    QPushButton* timeApplyBtn_ = nullptr;
+    QPushButton* otherApplyBtn_ = nullptr;
+    std::function<void(const Settings&)> onTimeApply_;
+    std::function<void(const Settings&)> onOtherApply_;
+    std::function<void(const Settings&)> onSaved_;
+};
+
+// ═══════════════════════════════════════════
+// 用户时长统计
+// ═══════════════════════════════════════════
+
+// core 的 ledger 只给每人净秒数；这里按快照差分还原增加/减少两列。
+class UserLedger {
+public:
+    struct Row {
+        QString key;
+        int add = 0;
+        int sub = 0;
+        int net = 0;
+    };
+
+    void setOnChanged(std::function<void()> cb) { onChanged_ = std::move(cb); }
+
+    void clear() {
+        add_.clear();
+        sub_.clear();
+        lastNet_.clear();
+        notify();
+    }
+
+    // 返回本次快照中变化最大的用户与其变化量，供悬浮窗日志行使用。
+    QPair<QString, int> applySnapshot(const QMap<QString, int>& net) {
+        QString hotKey;
+        int hotDelta = 0;
+        for (auto it = net.constBegin(); it != net.constEnd(); ++it) {
+            const QString key = it.key().trimmed().isEmpty() ? QStringLiteral("(未知)") : it.key();
+            const int delta = it.value() - lastNet_.value(key, 0);
+            lastNet_.insert(key, it.value());
+            if (delta == 0) continue;
+            if (delta > 0) add_[key] += delta;
+            else sub_[key] += -delta;
+            if (std::abs(delta) > std::abs(hotDelta)) {
+                hotKey = key;
+                hotDelta = delta;
+            }
+        }
+        if (hotDelta != 0) notify();
+        return {hotKey, hotDelta};
+    }
+
+    bool isEmpty() const { return add_.isEmpty() && sub_.isEmpty(); }
+
+    QVector<Row> rows() const {
+        QSet<QString> keys;
+        for (auto it = add_.constBegin(); it != add_.constEnd(); ++it) keys.insert(it.key());
+        for (auto it = sub_.constBegin(); it != sub_.constEnd(); ++it) keys.insert(it.key());
+        QStringList sorted(keys.constBegin(), keys.constEnd());
+        sorted.sort();
+        QVector<Row> out;
+        for (const QString& key : sorted) {
+            Row row;
+            row.key = key;
+            row.add = add_.value(key, 0);
+            row.sub = sub_.value(key, 0);
+            row.net = row.add - row.sub;
+            if (row.add == 0 && row.sub == 0) continue;
+            out.append(row);
+        }
+        return out;
+    }
+
+private:
+    void notify() {
+        if (onChanged_) onChanged_();
+    }
+
+    QMap<QString, int> add_;
+    QMap<QString, int> sub_;
+    QMap<QString, int> lastNet_;
+    std::function<void()> onChanged_;
+};
+
+// 只读展示：加班机运行期间各用户的加减时长。
+class UserTimeWindow final : public QMainWindow {
+public:
+    static constexpr int kWinMargin = 14;
+    static constexpr int kWinRadius = 10;
+
+    explicit UserTimeWindow(QWidget* parent = nullptr)
+        : QMainWindow(parent, Qt::FramelessWindowHint | Qt::Window) {
+        setAttribute(Qt::WA_TranslucentBackground);
+        setAttribute(Qt::WA_QuitOnClose, false);
+        setWindowTitle(QStringLiteral("用户时长统计"));
+
+        const QFontMetrics fm(QFont(QStringLiteral("Microsoft YaHei"), 13));
+        const int cellPad = 36;
+        colIdW_ = fm.horizontalAdvance(QString(15, QLatin1Char('0'))) + cellPad;
+        colDataW_ = fm.horizontalAdvance(QStringLiteral("+999时59分59秒")) + cellPad;
+        const int minW = 16 * 2 + colIdW_ + colDataW_ * 3 + 24;
+        setMinimumSize(minW, 400 + kWinMargin * 2);
+        resize(minW + 40, 460 + kWinMargin * 2);
+
+        buildUi(minW - kWinMargin * 2);
+        refreshTheme();
+        liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
+    }
+
+    void bindLedger(UserLedger* ledger) {
+        ledger_ = ledger;
+        refresh();
+    }
+
+    void refresh() {
+        if (!ledger_ || ledger_->isEmpty()) {
+            hint_->setText(QStringLiteral("当前没有统计数据。请先打开加班机并接收礼物后再查看。"));
+            table_->setRowCount(0);
+            return;
+        }
+        hint_->setText(
+            QStringLiteral("以下为本次加班机运行期间，各用户礼物触发的加减时长汇总（实时更新）。"));
+        const auto rows = ledger_->rows();
+        table_->setRowCount(rows.size());
+        for (int i = 0; i < rows.size(); ++i) {
+            const auto& row = rows.at(i);
+            table_->setItem(i, 0, new QTableWidgetItem(row.key));
+            const QVector<QString> cells = {
+                formatStatsDuration(row.add, QStringLiteral("+")),
+                formatStatsDuration(row.sub, QStringLiteral("-")),
+                formatStatsDuration(row.net, QString(), true),
+            };
+            for (int c = 0; c < cells.size(); ++c) {
+                auto* item = new QTableWidgetItem(cells.at(c));
+                item->setTextAlignment(Qt::AlignCenter);
+                table_->setItem(i, c + 1, item);
+            }
+        }
+    }
+
+    void refreshTheme() {
+        const auto& C = theme();
+        setStyleSheet(QStringLiteral(
+            "QWidget { background: transparent; color: %1;"
+            " font-family: 'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;"
+            " font-size: 13px; }"
+            "#UserTimeWindowCard { background: %2; border-radius: %3px; border: 1px solid %4; }"
+            "#UserTimeTitleBar { background: transparent; }"
+            "#OvertimePageTitle { font-size: 20px; font-weight: 600; color: %1; }"
+            "#UserTimeCloseBtn { background: transparent; border: none; color: %5;"
+            " font-size: 13px; border-radius: 6px; }"
+            "#UserTimeCloseBtn:hover { background: %6; color: #ffffff; }"
+            "#UserTimeStatsTable { background: %7; color: %1; border: none;"
+            " gridline-color: transparent; alternate-background-color: %8; }"
+            "#UserTimeStatsTable::item { padding: 8px 18px; }"
+            "#UserTimeStatsTable QHeaderView::section { background: %9; color: %5;"
+            " border: none; border-bottom: 1px solid %4; padding: 10px 18px; font-weight: 600; }"
+            "#UserTimeStatsTable QScrollBar:vertical { background: %8; width: 8px;"
+            " margin: 6px 2px 6px 0; border-radius: 4px; }"
+            "#UserTimeStatsTable QScrollBar::handle:vertical { background: %4;"
+            " border-radius: 4px; min-height: 28px; }"
+            "#UserTimeStatsTable QScrollBar::add-line:vertical,"
+            "#UserTimeStatsTable QScrollBar::sub-line:vertical { height: 0; }"
+        ).arg(C.text, C.bg, QString::number(kWinRadius), C.winEdge, C.textMuted, C.closeHover,
+              C.card, C.hover, C.sidebar));
+        hint_->setStyleSheet(QStringLiteral("color: %1; font-size: 12px; background: transparent;")
+                                 .arg(C.textMuted));
+    }
+
+protected:
+    void resizeEvent(QResizeEvent* event) override {
+        QMainWindow::resizeEvent(event);
+        QTimer::singleShot(0, this, [this]() { fitColumns(); });
+    }
+
+    void showEvent(QShowEvent* event) override {
+        QMainWindow::showEvent(event);
+        QTimer::singleShot(0, this, [this]() { fitColumns(); });
+    }
+
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton) {
+            const QRect barRect(titleBar_->mapTo(this, QPoint(0, 0)), titleBar_->size());
+            if (barRect.contains(event->position().toPoint())) {
+                dragging_ = true;
+                dragPos_ = event->globalPosition().toPoint() - frameGeometry().topLeft();
+            }
+        }
+        QMainWindow::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (dragging_ && (event->buttons() & Qt::LeftButton)) {
+            move(event->globalPosition().toPoint() - dragPos_);
+        }
+        QMainWindow::mouseMoveEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        dragging_ = false;
+        QMainWindow::mouseReleaseEvent(event);
+    }
+
+    void closeEvent(QCloseEvent* event) override {
+        ledger_ = nullptr;
+        event->ignore();
+        hide();
+    }
+
+private:
+    void buildUi(int contentMinW) {
+        table_ = new QTableWidget(0, 4, this);
+        table_->setObjectName(QStringLiteral("UserTimeStatsTable"));
+        table_->setHorizontalHeaderLabels({QStringLiteral("抖音 ID"), QStringLiteral("增加"),
+                                           QStringLiteral("减少"), QStringLiteral("总和")});
+        table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Fixed);
+        table_->setColumnWidth(0, colIdW_);
+        for (int col = 1; col <= 3; ++col) {
+            table_->horizontalHeader()->setSectionResizeMode(col, QHeaderView::Fixed);
+            table_->setColumnWidth(col, colDataW_);
+        }
+        table_->verticalHeader()->setVisible(false);
+        table_->setFrameShape(QFrame::NoFrame);
+        table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        table_->setSelectionMode(QAbstractItemView::NoSelection);
+        table_->setFocusPolicy(Qt::NoFocus);
+        table_->setShowGrid(false);
+        table_->setAlternatingRowColors(true);
+        table_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        table_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+        table_->setMinimumWidth(contentMinW);
+
+        auto* outer = new QWidget(this);
+        auto* outerLay = new QVBoxLayout(outer);
+        outerLay->setContentsMargins(kWinMargin, kWinMargin, kWinMargin, kWinMargin);
+        outerLay->setSpacing(0);
+
+        auto* card = new QFrame(outer);
+        card->setObjectName(QStringLiteral("UserTimeWindowCard"));
+        auto* shadow = new QGraphicsDropShadowEffect(card);
+        shadow->setBlurRadius(32);
+        shadow->setOffset(0, 4);
+        shadow->setColor(QColor(0, 0, 0, 55));
+        card->setGraphicsEffect(shadow);
+
+        auto* lay = new QVBoxLayout(card);
+        lay->setContentsMargins(16, 12, 16, 16);
+        lay->setSpacing(12);
+
+        titleBar_ = new QWidget(card);
+        titleBar_->setObjectName(QStringLiteral("UserTimeTitleBar"));
+        auto* tb = new QHBoxLayout(titleBar_);
+        tb->setContentsMargins(0, 0, 0, 0);
+        tb->setSpacing(8);
+        auto* title = new QLabel(QStringLiteral("用户时长统计"), titleBar_);
+        title->setObjectName(QStringLiteral("OvertimePageTitle"));
+        auto* closeBtn = new QPushButton(QStringLiteral("✕"), titleBar_);
+        closeBtn->setObjectName(QStringLiteral("UserTimeCloseBtn"));
+        closeBtn->setFixedSize(32, 32);
+        closeBtn->setCursor(Qt::PointingHandCursor);
+        QObject::connect(closeBtn, &QPushButton::clicked, this, [this]() { close(); });
+        tb->addWidget(title);
+        tb->addStretch();
+        tb->addWidget(closeBtn);
+        lay->addWidget(titleBar_);
+
+        hint_ = new QLabel(card);
+        hint_->setWordWrap(true);
+        lay->addWidget(hint_);
+        table_->setParent(card);
+        lay->addWidget(table_, 1);
+
+        outerLay->addWidget(card);
+        setCentralWidget(outer);
+    }
+
+    // 不低于最小列宽的前提下横向铺满视口。
+    void fitColumns() {
+        const int viewportW = table_->viewport()->width();
+        if (viewportW <= 0) return;
+        const int minTotal = colIdW_ + colDataW_ * 3;
+        if (viewportW <= minTotal) {
+            table_->setColumnWidth(0, colIdW_);
+            for (int col = 1; col <= 3; ++col) table_->setColumnWidth(col, colDataW_);
+            return;
+        }
+        const int extra = viewportW - minTotal;
+        const int idExtra = static_cast<int>(extra * 0.34);
+        const int durExtra = (extra - idExtra) / 3;
+        const int durRem = extra - idExtra - durExtra * 3;
+        table_->setColumnWidth(0, colIdW_ + idExtra);
+        for (int i = 0; i < 3; ++i) {
+            table_->setColumnWidth(i + 1, colDataW_ + durExtra + (i < durRem ? 1 : 0));
+        }
+    }
+
+    int colIdW_ = 0;
+    int colDataW_ = 0;
+    QTableWidget* table_ = nullptr;
+    QLabel* hint_ = nullptr;
+    QWidget* titleBar_ = nullptr;
+    UserLedger* ledger_ = nullptr;
+    bool dragging_ = false;
+    QPoint dragPos_;
+};
+
+// ═══════════════════════════════════════════
+// 悬浮窗：大组件按 cm 定尺，随窗口等比缩放
+// ═══════════════════════════════════════════
+
+static constexpr int kRefBlockW = 280;
+static constexpr qreal kCmTimerW = 4.0;
+static constexpr qreal kCmTimerH = 2.0;
+static constexpr qreal kCmSlotH = 1.5;
+static constexpr qreal kCmCustomH = 1.2;
+static constexpr qreal kCmLogH = 1.2;
+static constexpr qreal kCmRowGap = 0.3;
+static constexpr qreal kCmTitleTimerGap = 0.1;
+static constexpr qreal kCmGridGap = 0.25;
+static constexpr qreal kCmColGap = 0.2;
+
+static qreal screenDpi() {
+    static qreal dpi = 0;
+    if (dpi <= 0) {
+        auto* screen = QApplication::primaryScreen();
+        dpi = screen ? screen->logicalDotsPerInch() : 96.0;
+    }
+    return dpi;
+}
+
+static int cmToPx(qreal cm) {
+    return std::max(1, static_cast<int>(std::lround(screenDpi() / 2.54 * cm)));
+}
+
+static int windowMarginPx() {
+    static int margin = 0;
+    if (margin <= 0) margin = cmToPx(0.5);
+    return margin;
+}
+
+static int refTimerW() { return cmToPx(kCmTimerW); }
+static int refTimerH() { return cmToPx(kCmTimerH); }
+static int refTitleTimerGap() { return cmToPx(kCmTitleTimerGap); }
+static int refTitleRowH() { return std::max(cmToPx(0.35), 19); }
+static int refTitleTimerSectionH() { return refTitleRowH() + refTitleTimerGap() + refTimerH(); }
+static int refSlotRowH() { return cmToPx(kCmSlotH); }
+static int refCustomRowH() { return cmToPx(kCmCustomH); }
+static int refLogRowH() { return cmToPx(kCmLogH); }
+static int refRowGap() { return cmToPx(kCmRowGap); }
+static int refGridGap() { return cmToPx(kCmGridGap); }
+static int refColGap() { return cmToPx(kCmColGap); }
+static int refBlockW() { return kRefBlockW; }
+static int refSlotW() { return (refBlockW() - refColGap()) / 2; }
+
+static int refBlockH() {
+    const int gridH = 3 * refSlotRowH() + 2 * refGridGap();
+    const QVector<int> rows = {refTitleTimerSectionH(), gridH, refCustomRowH(), refLogRowH()};
+    int sum = 0;
+    for (int h : rows) sum += h;
+    return sum + refRowGap() * (rows.size() - 1);
+}
+
+static QSize defaultWindowSize() {
+    const int m = windowMarginPx();
+    return QSize(refBlockW() + 2 * m,
+                 RippleOverlayRoot::kTopbarH + refBlockH() + 2 * m);
+}
+
+static qreal windowAspect() {
+    const QSize s = defaultWindowSize();
+    return qreal(s.width()) / std::max(1, s.height());
+}
+
+// 皮肤驱动的文字：字号按盒子二分拟合，绘制带描边阴影。
+class SkinTextLabel final : public QLabel {
+public:
+    SkinTextLabel(const QString& role, const QString& text, bool wordWrap = false,
+                  QWidget* parent = nullptr)
+        : QLabel(text, parent), role_(role) {
+        setAttribute(Qt::WA_TranslucentBackground);
+        setWordWrap(wordWrap);
+        skin_ = activeOvertimeSkin();
+        px_ = skin_.roleStyle(kSurface, role_).pixelSize;
+        setAlignment(skin_.roleStyle(kSurface, role_).qtAlign());
+    }
+
+    void refreshSkin() {
+        skin_ = activeOvertimeSkin();
+        update();
+    }
+
+    void fitToBox(const QString& sample, int w, int h, qreal scale) {
+        px_ = skin_.fitRole(kSurface, role_, sample, std::max(1, w), std::max(1, h), scale);
+        applyFont();
+    }
+
+    void setPixelSizeDirect(int px) {
+        px_ = std::max(6, px);
+        applyFont();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        const auto style = skin_.roleStyle(kSurface, role_);
+        QPainter p(this);
+        p.setRenderHint(QPainter::TextAntialiasing, true);
+        p.setFont(style.font(px_));
+        int flags = static_cast<int>(alignment());
+        if (wordWrap()) flags |= Qt::TextWordWrap;
+        p.setPen(skin_.color(QStringLiteral("text_shadow"), QColor(0, 0, 0, 160)));
+        p.drawText(rect().translated(1, 1), flags, text());
+        p.setPen(skin_.color(QStringLiteral("text_fill"), QColor(255, 255, 255)));
+        p.drawText(rect(), flags, text());
+    }
+
+private:
+    static const QString kSurface;
+
+    void applyFont() {
+        QFont f = skin_.roleStyle(kSurface, role_).font(px_);
+        setFont(f);
+        update();
+    }
+
+    QString role_;
+    ToolSkin skin_;
+    int px_ = 13;
+};
+
+const QString SkinTextLabel::kSurface = QStringLiteral("overlay");
+
+// 单个礼物格：左 icon，右上行名、下行规则标签。
+class GiftSlotWidget final : public QFrame {
+public:
+    explicit GiftSlotWidget(const Rule& rule, QWidget* parent = nullptr) : QFrame(parent) {
+        setAttribute(Qt::WA_TranslucentBackground);
+        giftName_ = rule.gift;
+
+        iconLbl_ = new QLabel(this);
+        iconLbl_->setAlignment(Qt::AlignCenter);
+        iconLbl_->setStyleSheet(QStringLiteral("background: transparent;"));
+        nameLbl_ = new SkinTextLabel(QStringLiteral("gift_name"), giftName_, false, this);
+        timeLbl_ = new SkinTextLabel(QStringLiteral("gift_time"), ruleSlotLabel(rule), false, this);
+
+        auto* root = new QHBoxLayout(this);
+        root->setContentsMargins(0, 0, 0, 0);
+        root->setSpacing(4);
+        root->addWidget(iconLbl_);
+        auto* col = new QVBoxLayout;
+        col->setContentsMargins(0, 0, 0, 0);
+        col->setSpacing(1);
+        col->addWidget(nameLbl_);
+        col->addWidget(timeLbl_);
+        root->addLayout(col, 1);
+
+        applyScale(1.0, true);
+    }
+
+    void setRule(const QString& giftName, const QString& timeLabel) {
+        giftName_ = giftName;
+        nameLbl_->setText(giftName);
+        timeLbl_->setText(timeLabel);
+        loadedIconSide_ = -1;
+        applyScale(scale_, true);
+    }
+
+    void refreshSkin() {
+        nameLbl_->refreshSkin();
+        timeLbl_->refreshSkin();
+    }
+
+    void applyScale(qreal scale, bool heavy) {
+        const qreal s = std::max(0.5, scale);
+        scale_ = s;
+        const int slotW = static_cast<int>(std::lround(refSlotW() * s));
+        const int slotH = static_cast<int>(std::lround(refSlotRowH() * s));
+        const int iconSide = std::max(14, static_cast<int>(std::lround(slotH * 0.82)));
+        setFixedSize(slotW, slotH);
+        iconLbl_->setFixedSize(iconSide, iconSide);
+        if (heavy || loadedIconSide_ < 0 || std::abs(iconSide - loadedIconSide_) >= 2) {
+            const QPixmap px = liveaio::resources::loadGiftPixmap(g_appRoot, giftName_, iconSide);
+            if (!px.isNull()) {
+                iconLbl_->setPixmap(px);
+                iconLbl_->setText(QString());
+            } else {
+                iconLbl_->setPixmap(QPixmap());
+                iconLbl_->setText(QStringLiteral("·"));
+            }
+            loadedIconSide_ = iconSide;
+        }
+        const int textW = std::max(20, slotW - iconSide - int(std::lround(6 * s)));
+        const int textH = std::max(8, (slotH - int(std::lround(2 * s))) / 2);
+        if (heavy) {
+            nameLbl_->fitToBox(giftName_, textW, textH, s);
+            timeLbl_->fitToBox(timeLbl_->text(), textW, textH, s);
+        } else {
+            // 拖拽中用近似字号，避免每帧二分拟合。
+            const int approx = std::max(8, static_cast<int>(std::lround(13 * s)));
+            nameLbl_->setPixelSizeDirect(approx);
+            timeLbl_->setPixelSizeDirect(approx);
+        }
+    }
+
+private:
+    QString giftName_;
+    QLabel* iconLbl_ = nullptr;
+    SkinTextLabel* nameLbl_ = nullptr;
+    SkinTextLabel* timeLbl_ = nullptr;
+    qreal scale_ = 1.0;
+    int loadedIconSide_ = -1;
+};
+
+// 底部日志行：左「谁送了什么」，右「±时长」。
+class ResultRow final : public QWidget {
+public:
+    explicit ResultRow(QWidget* parent = nullptr) : QWidget(parent) {
+        setAttribute(Qt::WA_TranslucentBackground);
+        leftLbl_ = new SkinTextLabel(QStringLiteral("log_left"), QString(), false, this);
+        rightLbl_ = new SkinTextLabel(QStringLiteral("log_right"), QString(), false, this);
+        auto* lay = new QHBoxLayout(this);
+        lay->setContentsMargins(0, 0, 0, 0);
+        lay->setSpacing(6);
+        lay->addWidget(leftLbl_, 1);
+        lay->addWidget(rightLbl_, 0);
+        applyScale(1.0, true);
+    }
+
+    void setEntry(const QString& left, int deltaSeconds) {
+        leftLbl_->setText(left);
+        rightLbl_->setText(deltaSeconds ? formatDeltaLog(deltaSeconds) : QString());
+        applyScale(scale_, true);
+    }
+
+    void refreshSkin() {
+        leftLbl_->refreshSkin();
+        rightLbl_->refreshSkin();
+    }
+
+    void applyScale(qreal scale, bool heavy) {
+        const qreal s = std::max(0.5, scale);
+        scale_ = s;
+        const int h = static_cast<int>(std::lround(refLogRowH() * s));
+        const int w = static_cast<int>(std::lround(refBlockW() * s));
+        setFixedHeight(h);
+        const int pad = std::max(2, static_cast<int>(std::lround(2 * s)));
+        const int textW = std::max(20, w / 2 - pad);
+        if (heavy) {
+            leftLbl_->fitToBox(leftLbl_->text().isEmpty() ? QStringLiteral("占位")
+                                                          : leftLbl_->text(),
+                               textW, h - pad, s);
+            rightLbl_->fitToBox(rightLbl_->text().isEmpty() ? QStringLiteral("+0秒")
+                                                           : rightLbl_->text(),
+                                textW, h - pad, s);
+        } else {
+            const int approx = std::max(8, static_cast<int>(std::lround(13 * s)));
+            leftLbl_->setPixelSizeDirect(approx);
+            rightLbl_->setPixelSizeDirect(approx);
+        }
+    }
+
+private:
+    SkinTextLabel* leftLbl_ = nullptr;
+    SkinTextLabel* rightLbl_ = nullptr;
+    qreal scale_ = 1.0;
+};
+
+// 倒计时：1x 为 4cm×2cm，随大组件同比缩放。
+class TimerBox final : public QFrame {
+public:
+    explicit TimerBox(QWidget* parent = nullptr) : QFrame(parent) {
+        setAttribute(Qt::WA_TranslucentBackground);
+        lbl_ = new SkinTextLabel(QStringLiteral("timer"), formatTimerDisplay(0), false, this);
+        auto* lay = new QVBoxLayout(this);
+        lay->setContentsMargins(0, 0, 0, 0);
+        lay->addWidget(lbl_, 0, Qt::AlignHCenter | Qt::AlignTop);
+    }
+
+    void setTimerText(const QString& text) {
+        lbl_->setText(text);
+        applyScale(scale_, true);
+    }
+
+    void refreshSkin() { lbl_->refreshSkin(); }
+
+    void applyScale(qreal scale, bool heavy) {
+        const qreal s = std::max(0.5, scale);
+        scale_ = s;
+        const int w = static_cast<int>(std::lround(refTimerW() * s));
+        const int h = static_cast<int>(std::lround(refTimerH() * s));
+        setFixedSize(w, h);
+        const int pad = std::max(2, static_cast<int>(std::lround(kTimerEdgePad * s)));
+        lbl_->setFixedSize(w - pad, h - pad);
+        if (heavy) {
+            lbl_->fitToBox(lbl_->text(), w - pad, h - pad, s);
+        } else {
+            lbl_->setPixelSizeDirect(std::max(10, static_cast<int>(std::lround(h * 0.7))));
+        }
+    }
+
+private:
+    static constexpr int kTimerEdgePad = 2;
+
+    SkinTextLabel* lbl_ = nullptr;
+    qreal scale_ = 1.0;
+};
+
+// 标题（置底）+ 0.1cm + 倒计时（置顶）。
+class TitleTimerSection final : public QWidget {
+public:
+    explicit TitleTimerSection(QWidget* parent = nullptr) : QWidget(parent) {
+        setAttribute(Qt::WA_TranslucentBackground);
+
+        titleWrap_ = new QWidget(this);
+        titleWrap_->setAttribute(Qt::WA_TranslucentBackground);
+        titleLbl_ = new SkinTextLabel(QStringLiteral("title"), QStringLiteral("距离下播时间"),
+                                      false, titleWrap_);
+        auto* tw = new QVBoxLayout(titleWrap_);
+        tw->setContentsMargins(0, 0, 0, 0);
+        tw->setSpacing(0);
+        tw->addStretch(1);
+        tw->addWidget(titleLbl_, 0, Qt::AlignHCenter | Qt::AlignBottom);
+
+        timerBox_ = new TimerBox(this);
+
+        lay_ = new QVBoxLayout(this);
+        lay_->setContentsMargins(0, 0, 0, 0);
+        lay_->setSpacing(refTitleTimerGap());
+        lay_->addWidget(titleWrap_);
+        lay_->addWidget(timerBox_, 0, Qt::AlignHCenter);
+    }
+
+    TimerBox* timerBox() const { return timerBox_; }
+
+    void refreshSkin() {
+        titleLbl_->refreshSkin();
+        timerBox_->refreshSkin();
+    }
+
+    void applyScale(qreal scale, int blockW, int pad, bool heavy) {
+        const qreal s = std::max(0.5, scale);
+        const int sectionGap = std::max(1, static_cast<int>(std::lround(refTitleTimerGap() * s)));
+        lay_->setSpacing(sectionGap);
+        if (heavy) {
+            titleLbl_->fitToBox(titleLbl_->text(), blockW - pad, refTitleRowH(), s);
+        } else {
+            titleLbl_->setPixelSizeDirect(std::max(8, static_cast<int>(std::lround(13 * s))));
+        }
+        const int titleRowH = QFontMetrics(titleLbl_->font()).height()
+                              + std::max(1, static_cast<int>(std::lround(2 * s)));
+        titleWrap_->setFixedHeight(titleRowH);
+        timerBox_->applyScale(s, heavy);
+        setFixedHeight(titleRowH + sectionGap + timerBox_->height());
+    }
+
+private:
+    QWidget* titleWrap_ = nullptr;
+    SkinTextLabel* titleLbl_ = nullptr;
+    TimerBox* timerBox_ = nullptr;
+    QVBoxLayout* lay_ = nullptr;
+};
+
+// 加班机大组件：窗口尺寸只引用本组件。
+class OvertimeBlock final : public QWidget {
+public:
+    explicit OvertimeBlock(QWidget* parent = nullptr) : QWidget(parent) {
+        setAttribute(Qt::WA_TranslucentBackground);
+        setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        settings_ = loadSettings();
+        skin_ = activeOvertimeSkin();
+
+        rootLay_ = new QVBoxLayout(this);
+        rootLay_->setContentsMargins(0, 0, 0, 0);
+        rootLay_->setSpacing(refRowGap());
+
+        titleTimer_ = new TitleTimerSection(this);
+        rootLay_->addWidget(titleTimer_);
+
+        gridWrap_ = new QWidget(this);
+        gridWrap_->setAttribute(Qt::WA_TranslucentBackground);
+        grid_ = new QGridLayout(gridWrap_);
+        grid_->setContentsMargins(0, 0, 0, 0);
+        grid_->setHorizontalSpacing(refColGap());
+        grid_->setVerticalSpacing(refGridGap());
+        for (int i = 0; i < settings_.rules.size(); ++i) {
+            auto* slot = new GiftSlotWidget(settings_.rules.at(i), gridWrap_);
+            slots_.append(slot);
+            grid_->addWidget(slot, i / 2, i % 2, Qt::AlignLeft);
+        }
+        rootLay_->addWidget(gridWrap_);
+
+        customLbl_ = new SkinTextLabel(QStringLiteral("custom"), settings_.customText, true, this);
+        rootLay_->addWidget(customLbl_);
+
+        resultRow_ = new ResultRow(this);
+        rootLay_->addWidget(resultRow_);
+
+        applyScale(1.0, true);
+        applySettings(settings_);
+    }
+
+    void setRemainingDisplay(int totalSec) {
+        titleTimer_->timerBox()->setTimerText(formatTimerDisplay(totalSec));
+    }
+
+    void setGiftLog(const QString& left, int deltaSeconds) {
+        resultRow_->setEntry(left, deltaSeconds);
+    }
+
+    void applySettings(const Settings& settings) {
+        settings_ = settings;
+        for (int i = 0; i < slots_.size() && i < settings_.rules.size(); ++i) {
+            const Rule& rule = settings_.rules.at(i);
+            slots_[i]->setRule(rule.gift, ruleSlotLabel(rule));
+        }
+        customLbl_->setText(settings_.customText);
+        customLbl_->setAlignment(alignToQt(settings_.customAlign) | Qt::AlignTop);
+        applyScale(scale_, true);
+    }
+
+    void refreshSkin() {
+        skin_ = activeOvertimeSkin();
+        titleTimer_->refreshSkin();
+        for (auto* slot : slots_) slot->refreshSkin();
+        customLbl_->refreshSkin();
+        resultRow_->refreshSkin();
+        update();
+    }
+
+    void applyScale(qreal scale, bool heavy) {
+        const qreal s = std::max(0.5, scale);
+        scale_ = s;
+        rootLay_->setSpacing(std::max(1, static_cast<int>(std::lround(refRowGap() * s))));
+        grid_->setHorizontalSpacing(std::max(1, static_cast<int>(std::lround(refColGap() * s))));
+        grid_->setVerticalSpacing(std::max(1, static_cast<int>(std::lround(refGridGap() * s))));
+
+        const int bw = static_cast<int>(std::lround(refBlockW() * s));
+        const int pad = std::max(2, static_cast<int>(std::lround(2 * s)));
+        titleTimer_->applyScale(s, bw, pad, heavy);
+
+        const int gridH = static_cast<int>(
+            std::lround((3 * refSlotRowH() + 2 * refGridGap()) * s));
+        gridWrap_->setFixedHeight(gridH);
+        for (auto* slot : slots_) slot->applyScale(s, heavy);
+
+        const int customH = static_cast<int>(std::lround(refCustomRowH() * s));
+        customLbl_->setFixedHeight(customH);
+        if (heavy) {
+            customLbl_->fitToBox(customLbl_->text(), bw - pad, customH - pad, s);
+        } else {
+            customLbl_->setPixelSizeDirect(
+                std::max(8, static_cast<int>(std::lround(13 * s))));
+        }
+        resultRow_->applyScale(s, heavy);
+        setFixedSize(bw, static_cast<int>(std::lround(refBlockH() * s)));
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        const QColor bg = skin_.color(QStringLiteral("block_bg"), QColor(0, 0, 0, 0));
+        if (bg.alpha() == 0) return;
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(Qt::NoPen);
+        p.setBrush(bg);
+        const int radius = std::max(0, skin_.metrics().padH);
+        p.drawRoundedRect(rect(), radius, radius);
+    }
+
+private:
+    Settings settings_;
+    ToolSkin skin_;
+    QVBoxLayout* rootLay_ = nullptr;
+    TitleTimerSection* titleTimer_ = nullptr;
+    QWidget* gridWrap_ = nullptr;
+    QGridLayout* grid_ = nullptr;
+    QVector<GiftSlotWidget*> slots_;
+    SkinTextLabel* customLbl_ = nullptr;
+    ResultRow* resultRow_ = nullptr;
+    qreal scale_ = 1.0;
+};
+
+class OvertimeRoot final : public RippleOverlayRoot {
+public:
+    OvertimeRoot(QMainWindow* win, std::function<void()> onResume)
+        : RippleOverlayRoot(win), onResume_(std::move(onResume)) {
+        block_ = new OvertimeBlock(content());
+    }
+
+    OvertimeBlock* block() const { return block_; }
+
+    // 大组件按 0.5cm 边距居中，并等比缩放到内容区。
+    void layoutBlock(bool heavy = true) {
+        if (resizeFrozen()) return;
+        const int cw = content()->width();
+        const int ch = content()->height();
+        if (cw <= 0 || ch <= 0) return;
+        const int m = windowMarginPx();
+        const int availW = std::max(1, cw - 2 * m);
+        const int availH = std::max(1, ch - 2 * m);
+        const qreal s = std::max(0.5, std::min(qreal(availW) / refBlockW(),
+                                               qreal(availH) / refBlockH()));
+        const int bw = static_cast<int>(std::lround(refBlockW() * s));
+        const int bh = static_cast<int>(std::lround(refBlockH() * s));
+        block_->setGeometry(m + (availW - bw) / 2, m + (availH - bh) / 2, bw, bh);
+        block_->applyScale(s, heavy);
+    }
+
+protected:
+    void onContentGeometryChanged() override { layoutBlock(true); }
+
+    void onResizeResume() override {
+        if (onResume_) onResume_();
+    }
+
+    // 整窗按初始比例缩放，避免大组件留白。
+    QRect resizeGeometry(Edge edge, const QPoint& delta, const QRect& start) const override {
+        const qreal aspect = windowAspect();
+        const int minW = hostWindow()->minimumWidth();
+        const int minH = hostWindow()->minimumHeight();
+        QRect geo = start;
+        int newW = 0;
+        int newH = 0;
+        if (edge == Edge::Right || edge == Edge::BottomRight) {
+            newW = std::max(minW, start.width() + delta.x());
+            newH = std::max(minH, static_cast<int>(std::lround(newW / aspect)));
+            newW = static_cast<int>(std::lround(newH * aspect));
+        } else if (edge == Edge::Left || edge == Edge::BottomLeft) {
+            newW = std::max(minW, start.width() - delta.x());
+            newH = std::max(minH, static_cast<int>(std::lround(newW / aspect)));
+            newW = static_cast<int>(std::lround(newH * aspect));
+            geo.setLeft(geo.right() - newW);
+            geo.setBottom(geo.top() + newH);
+            return geo;
+        } else if (edge == Edge::Bottom) {
+            newH = std::max(minH, start.height() + delta.y());
+            newW = std::max(minW, static_cast<int>(std::lround(newH * aspect)));
+            newH = static_cast<int>(std::lround(newW / aspect));
+        } else {
+            return start;
+        }
+        geo.setRight(geo.left() + newW);
+        geo.setBottom(geo.top() + newH);
+        return geo;
+    }
+
+private:
+    OvertimeBlock* block_ = nullptr;
+    std::function<void()> onResume_;
+};
+
+class OvertimeWindow final : public RippleOverlayWindow {
+public:
+    OvertimeWindow()
+        : RippleOverlayWindow(QStringLiteral("加班机"),
+                              QStringLiteral("overtime_window_geometry")) {
+        const QSize def = defaultWindowSize();
+        setMinimumSize(static_cast<int>(def.width() * 0.75),
+                       static_cast<int>(def.height() * 0.75));
+        restoreGeometryFromConfig(def.width(), def.height());
+        root_ = new OvertimeRoot(this, [this]() { onFrameResumed(); });
+        attachRoot(root_);
+        applySettings(loadSettings());
+    }
+
+    UserLedger* userLedger() { return &ledger_; }
+
+    void applySettings(const Settings& settings) {
+        settings_ = settings;
+        remaining_ = totalSeconds(settings.hours, settings.minutes, settings.seconds);
+        root_->block()->applySettings(settings_);
+        root_->block()->setRemainingDisplay(remaining_);
+        root_->layoutBlock(true);
+    }
+
+    // 仅剩余时间生效，不动礼物规则与自定义文字。
+    void applyTimeOnly(const Settings& settings) {
+        settings_.hours = settings.hours;
+        settings_.minutes = settings.minutes;
+        settings_.seconds = settings.seconds;
+        remaining_ = totalSeconds(settings_.hours, settings_.minutes, settings_.seconds);
+        root_->block()->setRemainingDisplay(remaining_);
+    }
+
+    void applyOtherOnly(const Settings& settings) {
+        settings_.rules = settings.rules;
+        settings_.customText = settings.customText;
+        settings_.customAlign = settings.customAlign;
+        root_->block()->applySettings(settings_);
+        root_->layoutBlock(true);
+    }
+
+    void refreshSkin() { root_->block()->refreshSkin(); }
+
+    // Go core 的 tick 是唯一时间源，本地不自走表。
+    void applyCoreRemaining(int seconds) {
+        remaining_ = std::max(0, seconds);
+        if (root_->resizeFrozen()) return;
+        root_->block()->setRemainingDisplay(remaining_);
+    }
+
+    // 返回是否吃到了净变化；调用方据此决定是否清掉 pending 模拟礼物名。
+    bool applyLedger(const QMap<QString, int>& net, const QString& simGift, int simCount) {
+        const auto hot = ledger_.applySnapshot(net);
+        if (hot.second == 0) return false;
+        const QString gift = simGift.isEmpty() ? QStringLiteral("礼物") : simGift;
+        lastLogLeft_ = giftLogLeft(hot.first, gift, std::max(1, simCount));
+        lastLogDelta_ = hot.second;
+        if (!root_->resizeFrozen()) {
+            root_->block()->setGiftLog(lastLogLeft_, lastLogDelta_);
+        }
+        return true;
+    }
+
+protected:
+    void showEvent(QShowEvent* event) override {
+        RippleOverlayWindow::showEvent(event);
+        QTimer::singleShot(0, this, [this]() {
+            applySettings(loadSettings());
+            root_->layoutBlock(true);
+        });
+    }
+
+    void hideEvent(QHideEvent* event) override {
+        ledger_.clear();
+        RippleOverlayWindow::hideEvent(event);
+    }
+
+private:
+    void onFrameResumed() {
+        syncRadiusAfterResize();
+        root_->block()->setRemainingDisplay(remaining_);
+        if (!lastLogLeft_.isEmpty()) {
+            root_->block()->setGiftLog(lastLogLeft_, lastLogDelta_);
+        }
+    }
+
+    OvertimeRoot* root_ = nullptr;
+    Settings settings_;
+    UserLedger ledger_;
+    int remaining_ = 0;
+    QString lastLogLeft_;
+    int lastLogDelta_ = 0;
+};
+
+// ═══════════════════════════════════════════
+// 控制面板
+// ═══════════════════════════════════════════
+
+class OvertimeToolWindow final : public ToolWindowBase {
+public:
+    explicit OvertimeToolWindow(CoreClient* core) : ToolWindowBase(core) {
+        setWindowTitle(QStringLiteral("设置"));
+        setFixedSize(kToolWinW, kToolWinH);
+        build();
+        refreshTheme();
+        liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
+        pushSettings(loadSettings());
+    }
+
+    ~OvertimeToolWindow() override {
+        if (overlay_) {
+            overlay_->setOnClosed(nullptr);
+            overlay_->userLedger()->setOnChanged(nullptr);
+            overlay_->deleteLater();
+            overlay_ = nullptr;
+        }
+    }
+
+    QString toolId() const override { return QStringLiteral("overtime"); }
+
+    void onCorePacket(const QJsonObject& packet) override {
+        const QString op = packet.value(QStringLiteral("op")).toString();
+        if (op == QStringLiteral("tick")) {
+            if (overlay_ && overlay_->isVisible()) {
+                overlay_->applyCoreRemaining(
+                    packet.value(QStringLiteral("remaining_seconds")).toInt());
+            }
+            return;
+        }
+        if (op != QStringLiteral("ledger")) return;
+        if (!overlay_ || !overlay_->isVisible()) return;
+        QMap<QString, int> net;
+        for (const QJsonValue& item : packet.value(QStringLiteral("entries")).toArray()) {
+            const QJsonObject entry = item.toObject();
+            QString key = entry.value(QStringLiteral("user_id")).toString();
+            if (key.isEmpty()) key = entry.value(QStringLiteral("user")).toString();
+            if (key.isEmpty()) continue;
+            net.insert(key, entry.value(QStringLiteral("seconds")).toInt());
+        }
+        // clear_ledger 会发空 entries：本地台账必须跟着清空，否则差分会把后续礼物当成“无变化”。
+        if (net.isEmpty()) {
+            overlay_->userLedger()->clear();
+            syncUserTimeLedger();
+            return;
+        }
+        if (overlay_->applyLedger(net, pendingSimGift_, pendingSimCount_)) {
+            pendingSimGift_.clear();
+            pendingSimCount_ = 0;
+        }
+        syncUserTimeLedger();
+    }
+
+    void refreshTheme() override {
+        setStyleSheet(panelQss());
+        navigate(curNav_);
+        refreshOpenBtn();
+        styleUserTimeBtn();
+        styleTutorialBtn();
+        if (skinCombo_) skinCombo_->refreshTheme();
+        if (simWidget_) simWidget_->refreshTheme();
+        if (settingsPanel_) settingsPanel_->refreshTheme();
+        if (userTimeWin_) userTimeWin_->refreshTheme();
+    }
+
+private:
+    static QString panelQss() {
+        const auto& C = theme();
+        return QStringLiteral(
+            "QWidget { background: %1; color: %2;"
+            " font-family: 'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;"
+            " font-size: 13px; }"
+            "#OvertimeNavBar { background: %3; border-bottom: 1px solid %4; }"
+            "#OvertimeNavBtn { background: transparent; border: none;"
+            " border-bottom: 2px solid transparent; padding: 0 16px; color: %5;"
+            " font-size: 13px; }"
+            "#OvertimeNavBtn:hover { background: %6; color: %2; }"
+            "#OvertimeNavBtn[active=\"true\"] { background: transparent; color: %2;"
+            " font-weight: 600; border-bottom: 2px solid %7; }"
+            "#OvertimeContent { background: %1; border: none; }"
+            "#OvertimeCard { background: %8; border-radius: 10px; border: 1px solid %4; }"
+            "#OvertimeSection { background: transparent; border: none; }"
+            "#OvertimeSectionTitle { background: transparent; color: %2; font-size: 13px;"
+            " font-weight: 600; padding: 4px 0; }"
+            "#OvertimeSectionBody { background: transparent; border: none; }"
+            "#OvertimeSimGift, #OvertimeSimLeft { background: transparent; border: none; }"
+            "#OvertimeSimGiftIcon { background: transparent; border: none; }"
+            "#OvertimeGiftModule { background: %1; border: 1px solid %4; border-radius: 4px; }"
+            "#OvertimeGiftModule > QWidget { background: transparent; border: none; }"
+            "#OvertimePageTitle { font-size: 20px; font-weight: 600; color: %2; }"
+            "QLabel { background: transparent; }"
+            "QScrollBar:vertical { background: transparent; width: 4px; }"
+            "QScrollBar::handle:vertical { background: %4; border-radius: 2px; min-height: 20px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+            "QLineEdit, QTextEdit { background: %8; color: %2; border: 1px solid %4;"
+            " border-radius: 6px; padding: 4px 8px; font-size: 13px; }"
+            "QLineEdit:focus, QTextEdit:focus { border-color: %7; }"
+        ).arg(C.bg, C.text, C.sidebar, C.border, C.textMuted, C.hover, C.activeLine, C.card);
+    }
+
+    static QLabel* pageTitle(const QString& text) {
+        auto* lbl = new QLabel(text);
+        lbl->setObjectName(QStringLiteral("OvertimePageTitle"));
+        lbl->setAlignment(Qt::AlignHCenter);
+        return lbl;
+    }
+
+    static QFrame* makeCard() {
+        auto* card = new QFrame;
+        card->setObjectName(QStringLiteral("OvertimeCard"));
+        card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        auto* lay = new QVBoxLayout(card);
+        lay->setContentsMargins(20, 16, 20, 16);
+        lay->setSpacing(14);
+        return card;
+    }
+
+    static QLabel* cardTitle(const QString& text) {
+        auto* lbl = new QLabel(text);
+        lbl->setStyleSheet(QStringLiteral("font-size: 14px; font-weight: 600;"));
+        return lbl;
+    }
+
+    QLabel* cardDesc(const QString& text) {
+        auto* lbl = new QLabel(text);
+        lbl->setWordWrap(true);
+        descLabels_.append(lbl);
+        return lbl;
+    }
+
+    void build() {
+        auto* root = new QWidget(this);
+        setCentralWidget(root);
+        auto* mainLay = new QVBoxLayout(root);
+        mainLay->setContentsMargins(0, 0, 0, 0);
+        mainLay->setSpacing(0);
+
+        auto* topbar = new QWidget(root);
+        topbar->setObjectName(QStringLiteral("OvertimeNavBar"));
+        topbar->setFixedHeight(46);
+        auto* tb = new QHBoxLayout(topbar);
+        tb->setContentsMargins(8, 0, 8, 0);
+        tb->setSpacing(0);
+
+        stack_ = new QStackedWidget(root);
+        const QStringList tabs = {QStringLiteral("设置"), QStringLiteral("加班机")};
+        for (int i = 0; i < tabs.size(); ++i) {
+            auto* btn = new QPushButton(tabs.at(i), topbar);
+            btn->setObjectName(QStringLiteral("OvertimeNavBtn"));
+            btn->setFixedHeight(46);
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+            QObject::connect(btn, &QPushButton::clicked, this, [this, i]() { navigate(i); });
+            navBtns_.append(btn);
+            tb->addWidget(btn);
+        }
+        tb->addStretch();
+
+        stack_->addWidget(buildPage([this](QVBoxLayout* lay) { buildGeneralPanel(lay); }));
+        // 第二页较重，首次进入该标签时再构建。
+        placeholder_ = new QWidget;
+        auto* phLay = new QVBoxLayout(placeholder_);
+        phLay->setContentsMargins(kPagePad, 20, kPagePad, 20);
+        auto* loading = pageTitle(QStringLiteral("加载中…"));
+        phLay->addWidget(loading);
+        phLay->addStretch();
+        stack_->addWidget(placeholder_);
+
+        mainLay->addWidget(topbar);
+        mainLay->addWidget(stack_);
+        navigate(0);
+    }
+
+    QWidget* buildPage(const std::function<void(QVBoxLayout*)>& fill) {
+        auto* inner = new QWidget;
+        auto* lay = new QVBoxLayout(inner);
+        lay->setContentsMargins(kPagePad, 20, kPagePad, 20);
+        lay->setSpacing(16);
+        fill(lay);
+        auto* scroll = new QScrollArea;
+        scroll->setObjectName(QStringLiteral("OvertimeContent"));
+        scroll->setWidgetResizable(true);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        scroll->setWidget(inner);
+        return scroll;
+    }
+
+    void buildGeneralPanel(QVBoxLayout* lay) {
+        lay->addWidget(pageTitle(QStringLiteral("设置")));
+
+        auto* card = makeCard();
+        auto* cl = qobject_cast<QVBoxLayout*>(card->layout());
+        auto* row = new QHBoxLayout;
+        row->addWidget(cardTitle(QStringLiteral("悬浮加班窗")));
+        row->addStretch();
+        tutorialBtn_ = new QPushButton(QStringLiteral("教程"), card);
+        tutorialBtn_->setFixedHeight(34);
+        tutorialBtn_->setCursor(Qt::PointingHandCursor);
+        tutorialBtn_->setToolTip(QStringLiteral("查看使用教程"));
+        QObject::connect(tutorialBtn_, &QPushButton::clicked, this, [this]() {
+            showTutorialDialog(this);
+        });
+        row->addWidget(tutorialBtn_);
+        row->addSpacing(8);
+        openBtn_ = new QPushButton(QStringLiteral("打开加班机"), card);
+        openBtn_->setFixedHeight(34);
+        openBtn_->setCursor(Qt::PointingHandCursor);
+        QObject::connect(openBtn_, &QPushButton::clicked, this, [this]() { toggleOverlay(); });
+        row->addWidget(openBtn_);
+        cl->addLayout(row);
+        cl->addWidget(cardDesc(
+            QStringLiteral("透明悬浮窗，叠加在直播软件上方显示加班倒计时。"
+                           "窗口采集请在直播伴侣素材设置-高级设置-选择绿幕抠图（10.5+）。")));
+        lay->addWidget(card);
+
+        auto* themeCard = makeCard();
+        auto* tcl = qobject_cast<QVBoxLayout*>(themeCard->layout());
+        auto* trow = new QHBoxLayout;
+        trow->setSpacing(12);
+        trow->addWidget(cardTitle(QStringLiteral("加班外观主题")));
+        trow->addStretch();
+        const auto skins = liveaio::resources::listSkins(g_appRoot, QStringLiteral("overtime"));
+        QStringList names;
+        for (const auto& entry : skins) {
+            skinNameToId_.insert(entry.name, entry.id);
+            names << entry.name;
+        }
+        skinCombo_ = new ThemedComboBox(themeCard);
+        skinCombo_->addItems(names);
+        const QString activeId = configValue(
+            liveaio::resources::skinConfigKey(QStringLiteral("overtime")),
+            QStringLiteral("default")).toString();
+        for (const auto& entry : skins) {
+            if (entry.id == activeId) skinCombo_->setCurrentText(entry.name);
+        }
+        skinCombo_->setFixedHeight(34);
+        skinCombo_->setMinimumWidth(160);
+        skinCombo_->setOnChange([this](const QString& name) {
+            writeConfigValue(liveaio::resources::skinConfigKey(QStringLiteral("overtime")),
+                             skinNameToId_.value(name, QStringLiteral("default")));
+            if (overlay_ && overlay_->isVisible()) overlay_->refreshSkin();
+        });
+        trow->addWidget(skinCombo_);
+        tcl->addLayout(trow);
+        lay->addWidget(themeCard);
+
+        auto* simCard = makeCard();
+        auto* scl = qobject_cast<QVBoxLayout*>(simCard->layout());
+        scl->addWidget(cardTitle(QStringLiteral("模拟送礼")));
+        simWidget_ = new SimGiftWidget(simCard);
+        simWidget_->setOnPush([this](const QString& gift, int count) { pushSimGift(gift, count); });
+        scl->addWidget(simWidget_);
+        scl->addWidget(cardDesc(
+            QStringLiteral("向已打开的加班机推送模拟礼物，用于本地测试规则与倒计时")));
+        lay->addWidget(simCard);
+
+        auto* utCard = makeCard();
+        auto* utl = qobject_cast<QVBoxLayout*>(utCard->layout());
+        utl->addWidget(cardTitle(QStringLiteral("用户时长统计")));
+        auto* utRow = new QHBoxLayout;
+        userTimeBtn_ = new QPushButton(QStringLiteral("查看用户时长统计"), utCard);
+        userTimeBtn_->setFixedHeight(34);
+        userTimeBtn_->setCursor(Qt::PointingHandCursor);
+        QObject::connect(userTimeBtn_, &QPushButton::clicked, this, [this]() {
+            openUserTimeWindow();
+        });
+        utRow->addWidget(userTimeBtn_);
+        utRow->addStretch();
+        utl->addLayout(utRow);
+        utl->addWidget(cardDesc(
+            QStringLiteral("统计本次加班机运行期间，各用户礼物带来的加减时长")));
+        lay->addWidget(utCard);
+        lay->addStretch();
+    }
+
+    void buildOvertimePanel(QVBoxLayout* lay) {
+        lay->addWidget(pageTitle(QStringLiteral("加班机")));
+        auto* center = new QHBoxLayout;
+        center->addStretch(1);
+        settingsPanel_ = new SettingsPanel;
+        settingsPanel_->setOnSaved([this](const Settings& s) { pushSettings(s); });
+        settingsPanel_->setOnTimeApply([this](const Settings& s) {
+            if (overlay_) overlay_->applyTimeOnly(s);
+        });
+        settingsPanel_->setOnOtherApply([this](const Settings& s) {
+            if (overlay_) overlay_->applyOtherOnly(s);
+        });
+        center->addWidget(settingsPanel_);
+        center->addStretch(1);
+        lay->addLayout(center);
+    }
+
+    void ensureOvertimeTab() {
+        if (overtimeTabBuilt_) return;
+        overtimeTabBuilt_ = true;
+        const int idx = stack_->indexOf(placeholder_);
+        auto* page = buildPage([this](QVBoxLayout* lay) { buildOvertimePanel(lay); });
+        stack_->removeWidget(placeholder_);
+        placeholder_->deleteLater();
+        placeholder_ = nullptr;
+        stack_->insertWidget(idx, page);
+    }
+
+    void navigate(int index) {
+        curNav_ = index;
+        if (index == 1 && !overtimeTabBuilt_) {
+            stack_->setCurrentIndex(1);
+            QTimer::singleShot(0, this, [this]() {
+                ensureOvertimeTab();
+                if (curNav_ == 1) stack_->setCurrentIndex(1);
+            });
+        } else {
+            stack_->setCurrentIndex(index);
+        }
+        for (int i = 0; i < navBtns_.size(); ++i) {
+            navBtns_[i]->setProperty("active", i == index);
+            navBtns_[i]->style()->unpolish(navBtns_[i]);
+            navBtns_[i]->style()->polish(navBtns_[i]);
+        }
+    }
+
+    void sendCommand(const QString& cmd) {
+        sendCore(QJsonObject{
+            {QStringLiteral("op"), QStringLiteral("tool.overtime.cmd")},
+            {QStringLiteral("cmd"), cmd},
+        });
+    }
+
+    void pushSimGift(const QString& gift, int count) {
+        pendingSimGift_ = gift;
+        pendingSimCount_ = count;
+        sendCore(QJsonObject{
+            {QStringLiteral("op"), QStringLiteral("tool.overtime.sim_gift")},
+            {QStringLiteral("gift"), gift},
+            {QStringLiteral("count"), count},
+            {QStringLiteral("user"), QStringLiteral("LiveAIO")},
+        });
+    }
+
+    // core.Rule 用 add/sub/random 与 s/m/h，随机区间为 [min, max]。
+    static QJsonObject ruleToWire(const Rule& r) {
+        const bool isRandom = r.mode == QStringLiteral("随机");
+        QString mode = QStringLiteral("add");
+        if (r.mode == QStringLiteral("减")) mode = QStringLiteral("sub");
+        else if (isRandom) mode = QStringLiteral("random");
+        const QString unit = isRandom ? r.randomUnit : r.unit;
+        QString wireUnit = QStringLiteral("s");
+        if (unit == QStringLiteral("时")) wireUnit = QStringLiteral("h");
+        else if (unit == QStringLiteral("分")) wireUnit = QStringLiteral("m");
+        return QJsonObject{
+            {QStringLiteral("gift"), r.gift},
+            {QStringLiteral("mode"), mode},
+            {QStringLiteral("value"), r.value},
+            {QStringLiteral("unit"), wireUnit},
+            {QStringLiteral("min"), isRandom ? -r.randomNeg : 0},
+            {QStringLiteral("max"), isRandom ? r.randomPos : 0},
+        };
+    }
+
+    void pushSettings(const Settings& s) {
+        QJsonArray rules;
+        for (const Rule& r : s.rules) rules.push_back(ruleToWire(r));
+        sendCore(QJsonObject{
+            {QStringLiteral("op"), QStringLiteral("tool.overtime.set")},
+            {QStringLiteral("settings"), QJsonObject{
+                {QStringLiteral("hours"), s.hours},
+                {QStringLiteral("minutes"), s.minutes},
+                {QStringLiteral("seconds"), s.seconds},
+                {QStringLiteral("rules"), rules},
+            }},
+        });
+    }
+
+    void toggleOverlay() {
+        if (!overlay_) {
+            overlay_ = new OvertimeWindow;
+            overlay_->setOnClosed([this]() {
+                sendCommand(QStringLiteral("pause"));
+                refreshOpenBtn();
+                syncUserTimeLedger();
+            });
+            overlay_->userLedger()->setOnChanged([this]() { syncUserTimeLedger(); });
+        }
+        if (overlay_->isVisible()) {
+            overlay_->hide();
+            sendCommand(QStringLiteral("pause"));
+        } else {
+            const Settings s = loadSettings();
+            overlay_->applySettings(s);
+            pushSettings(s);
+            // 悬浮窗打开即开始走表，关闭时暂停；core 是唯一时间源。
+            sendCommand(QStringLiteral("clear_ledger"));
+            sendCommand(QStringLiteral("reset"));
+            overlay_->show();
+            overlay_->activateWindow();
+        }
+        refreshOpenBtn();
+        syncUserTimeLedger();
+    }
+
+    UserLedger* activeLedger() const {
+        if (overlay_ && overlay_->isVisible()) return overlay_->userLedger();
+        return nullptr;
+    }
+
+    void syncUserTimeLedger() {
+        if (userTimeWin_ && userTimeWin_->isVisible()) {
+            userTimeWin_->bindLedger(activeLedger());
+        }
+    }
+
+    void openUserTimeWindow() {
+        if (!userTimeWin_) userTimeWin_ = new UserTimeWindow(this);
+        userTimeWin_->bindLedger(activeLedger());
+        userTimeWin_->show();
+        userTimeWin_->raise();
+        userTimeWin_->activateWindow();
+    }
+
+    void refreshOpenBtn() {
+        const bool isOpen = overlay_ && overlay_->isVisible();
+        if (simWidget_) simWidget_->setPushEnabled(isOpen);
+        if (!openBtn_) return;
+        const auto& C = theme();
+        openBtn_->setText(isOpen ? QStringLiteral("关闭加班机") : QStringLiteral("打开加班机"));
+        if (isOpen) {
+            openBtn_->setStyleSheet(QStringLiteral(
+                "QPushButton { background: %1; color: #fff; border: 1.5px solid transparent;"
+                " border-radius: 8px; font-size: 13px; font-weight: 600; padding: 0 16px; }"
+                "QPushButton:hover { background: %2; }"
+            ).arg(C.closeHover, C.active));
+        } else {
+            openBtn_->setStyleSheet(QStringLiteral(
+                "QPushButton { background: %1; color: %2; border: 1.5px solid %2;"
+                " border-radius: 8px; font-size: 13px; font-weight: 600; padding: 0 16px; }"
+                "QPushButton:hover { background: %3; }"
+            ).arg(C.card, C.activeLine, C.hover));
+        }
+    }
+
+    void styleUserTimeBtn() {
+        if (!userTimeBtn_) return;
+        const auto& C = theme();
+        userTimeBtn_->setStyleSheet(QStringLiteral(
+            "QPushButton { background: %1; color: %2; border: 1.5px solid %2;"
+            " border-radius: 8px; font-size: 13px; font-weight: 600; padding: 0 16px; }"
+            "QPushButton:hover { background: %3; }"
+        ).arg(C.card, C.activeLine, C.hover));
+    }
+
+    void styleTutorialBtn() {
+        const auto& C = theme();
+        if (tutorialBtn_) {
+            tutorialBtn_->setStyleSheet(QStringLiteral(
+                "QPushButton { background: %1; color: %2; border: 1.5px solid %3;"
+                " border-radius: 8px; font-size: 13px; font-weight: 600; padding: 0 14px; }"
+                "QPushButton:hover { background: %4; color: %5; }"
+            ).arg(C.card, C.textMuted, C.border, C.hover, C.text));
+        }
+        for (auto* lbl : descLabels_) {
+            lbl->setStyleSheet(QStringLiteral("font-size: 12px; color: %1;").arg(C.textMuted));
+        }
+    }
+
+    QStackedWidget* stack_ = nullptr;
+    QWidget* placeholder_ = nullptr;
+    QVector<QPushButton*> navBtns_;
+    QVector<QLabel*> descLabels_;
+    int curNav_ = 0;
+    bool overtimeTabBuilt_ = false;
+    QPushButton* openBtn_ = nullptr;
+    QPushButton* tutorialBtn_ = nullptr;
+    QPushButton* userTimeBtn_ = nullptr;
+    ThemedComboBox* skinCombo_ = nullptr;
+    QMap<QString, QString> skinNameToId_;
+    SimGiftWidget* simWidget_ = nullptr;
+    SettingsPanel* settingsPanel_ = nullptr;
+    OvertimeWindow* overlay_ = nullptr;
+    UserTimeWindow* userTimeWin_ = nullptr;
+    QString pendingSimGift_;
+    int pendingSimCount_ = 0;
+};
+
+}  // namespace ot
+
+static ToolWindowBase* createOvertimeTool(CoreClient* core) {
+    return new ot::OvertimeToolWindow(core);
+}
+
+}  // namespace liveaio::tools

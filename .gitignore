@@ -5,29 +5,35 @@ state.json
 .DS_store
 Thumbs.db
 .vscode/
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+!.vscode/settings.json
 .cursor/
 log/
 msg_log/
 config.json
 browsers/
-build/
-core/dist/
-core/tools/
+
+# go.mod / go.sum 在仓库根（gopls 要求）；build/liveaio.* 仅为镜像
+# /go.sum 不再 ignore
+
+# 产物与 CMake 缓存
+build/cmake/
+build/build_work/
+build/LiveAIO/
+build/LiveAIO-with-browsers/
+build/installers/
 *.exe
+*.dll
 !listener/proxy_shell.exe
 
-0000.py
-ws_dump.py
-ws_samples/
-listener/proxy_shell.build
-listener/proxy_shell.dist
-listener/proxy_shell.onefile-build
-# 构建工具（非业务 tools/ 包）
+# 本地/杂项（业务已无 Python；.venv 仅防本地残留）
 upx.exe
 _upx.zip
-_bench_pages.py
-_bench_startup.py
-_test_system_browser_r2.py
 requirements.txt
-test/
-build_nuitka.py
+main/__debug_bin.exe
+aqtinstall.log
+
+.audit_py_ui/
+scripts/

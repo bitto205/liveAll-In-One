@@ -3,7 +3,7 @@
   "name": "默认",
   "version": 1,
   "tool": "overtime",
-  "surfaces": ["panel"],
+  "surfaces": ["overlay"],
   "metrics": {},
   "colors": {
     "text_fill": [255, 255, 255, 255],

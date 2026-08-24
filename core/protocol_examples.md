@@ -1,49 +1,43 @@
 # LiveAIO Core IPC Protocol v0.1
 
-> 总契约（工具 UI / util 归属 / 进程）：[`CONTRACT.md`](CONTRACT.md)  
-> 本文只放 **JSON 样例** 与字段对照表。
+> 总契约：[`CONTRACT.md`](CONTRACT.md)  
+> C++ 对接：[`CPP_UI_CONTRACT.md`](CPP_UI_CONTRACT.md)  
+> 本文只放 **JSON 样例** 与字段对照表。常量以 [`protocol.go`](protocol.go) 为准。
 
 ## Process topology
 
+```text
+LiveAIO.exe (C++ LoadLibrary)
+  ├── LiveAIOCore.dll   Go hub / TCP :19877 / 托盘 / 线路 / 工具业务
+  ├── LiveAIOPages.dll  C++ pages（JSONL 客户端）
+  └── LiveAIOTools.dll  C++ tools（JSONL 客户端）
 ```
-liveaio.exe / LiveAIO.exe (启动链 — UAC、托盘)
-    └── spawns liveaio-core.exe (IPC / 听帧 / 工具)
-    └── tray「打开界面」→ python ui_shell.py
 
-ui_shell (Qt UI)  ←→  bridge.CoreClient  ←→  liveaio-core (Go)
-```
-
-- UI and core are **separate processes**.
-- **Go** is the only app entry; Python UI attach-only.
-- Core never creates windows.
+- Go Core 是协议与 config owner；不创建业务窗口（托盘除外）。
+- Pages/Tools 是 attach-only UI，关窗不断 Core。
 
 ## Transport
 
 | Mode | Address | When |
 |------|---------|------|
-| Named Pipe (optional) | `\\.\pipe\liveaio-core` | When elevated / available |
-| TCP (Phase 0 primary) | `127.0.0.1:19877` | Default listen; bridge connects here |
+| Named Pipe (optional) | `\\.\pipe\liveaio-core` | 预留 |
+| TCP（主路径） | `127.0.0.1:19877` | UI 连接 |
 
-**Framing:** UTF-8 **JSON Lines** (one JSON object per line, `\n` terminated).
+**Framing:** UTF-8 **JSON Lines**（每行一个 JSON，`\n` 结尾）。
 
-**Handshake:** Core accepts a client, then immediately writes a `ready` event. Client may send `ping`; core replies `pong`.
+**Handshake:** 接受连接后写 `ready`；hub 再写 `capabilities`（含 `features`）与当前 `status`。客户端可发 `ping` → `pong`。
 
 ## Envelope
-
-Every line is a JSON object with at least:
 
 ```json
 {"op": "<command_or_event_name>", ...}
 ```
 
-- **Commands** (UI → Core): use `op`.
-- **Events** (Core → UI): also use `op` (same field name for simplicity in v0.1).
-
-Optional common fields: `id` (string, correlate request/response), `ts` (unix ms).
+可选：`id`（关联请求/响应）、`ts`（unix ms）。
 
 ---
 
-## Commands v0.1 (UI → Core)
+## Commands（UI → Core）
 
 ### ping
 
@@ -57,42 +51,42 @@ Optional common fields: `id` (string, correlate request/response), `ts` (unix ms
 {"op":"shutdown"}
 ```
 
-Core exits after flushing.
-
-### connect *(P1+)*
+### connect / disconnect
 
 ```json
 {"op":"connect","live_id":"123","route":"4","force_system":false}
-```
-
-### disconnect *(P1+)*
-
-```json
 {"op":"disconnect"}
 ```
 
-### frame.push *(routes 2/4)*
-Raw WS / IPC frame → Go parse → `message` + tool events.
+### status（拉取当前态，点对点回）
+
+```json
+{"op":"status"}
+```
+
+### frame.push（线路 2/3/4）
 
 ```json
 {"op":"frame.push","payload_b64":"<base64 of raw WS frame bytes>"}
 ```
 
-### message.ingest *(routes 1/3)*
-Python already parsed; core runs tool filters only (no `message` echo).
+### message.ingest（线路 1：已解析，不 echo `message`）
 
 ```json
 {"op":"message.ingest","type":"gift","user":"u","user_id":"1","gift":"小心心","count":1}
 ```
 
-### config.set / config.get *(P2+)*
+### config.set / config.get
 
 ```json
 {"op":"config.set","key":"overtime.settings","value":{}}
 {"op":"config.get","key":"overtime.settings","id":"2"}
+{"op":"config.get"}
 ```
 
-### tool.* *(P3+)*
+无 `key` 的 `config.get` 返回整表。
+
+### tool.*
 
 ```json
 {"op":"tool.overtime.set","settings":{}}
@@ -102,57 +96,99 @@ Python already parsed; core runs tool filters only (no `message` echo).
 {"op":"tool.memo.set","settings":{}}
 ```
 
+### ui.command
+
+```json
+{"op":"ui.command","action":"login.query"}
+{"op":"ui.command","action":"login.start"}
+{"op":"ui.command","action":"route.env","route":"4"}
+{"op":"ui.command","action":"route4.patch"}
+{"op":"ui.command","action":"ui.show"}
+{"op":"ui.command","action":"quit.detach_ui"}
+{"op":"ui.command","action":"quit.shutdown_all"}
+```
+
 ---
 
-## Events v0.1 (Core → UI)
+## Events（Core → UI）
 
 ### ready
 
 ```json
-{"op":"ready","version":"0.1.0"}
+{"op":"ready","version":"0.1.0","protocol_version":"0.1.0"}
 ```
 
-### pong
+### capabilities
+
+```json
+{
+  "op":"capabilities",
+  "capabilities":{
+    "protocol_version":"0.1.0",
+    "ui_owner":"go_host",
+    "config_owner":"go_core",
+    "listener_owner":"listener_boundary",
+    "supports_routes":["1","2","3","4"],
+    "tool_events":["tick","ledger","danmu.show","memo.item"],
+    "tool_commands":["tool.overtime.set","tool.overtime.cmd","tool.overtime.sim_gift","tool.danmu.set","tool.memo.set","ui.command","config.set","config.get"]
+  },
+  "features":{
+    "themes":["dark","light"],
+    "supports_tray":true,
+    "supports_detach_ui":true,
+    "supports_shutdown":true,
+    "supports_tools_host":true
+  }
+}
+```
+
+### ui.focus
+
+托盘「打开界面」或第二次启动时广播；已在运行的 Pages 收到后抬起既有窗口，不再开新进程。
+
+```json
+{"op":"ui.focus"}
+```
+
+### pong / error
 
 ```json
 {"op":"pong","id":"1"}
+{"op":"error","code":"unsupported","msg":"..."}
 ```
 
-### error
+### status
 
 ```json
-{"op":"error","code":"unsupported","msg":"route 1 not in core yet"}
+{"op":"status","connected":true,"route":"4","live_id":"123","driver":"shellipc","health":"ok","force_system":false}
 ```
 
-### status *(P1+)*
+### config.ok / config.value
 
 ```json
-{"op":"status","connected":true,"route":"4"}
+{"op":"config.ok","key":"overtime.settings","value":{}}
+{"op":"config.value","key":"overtime.settings","value":{},"exists":true}
+{"op":"config.value","values":{"overtime.settings":{}}}
 ```
 
-### message *(P1+)* — aligns with `util/models.py`
+### message（字段以 Go schema 为准）
 
 ```json
 {"op":"message","type":"chat","user":"Alice","user_id":"1","content":"hi"}
-```
-
-```json
 {"op":"message","type":"gift","user":"Bob","user_id":"2","gift":"小心心","gift_id":5655,"count":1,"repeat_end":1}
-```
-
-```json
 {"op":"message","type":"like","user":"C","user_id":"3","count":5}
-```
-
-```json
 {"op":"message","type":"follow","user":"D","user_id":"4","action":1,"share_type":0,"share_target":"","follow_count":0}
-```
-
-```json
 {"op":"message","type":"control","status":3}
 ```
 
-### tick / ledger / danmu.show / memo.item *(P3+)*
+### login.state / route.env
+
+```json
+{"op":"login.state","text":"✅ 已登录","can_login":false}
+{"op":"route.env","route":"4","ready":true}
+```
+
+### tick / ledger / danmu.show / memo.item
 
 ```json
 {"op":"tick","remaining_seconds":120,"running":true}
@@ -163,39 +199,41 @@ Python already parsed; core runs tool filters only (no `message` echo).
 
 ---
 
-## Core message types ↔ Python models
+## Core message `type` 字段
 
-| `type` | Python class | Core fields (v0.1 required) |
-|--------|--------------|-----------------------------|
-| chat | ChatMessage | user, user_id, content |
-| gift | GiftMessage | user, user_id, gift, gift_id, count, repeat_end |
-| like | LikeMessage | user, user_id, count |
-| enter | EnterMessage | user, user_id |
-| follow | FollowMessage | user, user_id, action, share_type, share_target, follow_count |
-| fansclub | FansclubMessage | user, user_id, content |
-| online | OnlineMessage | current, total |
-| control | ControlMessage | status |
-| room_enter | RoomEnterStatusMessage | status, room_status, title, id_str |
-| emoji | EmojiChatMessage | user, user_id, emoji_id, default_content |
-| room_stats | RoomStatsMessage | display_* , total, display_type |
-| rank | RoomRankMessage | ranks |
+| `type` | 主要字段 |
+|--------|----------|
+| chat | user, user_id, content |
+| gift | user, user_id, gift, gift_id, count, repeat_end |
+| like | user, user_id, count |
+| enter | user, user_id |
+| follow | user, user_id, action, share_type, share_target, follow_count |
+| fansclub | user, user_id, content |
+| online | current, total |
+| control | status |
+| room_enter | status, room_status, title, id_str |
+| emoji | user, user_id, emoji_id, default_content |
+| room_stats | display_* , total, display_type |
+| rank | ranks |
 
-Constants: living enter status `2`, ended `4`, control finish `3`.
+常量：开播 enter status `2`，结束 `4`，control 结束 `3`。
 
 ---
 
-## Example session (≥5 lines)
+## Example session
 
 ```json
-{"op":"ready","version":"0.1.0"}
+{"op":"ready","version":"0.1.0","protocol_version":"0.1.0"}
+{"op":"capabilities","capabilities":{"protocol_version":"0.1.0"},"features":{"supports_tray":true}}
+{"op":"status","connected":false}
 {"op":"ping","id":"1"}
 {"op":"pong","id":"1"}
-{"op":"frame.push","payload_b64":"AAAA"}
-{"op":"error","code":"parse","msg":"invalid frame"}
+{"op":"config.set","key":"danmu.settings","value":{"danmu_chat_on":true}}
+{"op":"config.ok","key":"danmu.settings","value":{"danmu_chat_on":true}}
 {"op":"shutdown"}
 ```
 
 ## Binary location
 
-Dev build: `core/dist/liveaio-core.exe`  
-Also searched: app root `liveaio-core.exe`.
+生产：`build/build_work/custom/`（或版本目录）下的 `LiveAIO.exe` + `LiveAIOCore.dll` + Pages/Tools dll。  
+调试：`go build ./main` 或 F5。

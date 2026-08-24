@@ -100,6 +100,7 @@ LiveAIO 是一个给抖音直播使用的辅助工具。它可以连接直播间
 ## 环境要求
 
 - Windows 10/11
-- Python 3.11+
+- Go 1.26+（源码编译）
+- CMake、Qt 6、MinGW（C++ UI 编译）
 
 项目还处于开发阶段，欢迎在 issue 中反馈 bug、提出建议或讨论！也欢迎各位来 clone 。

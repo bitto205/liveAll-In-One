@@ -1,0 +1,850 @@
+// tools/danmu_tool.cpp — 弹幕机，对齐旧 PySide danmu_tool.py。
+// DanmuToolWindow：448×520 控制面板，5 个顶部标签页。
+// DanmuOverlayWindow：透明悬浮弹幕窗，顶栏/三侧边框以左上圆圈为圆心做波纹展开。
+
+namespace liveaio::tools {
+
+static constexpr int kDanmuFadeInMs = 300;
+static constexpr int kDanmuStayMs = 3000;
+static constexpr int kDanmuFadeOutMs = 500;
+
+static const QString kDanmuGeoKey = QStringLiteral("danmu_window_geometry");
+
+static ToolSkin activeDanmuSkin() {
+    const QString id = configValue(liveaio::resources::skinConfigKey(QStringLiteral("danmu")),
+                                  QStringLiteral("default")).toString();
+    return ToolSkin::load(g_appRoot, QStringLiteral("danmu"),
+                          id.isEmpty() ? QStringLiteral("default") : id);
+}
+
+static void showTutorialDialog(QWidget* parent) {
+    const QDir imageDir(QDir(g_appRoot).filePath(QStringLiteral("image")));
+    const QStringList files = imageDir.entryList(
+        {QStringLiteral("*.png"), QStringLiteral("*.jpg")}, QDir::Files, QDir::Name);
+    if (files.isEmpty()) {
+        QMessageBox::warning(parent, QStringLiteral("教程"),
+                             QStringLiteral("未找到 image 文件夹中的教程图片。"));
+        return;
+    }
+    const QString path = imageDir.filePath(files.first());
+    QPixmap pix(path);
+    if (pix.isNull()) {
+        QMessageBox::warning(parent, QStringLiteral("教程"),
+                             QStringLiteral("无法加载教程图片：%1").arg(path));
+        return;
+    }
+
+    auto* dlg = new QDialog(parent);
+    dlg->setAttribute(Qt::WA_DeleteOnClose, true);
+    dlg->setWindowTitle(QStringLiteral("教程"));
+    dlg->setModal(false);
+    auto* lay = new QVBoxLayout(dlg);
+    lay->setContentsMargins(12, 12, 12, 12);
+    lay->setSpacing(10);
+
+    int maxW = 720;
+    int maxH = 480;
+    if (auto* screen = dlg->screen()) {
+        const QRect avail = screen->availableGeometry();
+        maxW = qMin(static_cast<int>(avail.width() * 0.68), 760);
+        maxH = qMin(static_cast<int>(avail.height() * 0.62), 520);
+    }
+    const QPixmap scaled = pix.scaled(maxW, maxH, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+
+    auto* img = new QLabel(dlg);
+    img->setAlignment(Qt::AlignCenter);
+    img->setPixmap(scaled);
+    img->setFixedSize(scaled.size());
+    lay->addWidget(img, 0, Qt::AlignCenter);
+
+    auto* closeBtn = new QPushButton(QStringLiteral("关闭"), dlg);
+    QObject::connect(closeBtn, &QPushButton::clicked, dlg, &QDialog::close);
+    lay->addWidget(closeBtn, 0, Qt::AlignCenter);
+
+    dlg->adjustSize();
+    dlg->show();
+}
+
+// ─────────────────────────────────────────────
+// 弹幕气泡（皮肤驱动绘制）
+// ─────────────────────────────────────────────
+class DanmuBubble final : public QWidget {
+public:
+    DanmuBubble(const QString& kind, const QString& user, const QString& text,
+                const QString& gift, const ToolSkin& skin, QWidget* parent)
+        : QWidget(parent), skin_(skin), kind_(kind), user_(user), text_(text), gift_(gift) {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        loadGiftIcon();
+
+        fade_ = new QVariantAnimation(this);
+        fade_->setDuration(kDanmuFadeInMs);
+        fade_->setStartValue(0.0);
+        fade_->setEndValue(1.0);
+        QObject::connect(fade_, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
+            opacity_ = v.toReal();
+            update();
+        });
+        QObject::connect(fade_, &QVariantAnimation::finished, this, [this]() {
+            if (phase_ == 0) {
+                phase_ = 1;
+                QTimer::singleShot(kDanmuStayMs, this, [this]() {
+                    phase_ = 2;
+                    fade_->setDuration(kDanmuFadeOutMs);
+                    fade_->setStartValue(1.0);
+                    fade_->setEndValue(0.0);
+                    fade_->start();
+                });
+            } else if (phase_ == 2) {
+                deleteLater();
+            }
+        });
+        relayout();
+        fade_->start();
+    }
+
+    void refreshSkin(const ToolSkin& skin) {
+        skin_ = skin;
+        loadGiftIcon();
+        relayout();
+    }
+
+    void relayout() {
+        const auto m = skin_.metrics();
+        const auto userSt = skin_.roleStyle(QStringLiteral("bubble"), QStringLiteral("user"));
+        const auto bodySt = skin_.roleStyle(
+            kind_ == QLatin1String("gift") ? QStringLiteral("gift_bubble") : QStringLiteral("bubble"),
+            QStringLiteral("body"));
+        const int maxChars = std::max(4, bodySt.maxChars);
+        const int minChars = std::max(1, bodySt.minChars);
+        const int chars = std::clamp(static_cast<int>(text_.size()), minChars, maxChars);
+        QFontMetrics ufm(userSt.font());
+        QFontMetrics bfm(bodySt.font());
+        const int textW = std::max(ufm.horizontalAdvance(user_),
+                                   bfm.horizontalAdvance(QString(chars, QChar(0x4E2D))))
+                          + bodySt.slackPx;
+        const int contentW = textW + (giftPm_.isNull() ? 0 : (giftW_ + m.giftIconGap));
+        const int w = contentW + m.padH * 2 + m.fadeW;
+        const int h = std::max(bfm.height() + ufm.height() + 4, giftH_) + m.padV * 2;
+        setFixedSize(w, h);
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setOpacity(opacity_);
+        const auto m = skin_.metrics();
+        QLinearGradient g(0, 0, width(), 0);
+        const QColor mid = skin_.color(QStringLiteral("gradient_mid"), QColor(0, 0, 0, 128));
+        const QColor edge = skin_.color(QStringLiteral("gradient_edge"), QColor(0, 0, 0, 0));
+        g.setColorAt(0.0, edge);
+        g.setColorAt(0.5, mid);
+        g.setColorAt(1.0, edge);
+        p.fillRect(rect(), g);
+
+        int x = m.padH + m.fadeW / 2;
+        int y = m.padV;
+        if (!giftPm_.isNull()) {
+            p.drawPixmap(QRect(x, y + (height() - m.padV * 2 - giftH_) / 2, giftW_, giftH_), giftPm_);
+            x += giftW_ + m.giftIconGap;
+        }
+        const auto userSt = skin_.roleStyle(QStringLiteral("bubble"), QStringLiteral("user"));
+        const auto bodySt = skin_.roleStyle(
+            kind_ == QLatin1String("gift") ? QStringLiteral("gift_bubble") : QStringLiteral("bubble"),
+            QStringLiteral("body"));
+        p.setFont(userSt.font());
+        p.setPen(skin_.color(QStringLiteral("user"), QColor(255, 255, 255, 200)));
+        p.drawText(x, y + QFontMetrics(userSt.font()).ascent(), user_);
+        y += QFontMetrics(userSt.font()).height() + 2;
+        p.setFont(bodySt.font());
+        p.setPen(skin_.color(QStringLiteral("body"), QColor(255, 255, 255)));
+        p.drawText(x, y + QFontMetrics(bodySt.font()).ascent(), text_);
+    }
+
+private:
+    void loadGiftIcon() {
+        giftPm_ = QPixmap();
+        giftW_ = 0;
+        giftH_ = 0;
+        if (kind_ != QLatin1String("gift") || gift_.isEmpty()) return;
+        const QString icon = resolveGiftIconPath(g_appRoot, gift_);
+        if (icon.isEmpty()) return;
+        const auto still = skin_.presentImage(icon, skin_.metrics().giftIconSize);
+        giftPm_ = still.pixmap;
+        giftW_ = still.logicalW;
+        giftH_ = still.logicalH;
+    }
+
+    ToolSkin skin_;
+    QString kind_, user_, text_, gift_;
+    QPixmap giftPm_;
+    int giftW_ = 0;
+    int giftH_ = 0;
+    QVariantAnimation* fade_ = nullptr;
+    qreal opacity_ = 0.0;
+    int phase_ = 0;
+};
+
+// 弹幕内容区：气泡随机落点，无额外绘制。
+class DanmuRoot final : public RippleOverlayRoot {
+public:
+    DanmuRoot(QMainWindow* win, std::function<void()> onResume)
+        : RippleOverlayRoot(win), onResume_(std::move(onResume)) {}
+
+protected:
+    void onResizeResume() override {
+        if (onResume_) onResume_();
+    }
+
+private:
+    std::function<void()> onResume_;
+};
+
+class DanmuOverlayWindow final : public RippleOverlayWindow {
+public:
+    DanmuOverlayWindow()
+        : RippleOverlayWindow(QStringLiteral("弹幕机"), kDanmuGeoKey) {
+        setMinimumSize(200, 150);
+        restoreGeometryFromConfig(420, 320);
+        skin_ = activeDanmuSkin();
+        attachRoot(new DanmuRoot(this, [this]() { onFrameResumed(); }));
+    }
+
+    void refreshSkin() {
+        skin_ = activeDanmuSkin();
+        for (auto* b : bubbles_) {
+            if (b) b->refreshSkin(skin_);
+        }
+        root()->update();
+    }
+
+    void addMessage(const QString& kind, const QString& user, const QString& text,
+                    const QString& gift) {
+        if (root()->resizeFrozen()) {
+            pending_.append({kind, user, text, gift});
+            if (pending_.size() > 80) pending_.remove(0, pending_.size() - 80);
+            return;
+        }
+        auto* bubble = new DanmuBubble(kind, user, text, gift, skin_, root()->content());
+        placeBubble(bubble);
+    }
+
+    void flushPending() {
+        const auto pending = pending_;
+        pending_.clear();
+        for (const auto& msg : pending) addMessage(msg.kind, msg.user, msg.text, msg.gift);
+    }
+
+private:
+    struct PendingMsg {
+        QString kind;
+        QString user;
+        QString text;
+        QString gift;
+    };
+
+    void onFrameResumed() {
+        syncRadiusAfterResize();
+        flushPending();
+    }
+
+    // 1cm 安全边距（按屏幕 DPI 折算）。
+    static int bubbleMargin() {
+        if (auto* screen = QApplication::primaryScreen()) {
+            return std::max(20, static_cast<int>(screen->logicalDotsPerInch() / 2.54));
+        }
+        return 20;
+    }
+
+    // 旧行为：在内容区随机找一个与现有气泡不重叠的位置，找不到就丢弃。
+    void placeBubble(DanmuBubble* bubble) {
+        QWidget* area = root()->content();
+        const int m = bubbleMargin();
+        const int bw = bubble->width();
+        const int bh = bubble->height();
+        const int xMin = m;
+        const int yMin = m;
+        const int xMax = area->width() - m - bw;
+        const int yMax = area->height() - m - bh;
+        if (xMax < xMin || yMax < yMin) {
+            bubble->deleteLater();
+            return;
+        }
+
+        QVector<QPoint> candidates;
+        const int step = 20;
+        QVector<int> xs;
+        QVector<int> ys;
+        for (int x = xMin; x <= xMax; x += step) xs.append(x);
+        if (xs.isEmpty() || xs.last() != xMax) xs.append(xMax);
+        for (int y = yMin; y <= yMax; y += step) ys.append(y);
+        if (ys.isEmpty() || ys.last() != yMax) ys.append(yMax);
+        for (int x : xs) {
+            for (int y : ys) candidates.append(QPoint(x, y));
+        }
+        for (int i = candidates.size() - 1; i > 0; --i) {
+            std::swap(candidates[i], candidates[QRandomGenerator::global()->bounded(i + 1)]);
+        }
+
+        QVector<QRect> occupied;
+        for (auto* b : bubbles_) {
+            if (b && b->isVisible()) occupied.append(b->geometry());
+        }
+
+        for (const QPoint& pos : candidates) {
+            const QRect candidate(pos.x(), pos.y(), bw, bh);
+            bool overlaps = false;
+            for (const QRect& taken : occupied) {
+                if (candidate.intersects(taken)) {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if (overlaps) continue;
+            bubble->move(pos);
+            bubbles_.append(bubble);
+            QObject::connect(bubble, &QObject::destroyed, this, [this, bubble]() {
+                bubbles_.removeAll(bubble);
+            });
+            bubble->show();
+            return;
+        }
+        bubble->deleteLater();
+    }
+
+    ToolSkin skin_;
+    QVector<DanmuBubble*> bubbles_;
+    QVector<PendingMsg> pending_;
+};
+
+// ─────────────────────────────────────────────
+// 控制面板
+// ─────────────────────────────────────────────
+class DanmuToolWindow final : public ToolWindowBase {
+public:
+    static constexpr int kWidth = 448;
+    static constexpr int kHeight = 520;
+    static constexpr int kSide = 24;
+    static constexpr int kScrollGutter = 8;
+
+    explicit DanmuToolWindow(CoreClient* core) : ToolWindowBase(core) {
+        setWindowTitle(QStringLiteral("设置"));
+        setFixedSize(kWidth, kHeight);
+
+        switchKeys_ = {
+            {QStringLiteral("chat"), QStringLiteral("danmu_chat_on")},
+            {QStringLiteral("gift"), QStringLiteral("danmu_gift_on")},
+            {QStringLiteral("follow"), QStringLiteral("danmu_follow_on")},
+            {QStringLiteral("like"), QStringLiteral("danmu_like_on")},
+        };
+
+        build();
+        refreshTheme();
+        liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
+        pushSettings();
+    }
+
+    ~DanmuToolWindow() override {
+        if (overlay_) {
+            overlay_->setOnClosed(nullptr);
+            overlay_->deleteLater();
+            overlay_ = nullptr;
+        }
+    }
+
+    QString toolId() const override { return QStringLiteral("danmu"); }
+
+    void onCorePacket(const QJsonObject& packet) override {
+        if (packet.value(QStringLiteral("op")).toString() != QStringLiteral("danmu.show")) return;
+        if (!overlay_ || !overlay_->isVisible()) return;
+        const QString kind = packet.value(QStringLiteral("kind")).toString();
+        const QString user = packet.value(QStringLiteral("user")).toString();
+        QString text = packet.value(QStringLiteral("text")).toString();
+        const QString gift = packet.value(QStringLiteral("gift")).toString();
+        if (kind == QLatin1String("like")) {
+            text = QStringLiteral("点了%1个赞")
+                       .arg(qMax(1, packet.value(QStringLiteral("count")).toInt(1)));
+        } else if (kind == QLatin1String("follow")) {
+            text = QStringLiteral("关注了");
+        }
+        overlay_->addMessage(kind, user, text + suffixFor(kind), gift);
+    }
+
+    void refreshTheme() override {
+        setStyleSheet(toolQss());
+        refreshSwitchStyles(false);
+        refreshOpenBtn();
+        styleTutorialBtn();
+        navigate(curNav_);
+    }
+
+private:
+    void build() {
+        auto* root = new QWidget(this);
+        root->setObjectName(QStringLiteral("ToolRoot"));
+        setCentralWidget(root);
+        auto* mainLay = new QVBoxLayout(root);
+        mainLay->setContentsMargins(0, 0, 0, 0);
+        mainLay->setSpacing(0);
+
+        auto* topbar = new QWidget(root);
+        topbar->setObjectName(QStringLiteral("TopBar"));
+        topbar->setFixedHeight(46);
+        auto* tbLay = new QHBoxLayout(topbar);
+        tbLay->setContentsMargins(8, 0, 8, 0);
+        tbLay->setSpacing(0);
+
+        stack_ = new QStackedWidget(root);
+
+        const QVector<QPair<QString, std::function<void(QVBoxLayout*)>>> tabs = {
+            {QStringLiteral("设置"), [this](QVBoxLayout* l) { buildSettingsPanel(l); }},
+            {QStringLiteral("弹幕"), [this](QVBoxLayout* l) { buildChatPanel(l); }},
+            {QStringLiteral("礼物"), [this](QVBoxLayout* l) { buildGiftPanel(l); }},
+            {QStringLiteral("关注"), [this](QVBoxLayout* l) { buildFollowPanel(l); }},
+            {QStringLiteral("点赞"), [this](QVBoxLayout* l) { buildLikePanel(l); }},
+        };
+        for (int i = 0; i < tabs.size(); ++i) {
+            auto* navBtn = new QPushButton(tabs[i].first, topbar);
+            navBtn->setObjectName(QStringLiteral("TabBtn"));
+            navBtn->setFixedHeight(46);
+            navBtn->setCursor(Qt::PointingHandCursor);
+            navBtn->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+            QObject::connect(navBtn, &QPushButton::clicked, this, [this, i]() { navigate(i); });
+            navBtns_.append(navBtn);
+            tbLay->addWidget(navBtn);
+
+            auto* inner = new QWidget;
+            auto* innerLay = new QVBoxLayout(inner);
+            innerLay->setContentsMargins(kSide + kScrollGutter / 2, 20,
+                                         kSide + kScrollGutter / 2, 20);
+            innerLay->setSpacing(16);
+            tabs[i].second(innerLay);
+            innerLay->addStretch();
+            stack_->addWidget(scrollPage(inner));
+        }
+        tbLay->addStretch();
+        mainLay->addWidget(topbar);
+        mainLay->addWidget(stack_);
+
+        navigate(0);
+    }
+
+    void navigate(int index) {
+        curNav_ = index;
+        stack_->setCurrentIndex(index);
+        for (int i = 0; i < navBtns_.size(); ++i) {
+            navBtns_[i]->setProperty("active", i == index);
+            navBtns_[i]->style()->unpolish(navBtns_[i]);
+            navBtns_[i]->style()->polish(navBtns_[i]);
+        }
+    }
+
+    QFrame* makeCard() {
+        auto* card = new QFrame;
+        card->setObjectName(QStringLiteral("Card"));
+        card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        auto* lay = new QVBoxLayout(card);
+        lay->setContentsMargins(20, 16, 20, 16);
+        lay->setSpacing(14);
+        return card;
+    }
+
+    QFrame* makeSeparator() {
+        auto* sep = new QFrame;
+        sep->setFrameShape(QFrame::HLine);
+        seps_.append(sep);
+        return sep;
+    }
+
+    static QLabel* pageTitle(const QString& text) {
+        auto* lbl = new QLabel(text);
+        lbl->setObjectName(QStringLiteral("ToolPageTitle"));
+        lbl->setAlignment(Qt::AlignHCenter);
+        return lbl;
+    }
+
+    void addToggleRow(QVBoxLayout* cardLay, const QString& key, const QString& name,
+                      const QString& tip) {
+        auto* row = new QHBoxLayout;
+        row->setSpacing(0);
+        auto* left = new QVBoxLayout;
+        left->setSpacing(3);
+        auto* n = new QLabel(name);
+        n->setStyleSheet(QStringLiteral("font-size: 14px; font-weight: 600;"));
+        auto* t = new QLabel(tip);
+        t->setObjectName(QStringLiteral("ToolTip"));
+        left->addWidget(n);
+        left->addWidget(t);
+        auto* btn = new QPushButton;
+        btn->setFixedHeight(28);
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setText(configValue(switchKeys_.value(key), true).toBool()
+                         ? QStringLiteral("已开启") : QStringLiteral("已关闭"));
+        QObject::connect(btn, &QPushButton::clicked, this, [this, key]() { toggleSwitch(key); });
+        switchBtns_.insert(key, btn);
+        row->addLayout(left);
+        row->addStretch();
+        row->addWidget(btn);
+        cardLay->addLayout(row);
+    }
+
+    void addSuffixRow(QVBoxLayout* cardLay, const QString& key) {
+        auto* row = new QHBoxLayout;
+        auto* lbl = new QLabel(QStringLiteral("弹幕后缀"));
+        auto* edit = new QLineEdit;
+        edit->setMaxLength(10);
+        edit->setPlaceholderText(QStringLiteral("最多10字"));
+        edit->setFixedWidth(150);
+        edit->setText(configValue(QStringLiteral("danmu_%1_suffix").arg(key), QString()).toString());
+        suffixEdits_.insert(key, edit);
+        row->addWidget(lbl);
+        row->addStretch();
+        row->addWidget(edit);
+        cardLay->addLayout(row);
+    }
+
+    void addApplyRow(QVBoxLayout* lay, std::function<void()> handler) {
+        auto* row = new QHBoxLayout;
+        row->setContentsMargins(0, 8, 0, 0);
+        row->addStretch(1);
+        auto* btn = new QPushButton(QStringLiteral("应用"));
+        btn->setFixedSize(72, 34);
+        btn->setCursor(Qt::PointingHandCursor);
+        QObject::connect(btn, &QPushButton::clicked, this, [handler]() { handler(); });
+        applyBtns_.append(btn);
+        row->addWidget(btn);
+        lay->addLayout(row);
+    }
+
+    void buildSettingsPanel(QVBoxLayout* lay) {
+        lay->addWidget(pageTitle(QStringLiteral("设置")));
+
+        auto* card = makeCard();
+        auto* cl = qobject_cast<QVBoxLayout*>(card->layout());
+        auto* row = new QHBoxLayout;
+        auto* lbl = new QLabel(QStringLiteral("悬浮弹幕窗"));
+        lbl->setStyleSheet(QStringLiteral("font-size: 14px; font-weight: 600;"));
+        row->addWidget(lbl);
+        row->addStretch();
+        tutorialBtn_ = new QPushButton(QStringLiteral("教程"));
+        tutorialBtn_->setFixedHeight(34);
+        tutorialBtn_->setCursor(Qt::PointingHandCursor);
+        tutorialBtn_->setToolTip(QStringLiteral("查看使用教程"));
+        QObject::connect(tutorialBtn_, &QPushButton::clicked, this, [this]() {
+            showTutorialDialog(this);
+        });
+        row->addWidget(tutorialBtn_);
+        row->addSpacing(8);
+        openBtn_ = new QPushButton(QStringLiteral("打开弹幕窗"));
+        openBtn_->setFixedHeight(34);
+        openBtn_->setCursor(Qt::PointingHandCursor);
+        QObject::connect(openBtn_, &QPushButton::clicked, this, [this]() { toggleOverlay(); });
+        row->addWidget(openBtn_);
+        cl->addLayout(row);
+
+        auto* desc = new QLabel(
+            QStringLiteral("透明悬浮窗，叠加在直播软件上方显示弹幕。"
+                           "窗口采集请在直播伴侣素材设置-高级设置-选择绿幕抠图（10.5+）。"));
+        desc->setWordWrap(true);
+        desc->setObjectName(QStringLiteral("ToolTip"));
+        cl->addWidget(desc);
+        lay->addWidget(card);
+
+        auto* themeCard = makeCard();
+        auto* tcl = qobject_cast<QVBoxLayout*>(themeCard->layout());
+        auto* trow = new QHBoxLayout;
+        trow->setSpacing(12);
+        auto* tlbl = new QLabel(QStringLiteral("弹幕外观主题"));
+        tlbl->setStyleSheet(QStringLiteral("font-size: 14px; font-weight: 600;"));
+        trow->addWidget(tlbl);
+        trow->addStretch();
+
+        const auto skins = liveaio::resources::listSkins(g_appRoot, QStringLiteral("danmu"));
+        QStringList names;
+        for (const auto& entry : skins) {
+            skinNameToId_.insert(entry.name, entry.id);
+            names << entry.name;
+        }
+        skinCombo_ = new liveaio::util::ThemedComboBox;
+        skinCombo_->addItems(names);
+        const QString activeId = configValue(
+            liveaio::resources::skinConfigKey(QStringLiteral("danmu")),
+            QStringLiteral("default")).toString();
+        for (const auto& entry : skins) {
+            if (entry.id == activeId) skinCombo_->setCurrentText(entry.name);
+        }
+        skinCombo_->setFixedHeight(34);
+        skinCombo_->setMinimumWidth(160);
+        skinCombo_->setOnChange([this](const QString& name) { onSkinChanged(name); });
+        trow->addWidget(skinCombo_);
+        tcl->addLayout(trow);
+        lay->addWidget(themeCard);
+    }
+
+    void buildChatPanel(QVBoxLayout* lay) {
+        lay->addWidget(pageTitle(QStringLiteral("弹幕")));
+        auto* card = makeCard();
+        auto* cl = qobject_cast<QVBoxLayout*>(card->layout());
+        addToggleRow(cl, QStringLiteral("chat"), QStringLiteral("消息弹幕"),
+                     QStringLiteral("显示观众发送的聊天弹幕"));
+        cl->addWidget(makeSeparator());
+        addSuffixRow(cl, QStringLiteral("chat"));
+        lay->addWidget(card);
+        addApplyRow(lay, [this]() { applyKind(QStringLiteral("chat")); });
+    }
+
+    void buildGiftPanel(QVBoxLayout* lay) {
+        lay->addWidget(pageTitle(QStringLiteral("礼物")));
+        auto* card = makeCard();
+        auto* cl = qobject_cast<QVBoxLayout*>(card->layout());
+        addToggleRow(cl, QStringLiteral("gift"), QStringLiteral("礼物弹幕"),
+                     QStringLiteral("显示观众送出礼物的弹幕"));
+        cl->addWidget(makeSeparator());
+
+        auto* row = new QHBoxLayout;
+        row->addWidget(new QLabel(QStringLiteral("最低金额")));
+        giftSpin_ = new QSpinBox;
+        giftSpin_->setRange(0, 999999);
+        giftSpin_->setSuffix(QStringLiteral(" 钻"));
+        giftSpin_->setFixedSize(110, 28);
+        giftSpin_->setValue(configValue(QStringLiteral("danmu_gift_min_diamonds"), 0).toInt());
+        row->addStretch();
+        row->addWidget(giftSpin_);
+        cl->addLayout(row);
+        cl->addWidget(makeSeparator());
+        addSuffixRow(cl, QStringLiteral("gift"));
+        lay->addWidget(card);
+        addApplyRow(lay, [this]() { applyKind(QStringLiteral("gift")); });
+    }
+
+    void buildFollowPanel(QVBoxLayout* lay) {
+        lay->addWidget(pageTitle(QStringLiteral("关注")));
+        auto* card = makeCard();
+        auto* cl = qobject_cast<QVBoxLayout*>(card->layout());
+        addToggleRow(cl, QStringLiteral("follow"), QStringLiteral("关注弹幕"),
+                     QStringLiteral("显示新关注通知弹幕"));
+        cl->addWidget(makeSeparator());
+        addSuffixRow(cl, QStringLiteral("follow"));
+        lay->addWidget(card);
+        addApplyRow(lay, [this]() { applyKind(QStringLiteral("follow")); });
+    }
+
+    void buildLikePanel(QVBoxLayout* lay) {
+        lay->addWidget(pageTitle(QStringLiteral("点赞")));
+        auto* card = makeCard();
+        auto* cl = qobject_cast<QVBoxLayout*>(card->layout());
+        addToggleRow(cl, QStringLiteral("like"), QStringLiteral("点赞弹幕"),
+                     QStringLiteral("显示观众点赞弹幕"));
+        cl->addWidget(makeSeparator());
+
+        auto* row = new QHBoxLayout;
+        row->addWidget(new QLabel(QStringLiteral("数量阈值")));
+        likeSpin_ = new QSpinBox;
+        likeSpin_->setRange(1, 99999);
+        likeSpin_->setFixedSize(90, 28);
+        likeSpin_->setValue(qMax(1, configValue(QStringLiteral("danmu_like_threshold"), 1).toInt()));
+        row->addStretch();
+        row->addWidget(likeSpin_);
+        cl->addLayout(row);
+        cl->addWidget(makeSeparator());
+
+        auto* row2 = new QHBoxLayout;
+        auto* left2 = new QVBoxLayout;
+        left2->setSpacing(3);
+        auto* lbl2 = new QLabel(QStringLiteral("累加模式"));
+        lbl2->setStyleSheet(QStringLiteral("font-size: 14px; font-weight: 600;"));
+        auto* tip2 = new QLabel(QStringLiteral("按用户累计点赞数，达到阈值后发送弹幕"));
+        tip2->setObjectName(QStringLiteral("ToolTip"));
+        left2->addWidget(lbl2);
+        left2->addWidget(tip2);
+        likeAccumBtn_ = new QPushButton;
+        likeAccumBtn_->setFixedHeight(28);
+        likeAccumBtn_->setCursor(Qt::PointingHandCursor);
+        likeAccumBtn_->setText(configValue(QStringLiteral("danmu_like_accumulate"), false).toBool()
+                                   ? QStringLiteral("累加：已开启") : QStringLiteral("累加：已关闭"));
+        QObject::connect(likeAccumBtn_, &QPushButton::clicked, this, [this]() {
+            const bool on = likeAccumBtn_->text() == QStringLiteral("累加：已开启");
+            likeAccumBtn_->setText(on ? QStringLiteral("累加：已关闭")
+                                      : QStringLiteral("累加：已开启"));
+            writeConfigValue(QStringLiteral("danmu_like_accumulate"), !on);
+            refreshSwitchStyles(false);
+            pushSettings();
+        });
+        row2->addLayout(left2);
+        row2->addStretch();
+        row2->addWidget(likeAccumBtn_);
+        cl->addLayout(row2);
+        cl->addWidget(makeSeparator());
+        addSuffixRow(cl, QStringLiteral("like"));
+        lay->addWidget(card);
+        addApplyRow(lay, [this]() { applyKind(QStringLiteral("like")); });
+    }
+
+    void toggleSwitch(const QString& key) {
+        auto* btn = switchBtns_.value(key);
+        if (!btn) return;
+        const bool on = btn->text() == QStringLiteral("已开启");
+        btn->setText(on ? QStringLiteral("已关闭") : QStringLiteral("已开启"));
+        refreshSwitchStyles(false);
+    }
+
+    void refreshSwitchStyles(bool syncFromConfig) {
+        const auto& C = theme();
+        const QString onStyle = QStringLiteral(
+            "QPushButton { background: %1; color: #fff; border: 1.5px solid transparent;"
+            " border-radius: 8px; font-size: 12px; font-weight: 600; padding: 0 14px; }"
+            "QPushButton:hover { background: %1; }").arg(C.activeLine);
+        const QString offStyle = QStringLiteral(
+            "QPushButton { background: transparent; color: %1; border: 1.5px solid %2;"
+            " border-radius: 8px; font-size: 12px; padding: 0 14px; }"
+            "QPushButton:hover { background: %3; }").arg(C.textMuted, C.border, C.hover);
+
+        for (auto it = switchBtns_.constBegin(); it != switchBtns_.constEnd(); ++it) {
+            bool on;
+            if (syncFromConfig) {
+                on = configValue(switchKeys_.value(it.key()), true).toBool();
+                it.value()->setText(on ? QStringLiteral("已开启") : QStringLiteral("已关闭"));
+            } else {
+                on = it.value()->text() == QStringLiteral("已开启");
+            }
+            it.value()->setStyleSheet(on ? onStyle : offStyle);
+        }
+        if (likeAccumBtn_) {
+            if (syncFromConfig) {
+                const bool on = configValue(QStringLiteral("danmu_like_accumulate"), false).toBool();
+                likeAccumBtn_->setText(on ? QStringLiteral("累加：已开启")
+                                          : QStringLiteral("累加：已关闭"));
+            }
+            const bool on = likeAccumBtn_->text() == QStringLiteral("累加：已开启");
+            likeAccumBtn_->setStyleSheet(on ? onStyle : offStyle);
+        }
+        for (auto* sep : seps_) {
+            sep->setStyleSheet(QStringLiteral("background: %1; max-height: 1px;").arg(C.border));
+        }
+        for (auto* btn : applyBtns_) {
+            btn->setStyleSheet(QStringLiteral(
+                "QPushButton { background: %1; color: #fff; border: none; border-radius: 6px;"
+                " font-size: 13px; font-weight: 600; }"
+                "QPushButton:hover { background: %2; color: %3; }"
+            ).arg(C.activeLine, C.hover, C.text));
+        }
+        if (skinCombo_) skinCombo_->refreshTheme();
+    }
+
+    void styleTutorialBtn() {
+        if (!tutorialBtn_) return;
+        const auto& C = theme();
+        tutorialBtn_->setStyleSheet(QStringLiteral(
+            "QPushButton { background: %1; color: %2; border: 1.5px solid %3;"
+            " border-radius: 8px; font-size: 13px; font-weight: 600; padding: 0 14px; }"
+            "QPushButton:hover { background: %4; color: %5; }"
+        ).arg(C.card, C.textMuted, C.border, C.hover, C.text));
+    }
+
+    void applyKind(const QString& kind) {
+        const bool on = switchBtns_.value(kind)
+            && switchBtns_.value(kind)->text() == QStringLiteral("已开启");
+        writeConfigValue(switchKeys_.value(kind), on);
+        if (auto* edit = suffixEdits_.value(kind)) {
+            writeConfigValue(QStringLiteral("danmu_%1_suffix").arg(kind), edit->text());
+        }
+        if (kind == QStringLiteral("gift") && giftSpin_) {
+            writeConfigValue(QStringLiteral("danmu_gift_min_diamonds"), giftSpin_->value());
+        }
+        if (kind == QStringLiteral("like")) {
+            if (likeSpin_) {
+                writeConfigValue(QStringLiteral("danmu_like_threshold"),
+                                 qMax(1, likeSpin_->value()));
+            }
+            if (likeAccumBtn_) {
+                writeConfigValue(QStringLiteral("danmu_like_accumulate"),
+                                 likeAccumBtn_->text() == QStringLiteral("累加：已开启"));
+            }
+        }
+        pushSettings();
+    }
+
+    QString suffixFor(const QString& kind) const {
+        if (auto* edit = suffixEdits_.value(kind)) return edit->text();
+        return configValue(QStringLiteral("danmu_%1_suffix").arg(kind), QString()).toString();
+    }
+
+    void onSkinChanged(const QString& name) {
+        const QString id = skinNameToId_.value(name, QStringLiteral("default"));
+        writeConfigValue(liveaio::resources::skinConfigKey(QStringLiteral("danmu")), id);
+        if (overlay_) overlay_->refreshSkin();
+    }
+
+    void toggleOverlay() {
+        if (!overlay_) {
+            overlay_ = new DanmuOverlayWindow;
+            overlay_->setOnClosed([this]() { refreshOpenBtn(); });
+        }
+        if (overlay_->isVisible()) {
+            overlay_->hide();
+        } else {
+            overlay_->show();
+            overlay_->activateWindow();
+        }
+        refreshOpenBtn();
+    }
+
+    void refreshOpenBtn() {
+        if (!openBtn_) return;
+        const auto& C = theme();
+        const bool open = overlay_ && overlay_->isVisible();
+        openBtn_->setText(open ? QStringLiteral("关闭弹幕窗") : QStringLiteral("打开弹幕窗"));
+        if (open) {
+            openBtn_->setStyleSheet(QStringLiteral(
+                "QPushButton { background: %1; color: #fff; border: 1.5px solid transparent;"
+                " border-radius: 8px; font-size: 13px; font-weight: 600; padding: 0 16px; }"
+                "QPushButton:hover { background: %2; }"
+            ).arg(C.closeHover, C.active));
+        } else {
+            openBtn_->setStyleSheet(QStringLiteral(
+                "QPushButton { background: %1; color: %2; border: 1.5px solid %2;"
+                " border-radius: 8px; font-size: 13px; font-weight: 600; padding: 0 16px; }"
+                "QPushButton:hover { background: %3; }"
+            ).arg(C.card, C.activeLine, C.hover));
+        }
+    }
+
+    void pushSettings() {
+        sendCore(QJsonObject{
+            {QStringLiteral("op"), QStringLiteral("tool.danmu.set")},
+            {QStringLiteral("settings"), QJsonObject{
+                {QStringLiteral("danmu_chat_on"), configValue(QStringLiteral("danmu_chat_on"), true).toBool()},
+                {QStringLiteral("danmu_gift_on"), configValue(QStringLiteral("danmu_gift_on"), true).toBool()},
+                {QStringLiteral("danmu_gift_min_diamonds"), configValue(QStringLiteral("danmu_gift_min_diamonds"), 0).toInt()},
+                {QStringLiteral("danmu_follow_on"), configValue(QStringLiteral("danmu_follow_on"), true).toBool()},
+                {QStringLiteral("danmu_like_on"), configValue(QStringLiteral("danmu_like_on"), true).toBool()},
+                {QStringLiteral("danmu_like_threshold"), qMax(1, configValue(QStringLiteral("danmu_like_threshold"), 1).toInt())},
+                {QStringLiteral("danmu_like_accumulate"), configValue(QStringLiteral("danmu_like_accumulate"), false).toBool()},
+            }},
+        });
+    }
+
+    QStackedWidget* stack_ = nullptr;
+    QVector<QPushButton*> navBtns_;
+    int curNav_ = 0;
+    QMap<QString, QString> switchKeys_;
+    QMap<QString, QPushButton*> switchBtns_;
+    QMap<QString, QLineEdit*> suffixEdits_;
+    QMap<QString, QString> skinNameToId_;
+    QVector<QFrame*> seps_;
+    QVector<QPushButton*> applyBtns_;
+    QSpinBox* giftSpin_ = nullptr;
+    QSpinBox* likeSpin_ = nullptr;
+    QPushButton* likeAccumBtn_ = nullptr;
+    QPushButton* openBtn_ = nullptr;
+    QPushButton* tutorialBtn_ = nullptr;
+    liveaio::util::ThemedComboBox* skinCombo_ = nullptr;
+    DanmuOverlayWindow* overlay_ = nullptr;
+};
+
+static ToolWindowBase* createDanmuTool(CoreClient* core) {
+    return new DanmuToolWindow(core);
+}
+
+}  // namespace liveaio::tools
