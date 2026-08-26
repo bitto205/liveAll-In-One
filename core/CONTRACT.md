@@ -97,6 +97,10 @@ LiveAIO.exe                 C++ 薄宿主：LoadLibrary 各模块
 
 禁止：同一帧在 UI 或第二套解析器再 parse 一次进工具。
 
+### 1.4 C++ UI 懒加载与 overlay
+
+Pages/Tools 的懒加载矩阵、进程级透明 overlay 单壳、Async-by-default 规则见 [`CPP_UI_CONTRACT.md`](CPP_UI_CONTRACT.md)（§懒加载矩阵、§透明 overlay、§Async-by-default）。
+
 ---
 
 ## 2. 工具：业务 vs UI

@@ -71,6 +71,7 @@ func (h *hub) handleUICommand(c *Conn, env Envelope) {
 	case "quit.shutdown_all":
 		_ = c.Send(Envelope{"op": OpReady, "bye": true})
 		h.stopCapture()
+		QuitTray()
 		if h.shutdown != nil {
 			h.shutdown()
 		}

@@ -8,6 +8,7 @@
 #include <QAbstractAnimation>
 #include <QEasingCurve>
 #include <QEvent>
+#include <QFile>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -27,9 +28,13 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QVariant>
+#include <QFutureWatcher>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QVariantAnimation>
 #include <QVector>
 #include <QWidget>
+#include <QtConcurrent>
 #include <QtGlobal>
 
 #include <functional>
@@ -217,6 +222,17 @@ inline QString qssOutlined(int h = 36) {
     ).arg(C.card, C.activeLine, QString::number(h), C.hover);
 }
 
+// 与 qssLineEdit 同高同边框：并排输入框+按钮时用这个，避免 1.5px/min-height 把按钮撑高。
+inline QString qssOutlinedBesideEdit(int h = 36) {
+    const ThemePalette& C = theme();
+    return QStringLiteral(
+        "QPushButton { background: %1; color: %2; border: 1px solid %2;"
+        " border-radius: 6px; font-size: 13px; font-weight: 600;"
+        " height: %3px; max-height: %3px; min-height: %3px; padding: 0 14px; }"
+        "QPushButton:hover { background: %4; border: 1px solid %2; }"
+    ).arg(C.card, C.activeLine, QString::number(h), C.hover);
+}
+
 inline QString qssDisabled(int h = 36) {
     const ThemePalette& C = theme();
     return QStringLiteral(
@@ -270,10 +286,15 @@ inline QString qssLineEdit() {
     const ThemePalette& C = theme();
     return QStringLiteral(
         "QLineEdit { background: %1; color: %2; border: 1px solid %3; border-radius: 6px;"
-        " padding: 0 10px; font-size: 13px; }"
+        " padding: 0 10px; font-size: 13px;"
+        " height: 36px; max-height: 36px; min-height: 36px; }"
         "QLineEdit:focus { border-color: %4; }"
     ).arg(C.card, C.text, C.border, C.activeLine);
 }
+
+// 主窗口壳几何常量（圆角半径）。
+inline constexpr int kWindowShadowMargin = 0;
+inline constexpr int kWindowCornerRadius = 10;
 
 // 主窗口壳 QSS：旧 main_page.build_qss + settings_page.build_setting_qss。
 inline QString shellQss() {
@@ -282,14 +303,14 @@ inline QString shellQss() {
         "QWidget { background: transparent; color: %1;"
         " font-family: 'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;"
         " font-size: 14px; outline: none; }"
-        "#WindowCard { background: %2; border-radius: 10px 10px 0 0; border: 1px solid %3; }"
-        "#TitleBar { background: %2; border-radius: 10px 10px 0 0; }"
+        "#WindowCard { background: %2; border-radius: %12px; border: 1px solid %3; }"
+        "#TitleBar { background: transparent; border-radius: %12px %12px 0 0; }"
         "#AppTitle { color: %5; font-size: 12px; background: transparent; }"
         "#WinBtn { background: transparent; border: none; border-radius: 0px; color: %5;"
         " font-size: 13px; min-width: 46px; max-width: 46px;"
         " min-height: 36px; max-height: 36px; }"
         "#WinBtn:hover { background: %6; color: %1; border-radius: 0px; }"
-        "#Sidebar { background: %2; border-radius: 0; }"
+        "#Sidebar { background: transparent; }"
         "#SidebarDivider { background: %3; min-width: 1px; max-width: 1px; }"
         "#ToggleBtn, #NavBtn, #SettingsBtn { background: transparent; border: none;"
         " border-radius: 0px; text-align: left; color: %5; }"
@@ -301,7 +322,7 @@ inline QString shellQss() {
         "QScrollBar:vertical { background: transparent; width: 4px; }"
         "QScrollBar::handle:vertical { background: %4; border-radius: 2px; min-height: 20px; }"
         "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
-        "#ContentArea { background: %2; border-radius: 0; }"
+        "#ContentArea { background: transparent; }"
         "#Card { background: %10; border-radius: 10px; border: 1px solid %4; }"
         "#PageTitle { font-size: 22px; font-weight: 600; color: %1; background: transparent; }"
         "#PageSubtitle { font-size: 13px; color: %5; background: transparent; }"
@@ -312,12 +333,13 @@ inline QString shellQss() {
         " border-bottom: 2px solid transparent; }"
         "#SettingNavBtn[active=\"true\"] { background: transparent; color: %1;"
         " font-weight: 600; border-bottom: 2px solid %11; }"
-        "#SettingContent { background: %2; }"
+        "#SettingContent { background: transparent; }"
         "#SettingCard { background: %10; border-radius: 10px; border: 1px solid %4; }"
         "#SettingCardTitle { font-size: 13px; font-weight: 600; color: %5; background: transparent; }"
         "#SettingPageTitle { font-size: 20px; font-weight: 600; color: %1; background: transparent; }"
     ).arg(C.text, C.bg, C.winEdge, C.border, C.textMuted, C.btnHover,
-          C.sidebar, C.hover, C.active, C.card, C.activeLine);
+          C.sidebar, C.hover, C.active, C.card, C.activeLine,
+          QString::number(kWindowCornerRadius));
 }
 
 // 旧 _danmu_spin_qss：自绘上下箭头的紧凑 QSpinBox。
@@ -533,7 +555,17 @@ public:
 
     void addItems(const QStringList& items) {
         items_ = items;
+        lazyLoaded_ = true;
         if (!items_.isEmpty()) setCurrent(items_.first(), false);
+    }
+
+    // 首次展开下拉时再读盘（如 listSkins），避免工具窗构造期扫目录。
+    void setLazyItemsLoader(std::function<QStringList()> loader) {
+        lazyLoader_ = std::move(loader);
+        lazyLoaded_ = false;
+        items_.clear();
+        current_.clear();
+        btn_->setText(QStringLiteral("   ▾"));
     }
 
     QString currentText() const { return current_; }
@@ -597,6 +629,9 @@ private:
             popup_->hide();
             return;
         }
+        if (!lazyLoaded_ && lazyLoader_) {
+            addItems(lazyLoader_());
+        }
         popup_->setItems(items_, current_, [this](const QString& t) { setCurrent(t, true); },
                          width() + kOvershoot * 2);
         popup_->move(mapToGlobal(QPoint(-kOvershoot, -kOvershoot)));
@@ -608,6 +643,8 @@ private:
     QPushButton* btn_ = nullptr;
     DropPopup* popup_ = nullptr;
     bool compact_ = false;
+    bool lazyLoaded_ = true;
+    std::function<QStringList()> lazyLoader_;
     std::function<void(const QString&)> onChange_;
 };
 
@@ -702,7 +739,6 @@ private:
 inline constexpr int kSidebarExpanded = 220;
 inline constexpr int kSidebarCollapsed = 64;
 inline constexpr int kSidebarAnimMs = 220;
-inline constexpr int kWindowShadowMargin = 14;
 
 // 自绘：QSS 的 border-radius 对 hover 背景裁剪不可靠，这里手绘右上角圆弧。
 class CloseButton final : public QPushButton {
@@ -756,6 +792,7 @@ public:
 
     explicit TitleBar(QWidget* parent = nullptr) : QWidget(parent) {
         setObjectName(QStringLiteral("TitleBar"));
+        setAttribute(Qt::WA_StyledBackground, true);
         setFixedHeight(kHeight);
 
         auto* lay = new QHBoxLayout(this);
@@ -889,6 +926,7 @@ public:
     Sidebar(const QVector<NavItem>& items, const NavItem& settingsItem, QWidget* parent = nullptr)
         : QWidget(parent) {
         setObjectName(QStringLiteral("Sidebar"));
+        setAttribute(Qt::WA_StyledBackground, true);
         setFixedWidth(kSidebarExpanded);
         setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
         build(items, settingsItem);
@@ -902,14 +940,15 @@ public:
         expanded_ = !expanded_;
         const int start = width();
         const int end = expanded_ ? kSidebarExpanded : kSidebarCollapsed;
-        for (auto* a : {animMin_, animMax_}) {
-            a->stop();
-            a->setStartValue(start);
-            a->setEndValue(end);
-            a->start();
-        }
+        // 一次回调同时改 min/max，避免双动画不同步导致每帧两次布局。
+        anim_->stop();
+        anim_->setStartValue(start);
+        anim_->setEndValue(end);
+        anim_->start();
         toggleIcon_->setText(expanded_ ? QStringLiteral("◀") : QStringLiteral("▶"));
     }
+
+    void setOnAnimActive(std::function<void(bool)> cb) { onAnimActive_ = std::move(cb); }
 
     void setActiveMain(int index) {
         for (int i = 0; i < navBtns_.size(); ++i) navBtns_[i]->setActive(i == index);
@@ -996,12 +1035,20 @@ private:
     }
 
     void setupAnim() {
-        animMin_ = new QPropertyAnimation(this, "minimumWidth", this);
-        animMax_ = new QPropertyAnimation(this, "maximumWidth", this);
-        for (auto* a : {animMin_, animMax_}) {
-            a->setDuration(kSidebarAnimMs);
-            a->setEasingCurve(QEasingCurve::InOutQuart);
-        }
+        anim_ = new QVariantAnimation(this);
+        anim_->setDuration(kSidebarAnimMs);
+        anim_->setEasingCurve(QEasingCurve::InOutQuart);
+        QObject::connect(anim_, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
+            const int w = qRound(v.toReal());
+            setMinimumWidth(w);
+            setMaximumWidth(w);
+        });
+        QObject::connect(anim_, &QVariantAnimation::stateChanged, this,
+                         [this](QAbstractAnimation::State neu, QAbstractAnimation::State) {
+                             if (onAnimActive_) {
+                                 onAnimActive_(neu == QAbstractAnimation::Running);
+                             }
+                         });
     }
 
     QWidget* panel_ = nullptr;
@@ -1009,8 +1056,8 @@ private:
     QLabel* toggleLabel_ = nullptr;
     QVector<NavButton*> navBtns_;
     NavButton* settingsBtn_ = nullptr;
-    QPropertyAnimation* animMin_ = nullptr;
-    QPropertyAnimation* animMax_ = nullptr;
+    QVariantAnimation* anim_ = nullptr;
+    std::function<void(bool)> onAnimActive_;
     bool expanded_ = true;
 };
 
@@ -1034,7 +1081,7 @@ public:
                 paused_.push_back(anim);
             }
         }
-        host_->setUpdatesEnabled(false);
+        // 不关 setUpdatesEnabled：边框需高帧率重绘，内容由调用方节流。
     }
 
     void end() {
@@ -1044,7 +1091,6 @@ public:
             if (anim && anim->state() == QAbstractAnimation::Paused) anim->resume();
         }
         paused_.clear();
-        host_->setUpdatesEnabled(true);
         if (onResume_) onResume_();
         host_->update();
     }
@@ -1238,6 +1284,119 @@ private:
     bool dragging_ = false;
     QPoint dragOffset_;
 };
+
+// ─────────────────────────────────────────────
+// Async-by-default：主线程分帧 / 工作线程读盘（不碰 QWidget）
+// ─────────────────────────────────────────────
+inline void deferNextTick(QObject* context, std::function<void()> fn) {
+    if (!context) return;
+    QTimer::singleShot(0, context, std::move(fn));
+}
+
+class ChunkBuilder final : public QObject {
+public:
+    ChunkBuilder(QObject* parent, int batchSize, int intervalMs)
+        : QObject(parent), batchSize_(batchSize), intervalMs_(intervalMs) {
+        timer_ = new QTimer(this);
+        timer_->setSingleShot(true);
+        QObject::connect(timer_, &QTimer::timeout, this, [this]() { runBatch(); });
+    }
+
+    void start(int total, std::function<void(int)> buildOne, std::function<void()> onDone) {
+        total_ = total;
+        index_ = 0;
+        buildOne_ = std::move(buildOne);
+        onDone_ = std::move(onDone);
+        runBatch();
+    }
+
+private:
+    void runBatch() {
+        if (!buildOne_) return;
+        const int end = std::min(index_ + batchSize_, total_);
+        for (int i = index_; i < end; ++i) buildOne_(i);
+        index_ = end;
+        if (index_ >= total_) {
+            if (onDone_) onDone_();
+            buildOne_ = nullptr;
+            onDone_ = nullptr;
+            return;
+        }
+        timer_->start(intervalMs_);
+    }
+
+    QTimer* timer_ = nullptr;
+    int batchSize_ = 8;
+    int intervalMs_ = 24;
+    int total_ = 0;
+    int index_ = 0;
+    std::function<void(int)> buildOne_;
+    std::function<void()> onDone_;
+};
+
+class WidgetDeferredDestroy final : public QObject {
+public:
+    explicit WidgetDeferredDestroy(QObject* parent = nullptr) : QObject(parent) {
+        timer_ = new QTimer(this);
+        timer_->setSingleShot(true);
+        QObject::connect(timer_, &QTimer::timeout, this, [this]() { drainBatch(); });
+    }
+
+    void enqueue(QWidget* widget) {
+        if (!widget) return;
+        queue_.append(widget);
+        schedule();
+    }
+
+    void enqueueBatch(const QVector<QWidget*>& widgets) {
+        for (QWidget* w : widgets) {
+            if (w) queue_.append(w);
+        }
+        schedule();
+    }
+
+    void setBatchSize(int n) { batchSize_ = std::max(1, n); }
+    void setIntervalMs(int ms) { intervalMs_ = std::max(8, ms); }
+
+private:
+    void schedule() {
+        if (!timer_->isActive() && !queue_.isEmpty()) timer_->start(intervalMs_);
+    }
+
+    void drainBatch() {
+        int n = 0;
+        while (!queue_.isEmpty() && n < batchSize_) {
+            QPointer<QWidget> w = queue_.takeFirst();
+            if (w) w->deleteLater();
+            ++n;
+        }
+        if (!queue_.isEmpty()) timer_->start(intervalMs_);
+    }
+
+    QTimer* timer_ = nullptr;
+    QVector<QPointer<QWidget>> queue_;
+    int batchSize_ = 8;
+    int intervalMs_ = 24;
+};
+
+inline void readJsonAsync(const QString& path, QObject* context,
+                          std::function<void(QJsonObject)> onReady) {
+    if (!context || !onReady) return;
+    auto* watcher = new QFutureWatcher<QJsonObject>(context);
+    QObject::connect(watcher, &QFutureWatcher<QJsonObject>::finished, context,
+                     [watcher, onReady]() {
+                         onReady(watcher->result());
+                         watcher->deleteLater();
+                     });
+    watcher->setFuture(QtConcurrent::run([path]() {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) return QJsonObject{};
+        QJsonParseError err;
+        const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &err);
+        return (err.error == QJsonParseError::NoError && doc.isObject()) ? doc.object()
+                                                                         : QJsonObject{};
+    }));
+}
 
 }  // namespace liveaio::util
 

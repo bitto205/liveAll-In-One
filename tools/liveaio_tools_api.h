@@ -18,6 +18,9 @@ extern "C" {
  * 打开一个工具窗口。tool_id: "memo" | "danmu" | "overtime"。返回 0 表示成功。 */
 LIVEAIO_TOOLS_API int LiveAIO_ToolsOpen(const char* tool_id);
 
+/* 进入 Tools 页时预连 Core、预加载 config/catalog（不必打开具体工具）。 */
+LIVEAIO_TOOLS_API void LiveAIO_ToolsWarm(void);
+
 /* 主界面切换主题时同步已打开的工具窗（theme_name 为 util/widgets.cpp 的主题名）。 */
 LIVEAIO_TOOLS_API void LiveAIO_ToolsApplyTheme(const char* theme_name);
 

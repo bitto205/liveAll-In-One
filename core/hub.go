@@ -51,6 +51,11 @@ func startHub(ctx context.Context, root, tcp string, log *slog.Logger, shutdown 
 		h.connected = connected
 		h.send(h.statusEnvelope())
 	}
+	h.capture.OnError = func(err error) {
+		h.connected = false
+		h.send(Envelope{"op": OpError, "code": "listen", "route": h.route, "msg": err.Error()})
+		h.send(h.statusEnvelope())
+	}
 	h.overtime = NewOvertime(
 		func(rem int, running bool) {
 			h.send(Envelope{"op": OpTick, "remaining_seconds": rem, "running": running})
@@ -374,6 +379,15 @@ func (h *hub) statusEnvelope() Envelope {
 
 func (h *hub) afterMessage(m listener.Msg) {
 	t, _ := m["type"].(string)
+	if t == "control" && listener.ControlEnded(m["status"]) {
+		if h.connected {
+			h.connected = false
+			h.send(h.statusEnvelope())
+			h.log.Info("live ended", "via", "control")
+			h.stopCapture()
+		}
+		return
+	}
 	diamonds := 0
 	if t == "gift" {
 		gift, _ := m["gift"].(string)

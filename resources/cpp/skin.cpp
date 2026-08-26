@@ -113,7 +113,9 @@ static int fitFontPixelSize(const QString& text, int maxW, int maxH,
         f.setPixelSize(mid);
         if (bold) f.setBold(true);
         QFontMetrics fm(f);
-        if (fm.horizontalAdvance(sample) <= maxW && fm.height() <= maxH) {
+        // height() 含 leading，YaHei 会把字压到明显偏小；用字形紧框。
+        const QRect tight = fm.tightBoundingRect(sample);
+        if (fm.horizontalAdvance(sample) <= maxW && tight.height() <= maxH) {
             best = mid;
             lo = mid + 1;
         } else {
@@ -247,8 +249,24 @@ public:
     int fitRole(const QString& surface, const QString& role, const QString& text,
                 int maxW, int maxH, qreal scale = 1.0) const {
         const auto st = roleStyle(surface, role);
-        const int cap = std::max(st.minPx, int(std::lround(st.maxPx * scale)));
-        const QString sample = text.isEmpty() ? (st.fitRef.isEmpty() ? QStringLiteral("国") : st.fitRef) : text;
+        // 皮肤 max_px×scale 为硬顶（礼物名等）。
+        const int cap = st.maxPx > 0
+            ? std::max(st.minPx, int(std::lround(st.maxPx * std::max(0.5, scale))))
+            : std::max(st.minPx, maxH);
+        const QString sample = text.isEmpty()
+            ? (st.fitRef.isEmpty() ? QStringLiteral("国") : st.fitRef)
+            : text;
+        return fitFontPixelSize(sample, maxW, maxH, st.fontFamily, st.bold, cap, st.minPx);
+    }
+
+    // 按盒子高度填满（倒计时/标题）；不受皮肤 max_px 牵制，避免和礼物字号绑死。
+    int fitRoleFill(const QString& surface, const QString& role, const QString& text,
+                    int maxW, int maxH) const {
+        const auto st = roleStyle(surface, role);
+        const int cap = std::max(st.minPx, maxH);
+        const QString sample = text.isEmpty()
+            ? (st.fitRef.isEmpty() ? QStringLiteral("国") : st.fitRef)
+            : text;
         return fitFontPixelSize(sample, maxW, maxH, st.fontFamily, st.bold, cap, st.minPx);
     }
 
@@ -267,7 +285,23 @@ public:
     }
 
     LoadedStill presentImage(const QString& path, int boxH, qreal uiScale = 1.0) const {
+        QImageReader probe(path);
+        probe.setAutoTransform(true);
+        if (probe.canRead() && probe.imageCount() > 1) {
+            const LoadedAnim anim = loadAnimPath(path, boxH, screenDpr(), uiScale);
+            if (!anim.frames.isEmpty()) {
+                LoadedStill out;
+                out.pixmap = anim.frames.first();
+                out.logicalW = anim.logicalW;
+                out.logicalH = anim.logicalH;
+                return out;
+            }
+        }
         return loadStillPath(path, boxH, screenDpr(), uiScale);
+    }
+
+    LoadedAnim presentAnimation(const QString& path, int boxH, qreal uiScale = 1.0) const {
+        return loadAnimPath(path, boxH, screenDpr(), uiScale);
     }
 };
 

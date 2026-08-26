@@ -3,6 +3,8 @@
 
 namespace liveaio::pages {
 
+using liveaio::util::deferNextTick;
+
 class HomePage;
 
 enum class BtnState { Idle, Connecting, Connected, Error };
@@ -10,20 +12,25 @@ enum class BtnState { Idle, Connecting, Connected, Error };
 struct RouteMeta {
     QString title;
     QString badge;
-    QString desc;
+    QString desc;       // 详情页完整说明
+    QString pickerDesc; // 选择卡片：固定短文案，单行不换行，避免侧栏伸缩时撑高
 };
 
 static const QMap<QString, RouteMeta>& routeMetaTable() {
     static const QMap<QString, RouteMeta> table = {
         {QStringLiteral("1"), {QStringLiteral("线路一"), QStringLiteral("JS Hook"),
-             QStringLiteral("该线路建议登录抖音（可选）。在直播间连接期间请勿用登录账号进入任何直播间")}},
+             QStringLiteral("该线路建议登录抖音（可选）。在直播间连接期间请勿用登录账号进入任何直播间"),
+             QStringLiteral("建议登录抖音（可选）")}},
         {QStringLiteral("2"), {QStringLiteral("线路二"), QStringLiteral("WSS"),
-             QStringLiteral("该线路建议登录抖音（可选）。在直播间连接期间请勿用登录账号进入任何直播间")}},
+             QStringLiteral("该线路建议登录抖音（可选）。在直播间连接期间请勿用登录账号进入任何直播间"),
+             QStringLiteral("建议登录抖音（可选）")}},
         {QStringLiteral("3"), {QStringLiteral("线路三"), QStringLiteral("WinDivert"),
-             QStringLiteral("\n该线路需要监听直播伴侣，无需登录抖音，但不能同时运行任何代理软件。"
-                            "在连接直播间以后，请勿关闭直播伴侣或者关播，否则需要重新开播才能连接")}},
+             QStringLiteral("该线路需要监听直播伴侣，无需登录抖音，但不能同时运行任何代理软件。"
+                            "在连接直播间以后，请勿关闭直播伴侣或者关播，否则需要重新开播才能连接"),
+             QStringLiteral("监听直播伴侣，勿同时开代理")}},
         {QStringLiteral("4"), {QStringLiteral("线路四"), QStringLiteral("Proxy Shell"),
-             QStringLiteral("该线路需要监听直播伴侣，无需登录抖音。但是需要patch直播伴侣")}},
+             QStringLiteral("该线路需要监听直播伴侣，无需登录抖音。但是需要patch直播伴侣"),
+             QStringLiteral("监听直播伴侣，需 patch")}},
     };
     return table;
 }
@@ -188,9 +195,11 @@ private:
         top->addWidget(badge);
         lay->addLayout(top);
 
-        auto* desc = new QLabel(meta.desc, card);
-        desc->setWordWrap(true);
-        desc->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Minimum);
+        auto* desc = new QLabel(meta.pickerDesc, card);
+        desc->setWordWrap(false);
+        desc->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+        desc->setFixedHeight(QFontMetrics(desc->font()).height());
+        desc->setToolTip(meta.desc);
         lay->addWidget(desc);
 
         labels_.insert(route, CardLabels{name, badge, desc});
@@ -295,8 +304,10 @@ public:
         saveBtn_->setCursor(Qt::PointingHandCursor);
         QObject::connect(saveBtn_, &QPushButton::clicked, this, [this]() { saveLiveId(); });
         auto* row2 = new QHBoxLayout;
-        row2->addWidget(roomInput_);
-        row2->addWidget(saveBtn_);
+        row2->setSpacing(8);
+        row2->setAlignment(Qt::AlignVCenter);
+        row2->addWidget(roomInput_, 1);
+        row2->addWidget(saveBtn_, 0);
         step2_.body->addLayout(row2);
         lay->addWidget(step2_.card);
 
@@ -370,7 +381,7 @@ public:
         loginDesc_->setStyleSheet(qssMutedLabel(12));
         loginStatus_->setStyleSheet(qssMutedLabel(13));
         roomInput_->setStyleSheet(qssLineEdit());
-        saveBtn_->setStyleSheet(qssOutlined(36));
+        saveBtn_->setStyleSheet(qssOutlinedBesideEdit(36));
         step1_.refreshTheme();
         step2_.refreshTheme();
         step3_.refreshTheme();
@@ -887,18 +898,23 @@ public:
         stack_->addWidget(picker_);
 
         for (const QString& route : {QStringLiteral("1"), QStringLiteral("2")}) {
-            auto* page = new WebRoutePage(route, this, core_, stack_);
-            webPages_.insert(route, page);
-            stack_->addWidget(page);
+            auto* ph = new QWidget(stack_);
+            ph->setObjectName(QStringLiteral("RoutePlaceholder"));
+            routePlaceholders_.insert(route, ph);
+            stack_->addWidget(ph);
             routeIndex_.insert(route, stack_->count() - 1);
         }
         if (route3Enabled()) {
-            route3_ = new Route3Page(this, core_, stack_);
-            stack_->addWidget(route3_);
+            auto* ph = new QWidget(stack_);
+            ph->setObjectName(QStringLiteral("RoutePlaceholder"));
+            routePlaceholders_.insert(QStringLiteral("3"), ph);
+            stack_->addWidget(ph);
             routeIndex_.insert(QStringLiteral("3"), stack_->count() - 1);
         }
-        route4_ = new Route4Page(this, core_, stack_);
-        stack_->addWidget(route4_);
+        auto* ph4 = new QWidget(stack_);
+        ph4->setObjectName(QStringLiteral("RoutePlaceholder"));
+        routePlaceholders_.insert(QStringLiteral("4"), ph4);
+        stack_->addWidget(ph4);
         routeIndex_.insert(QStringLiteral("4"), stack_->count() - 1);
 
         auto* root = new QVBoxLayout(this);
@@ -908,9 +924,10 @@ public:
         refreshTheme();
         showPicker();
 
-        if (core_) {
-            core_->uiCommand(QStringLiteral("route.env"), QStringLiteral("3"));
-            core_->uiCommand(QStringLiteral("route.env"), QStringLiteral("4"));
+        const QString warmRoute =
+            configValue(QStringLiteral("route"), QStringLiteral("2")).toString();
+        if (routeIndex_.contains(warmRoute)) {
+            liveaio::util::deferNextTick(this, [this, warmRoute]() { ensureRoutePage(warmRoute); });
         }
     }
 
@@ -1019,12 +1036,54 @@ protected:
     }
 
 private:
+    void ensureRoutePage(const QString& route) {
+        if (route == QStringLiteral("3") && !route3Enabled()) return;
+        if (webPages_.contains(route)) return;
+        if (route == QStringLiteral("3") && route3_) return;
+        if (route == QStringLiteral("4") && route4_) return;
+
+        QWidget* page = nullptr;
+        if (route == QStringLiteral("1") || route == QStringLiteral("2")) {
+            auto* wp = new WebRoutePage(route, this, core_, stack_);
+            webPages_.insert(route, wp);
+            page = wp;
+        } else if (route == QStringLiteral("3")) {
+            route3_ = new Route3Page(this, core_, stack_);
+            page = route3_;
+        } else if (route == QStringLiteral("4")) {
+            route4_ = new Route4Page(this, core_, stack_);
+            page = route4_;
+        }
+        QWidget* ph = routePlaceholders_.value(route);
+        if (!page || !ph) return;
+        const int idx = stack_->indexOf(ph);
+        stack_->removeWidget(ph);
+        ph->deleteLater();
+        routePlaceholders_.remove(route);
+        stack_->insertWidget(idx, page);
+        routeIndex_.insert(route, idx);
+    }
+
+    bool routePageReady(const QString& route) const {
+        if (route == QStringLiteral("1") || route == QStringLiteral("2")) return webPages_.contains(route);
+        if (route == QStringLiteral("3")) return route3_ != nullptr;
+        if (route == QStringLiteral("4")) return route4_ != nullptr;
+        return false;
+    }
+
     void enterRoute(const QString& route) {
         if (route == QStringLiteral("3") && !route3Enabled()) {
             showPicker();
             return;
         }
         if (!routeIndex_.contains(route)) {
+            showPicker();
+            return;
+        }
+        if (!routePageReady(route)) {
+            ensureRoutePage(route);
+        }
+        if (!routePageReady(route)) {
             showPicker();
             return;
         }
@@ -1100,6 +1159,7 @@ private:
     QStackedWidget* stack_ = nullptr;
     RoutePickerPage* picker_ = nullptr;
     QMap<QString, WebRoutePage*> webPages_;
+    QMap<QString, QWidget*> routePlaceholders_;
     Route3Page* route3_ = nullptr;
     Route4Page* route4_ = nullptr;
     QMap<QString, int> routeIndex_;

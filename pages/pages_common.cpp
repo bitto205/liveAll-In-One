@@ -3,13 +3,16 @@
 
 #include <QApplication>
 #include <QCloseEvent>
+#include <QEventLoop>
 #include <QComboBox>
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
+#include <QFontMetrics>
 #include <QGraphicsDropShadowEffect>
+#include <QGraphicsEffect>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -21,7 +24,11 @@
 #include <QMap>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QRegion>
 #include <QScrollArea>
+#include <QShowEvent>
 #include <QSizePolicy>
 #include <QStackedWidget>
 #include <QTcpSocket>
@@ -41,6 +48,7 @@ using liveaio::util::StepCard;
 using liveaio::util::ThemedComboBox;
 using liveaio::util::ThemedToggle;
 using liveaio::util::TitleBar;
+using liveaio::util::kWindowCornerRadius;
 using liveaio::util::kWindowShadowMargin;
 using liveaio::util::labelRow;
 using liveaio::util::qssAccentLabel;
@@ -51,6 +59,7 @@ using liveaio::util::qssErrorLabel;
 using liveaio::util::qssLineEdit;
 using liveaio::util::qssMutedLabel;
 using liveaio::util::qssOutlined;
+using liveaio::util::qssOutlinedBesideEdit;
 using liveaio::util::qssSuccess;
 using liveaio::util::scrollPage;
 using liveaio::util::shellQss;
@@ -145,7 +154,28 @@ public:
         send(QJsonObject{{QStringLiteral("op"), QStringLiteral("shutdown")}});
     }
 
+    // 关主窗且不收进托盘：发 quit.shutdown_all 并等 Core 回 bye，避免 socket 未刷完就 quit。
+    void requestFullShutdown(int timeoutMs = 2500) {
+        if (socket_->state() != QAbstractSocket::ConnectedState) return;
+        uiCommand(QStringLiteral("quit.shutdown_all"));
+        socket_->flush();
+        waitForBye(timeoutMs);
+    }
+
 private:
+    void waitForBye(int timeoutMs) {
+        waitingBye_ = true;
+        QEventLoop loop;
+        byeLoop_ = &loop;
+        QTimer timer;
+        timer.setSingleShot(true);
+        QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
+        timer.start(timeoutMs);
+        loop.exec();
+        waitingBye_ = false;
+        byeLoop_ = nullptr;
+    }
+
     void onReadyRead() {
         buffer_.append(socket_->readAll());
         while (true) {
@@ -158,7 +188,13 @@ private:
             const auto doc = QJsonDocument::fromJson(line, &err);
             if (err.error != QJsonParseError::NoError || !doc.isObject()) continue;
             QJsonObject packet = doc.object();
-            if (packet.value(QStringLiteral("op")).toString() == QStringLiteral("ready")) ready_ = true;
+            const QString op = packet.value(QStringLiteral("op")).toString();
+            if (op == QStringLiteral("ready")) {
+                ready_ = true;
+                if (waitingBye_ && packet.value(QStringLiteral("bye")).toBool() && byeLoop_) {
+                    byeLoop_->quit();
+                }
+            }
             if (packetCb_) packetCb_(packet);
         }
     }
@@ -166,6 +202,8 @@ private:
     QTcpSocket* socket_;
     QByteArray buffer_;
     bool ready_ = false;
+    bool waitingBye_ = false;
+    QEventLoop* byeLoop_ = nullptr;
     std::function<void(const QJsonObject&)> packetCb_;
     std::function<void(bool)> statusCb_;
 };

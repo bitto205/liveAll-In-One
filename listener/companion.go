@@ -119,9 +119,6 @@ func SetManualCompanionDir(root, pathStr string) (bool, string) {
 	if st, err := os.Stat(pathStr); err != nil || !st.IsDir() {
 		return false, "path is not a directory"
 	}
-	if err := writeConfigKey(root, companionKey, pathStr); err != nil {
-		return false, err.Error()
-	}
 	return true, pathStr
 }
 

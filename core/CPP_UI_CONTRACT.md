@@ -23,20 +23,25 @@ tools: 只消费 tick|ledger|danmu.show|memo.item；只发 tool.*.set|cmd|sim_gi
 
 ```mermaid
 flowchart LR
-  Host["LiveAIO.exe C++"]
+  Exe["LiveAIO.exe"]
   Core["LiveAIOCore.dll Go"]
   Pages["LiveAIOPages.dll"]
   Tools["LiveAIOTools.dll"]
   Listener["listener boundary"]
-  Host -->|LoadLibrary| Core
-  Host -->|LoadLibrary| Pages
-  Host -->|LoadLibrary| Tools
+  Exe -->|LoadLibrary| Core
+  Exe -->|LoadLibrary| Pages
+  Core -->|OpenPages| Pages
+  Pages -->|QLibrary 首次打开工具| Tools
   Pages -->|"JSONL cmds"| Core
   Tools -->|"JSONL cmds"| Core
   Core -->|"JSONL events"| Pages
   Core -->|"JSONL events"| Tools
   Listener -->|"frames or ingest"| Core
 ```
+
+**加载链（生产）：** `LiveAIO.exe` → `LiveAIOCore.dll` → `LiveAIOPages.dll`（`OpenPages`）→ 进入 Tools 页 `QLibrary::load` `LiveAIOTools.dll` 并 **`LiveAIO_ToolsWarm` 预连 Core** → 用户点「打开」才建工具设置窗。宿主 **不** 直接加载 Tools。
+
+**双 TCP：** Pages 与 Tools 各持一条 `127.0.0.1:19877` 连接（同进程内两条 socket）。工具事件由 Core **广播**；Pages 侧对 `tick`/`ledger`/`danmu.show` 等可空转。
 
 ---
 
@@ -81,6 +86,112 @@ flowchart LR
 
 - 数据目录：`resources/skin/<tool>/<skin>/skin.json`、`resources/gift/`
 - 读逻辑：[`resources/cpp/skin.cpp`](../resources/cpp/skin.cpp)、[`resources/cpp/gift.cpp`](../resources/cpp/gift.cpp)
+
+---
+
+## 懒加载矩阵（目标行为）
+
+| 层级 | 行为 |
+|------|------|
+| 主侧栏页（Home / Tools / Settings） | placeholder；**导航时同步** `ensure*` 建页；启动 **预建 Home** |
+| Home 线路 1–4 | **enterRoute 同步**建页；配置默认线路 **后台**预建；`route.env` 仅进入时发 |
+| Settings 三个面板 | **点 Tab 同步** `ensurePanel` |
+| `LiveAIOTools.dll` | Tools 页加载后 **`LiveAIO_ToolsWarm` 预连 Core + config/catalog** |
+| 工具控制窗（1） | 每 id `ToolEntry`；关窗 **不杀 overlay**；`tryReleaseTool` 判定销毁 |
+| 透明 overlay（2） | **进程单壳**；`ToolRuntime` 持 controller；关 overlay **不杀设置窗** |
+| 礼物 catalog / 皮肤列表 | `ensureGiftCatalogAsync` + `warmToolCatalogs`；picker hide **release thumb** |
+| 弹幕气泡 | 对象池复用；回池 `setParent(nullptr)`；unmount **drain 池** |
+
+---
+
+## 透明 overlay 单例与生命周期（严丝合缝）
+
+**单壳：** `OverlayHostService` → `SharedOverlayShell` + 每工具 `*OverlayController`（逻辑与 `root_` 指针）。
+
+**拉起（show）：**
+
+1. 若有旧 content：`detachContent(prevClosed)`（见下）
+2. `shell_->prepare`（标题/几何 key）→ `mountRoot` → `show`
+3. Controller 在 `show` 前 `root_=nullptr` 并 **new 新 Root**；`closedCb_` = `[unmount → tool onClosed]`
+
+**拆解（detachContent / teardown）固定顺序：**
+
+1. `shell_->hide()`
+2. `active_ = None`
+3. **notify**（controller `unmount`：释缓存、清气泡池、`root_=nullptr`、ledger 断回调）
+4. `takeRoot()` → `WidgetDeferredDestroy` 分帧 `deleteLater`（禁止在 notify 之后仍访问 root）
+
+**切换工具：** `show` 新工具前对旧工具执行 `detachContent(prevClosed)`，旧工具 `refreshOpenBtn` 经 `closedCb_` 触发。
+
+**关闭路径：** 壳 ✕ → `teardown(closedCb_)`；工具按钮 → `teardown()`（同一 `closedCb_`）。禁止在 `teardown` 外重复 `unmount`。
+
+**气泡池：** 回池时 `setParent(nullptr)`；`unmount` 时 `drainBubblePool`；复用前 `setParent(content)`。
+
+---
+
+## 工具四态生命周期（1=设置窗，2=透明 overlay）
+
+`ToolsSession` 按 tool id 持 `ToolEntry { runtime, panel }`（memo 仅 panel）。
+
+| 状态 | panel | overlay | 行为 |
+|------|-------|---------|------|
+| **12** | 存活 | 存活 | 互关不销毁对方 |
+| **1** | 存活 | 无 | `ToolRuntime` 存活 |
+| **2** | 无 | 存活 | runtime 继续收 `danmu.show`/`tick`/`ledger` |
+| **无** | 无 | 无 | `tryReleaseTool` 销毁 runtime、移除 entry |
+
+**释放条件：** `!panel && !runtime->isOverlayActive()` → `deleteLater(runtime)`。
+
+**关设置窗：** `ToolWindowBase::closeEvent` → `onPanelClosing` → `hide` + `deleteLater(panel)`；**禁止**在 panel 析构里 `teardownFast`。
+
+**关 overlay：** `teardown()` → `closedCb_` 末尾 `tryReleaseTool`。
+
+---
+
+## Config 预加载（tools 侧）
+
+- 进入 Tools 页：`LiveAIO_ToolsWarm` → `ensureCore` + `installConfigBridge`
+- 冷启动：`readConfigMap` 填入 `g_configCache`
+- `ready` 后：`config.get` 全量合并；`config.value` / `config.ok` 持续更新缓存
+- **写：** 乐观更新缓存 + `config.set`；未 `ready` 时 **入队**，`ready` 后 flush（不写本地回退）
+
+---
+
+## sharedGiftPicker（仅 overtime）
+
+- **归属：** `GiftPickerPopup` 为 `ToolsSession` 子对象（`setGiftPickerParent`）
+- **全局单 popup**；`openAt` 前隐式 hide；`setOnPicked` 每次 `openAt` 绑定（`QPointer` 守卫 panel）
+- **关设置窗：** `hideSessionGiftPicker`
+- **主题：** `LiveAIO_ToolsApplyTheme` → `picker.refreshTheme`
+- overlay 开着、设置窗已关：无锚点，picker 不可用
+
+---
+
+## 礼物动图
+
+礼物静图/动图：首帧同步 + 逐帧懒解码 + **有界缓存**（礼物几乎无动图；皮肤动图资源少）。不引入额外播放 SDK。
+
+---
+
+## Async-by-default
+
+**允许同步阻塞 UI（须等 Core 回包）：**
+
+- `connect` / `disconnect` / `connectLive`
+- `route.env` 驱动线路页状态
+- `login.query` / `login.start` → `login.state`
+- IPC `ready` 前禁用依赖 core 的操作
+
+**必须异步 / 分帧（不得阻塞主事件循环）：**
+
+- `ensurePage` / `ensureTab` / `ensureRoutePage`（`deferNextTick` + 可选 `buildInChunks`）
+- `QLibrary::load`（Tools DLL）
+- `gift_info.json` / `listSkins`（`readJsonAsync` 或首次下拉）
+- 礼物静图/动图解码（动图保持逐帧 `QTimer`）
+- overlay / 大工具窗关闭拆解（`WidgetDeferredDestroy`）
+- `onCorePacket` 内 **禁止** 重 UI 构建 → `singleShot(0)` 或分帧
+
+**工具（`util/widgets.cpp`）：** `deferNextTick`、`ChunkBuilder`/`buildInChunks`、`readJsonAsync`、`WidgetDeferredDestroy`。
 
 ---
 

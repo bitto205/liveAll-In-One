@@ -53,10 +53,6 @@ extern "C" LIVEAIO_PAGES_API int LiveAIO_PagesShow(void) {
     liveaio::pages::MainWindow* win = g_mainWindow.loadAcquire();
     if (!win || !QCoreApplication::instance()) return 0;
     // 调用方是 Go 的任意线程，必须回到 UI 线程再动窗口。
-    QMetaObject::invokeMethod(win, [win]() {
-        win->showNormal();
-        win->raise();
-        win->activateWindow();
-    }, Qt::QueuedConnection);
+    QMetaObject::invokeMethod(win, [win]() { win->raiseFromTray(); }, Qt::QueuedConnection);
     return 1;
 }

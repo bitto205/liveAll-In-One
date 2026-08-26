@@ -3,6 +3,8 @@
 
 namespace liveaio::pages {
 
+using liveaio::util::deferNextTick;
+
 // 旧 BaseSetting.build_section
 struct SettingSection {
     QFrame* card = nullptr;
@@ -80,7 +82,7 @@ public:
         SettingSection behaviorCard = settingSection(QStringLiteral("行为"), this);
         auto* row2 = new QHBoxLayout;
         row2->setSpacing(12);
-        auto* lbl2 = new QLabel(QStringLiteral("关闭主窗退出界面（系统托盘在内核）"), behaviorCard.card);
+        auto* lbl2 = new QLabel(QStringLiteral("关闭后缩小到托盘"), behaviorCard.card);
         lbl2->setStyleSheet(QStringLiteral("background: transparent; font-size: 14px;"));
         row2->addWidget(lbl2);
         row2->addStretch();
@@ -284,18 +286,23 @@ public:
         stack_ = new QStackedWidget(scroll);
         stack_->setObjectName(QStringLiteral("SettingContent"));
 
-        system_ = new SystemSettingsPanel(core_, stack_);
-        account_ = new AccountSettingsPanel(core_, stack_);
-        auto* tools = new ToolsSettingsPanel(stack_);
-        for (SettingPanel* panel : {static_cast<SettingPanel*>(system_),
-                                    static_cast<SettingPanel*>(account_),
-                                    static_cast<SettingPanel*>(tools)}) {
-            auto* btn = new SettingNavBtn(panel->panelName(), tabContainer_);
-            const int index = navBtns_.size();
-            QObject::connect(btn, &QPushButton::clicked, this, [this, index]() { navigate(index); });
+        static const QStringList kPanelNames = {
+            QStringLiteral("系统"), QStringLiteral("账号"), QStringLiteral("工具设置"),
+        };
+        panels_.resize(kPanelNames.size());
+        panelFactories_ = {
+            [this]() -> SettingPanel* { return new SystemSettingsPanel(core_, stack_); },
+            [this]() -> SettingPanel* { return new AccountSettingsPanel(core_, stack_); },
+            [this]() -> SettingPanel* { return new ToolsSettingsPanel(stack_); },
+        };
+        for (int i = 0; i < kPanelNames.size(); ++i) {
+            auto* btn = new SettingNavBtn(kPanelNames.at(i), tabContainer_);
+            QObject::connect(btn, &QPushButton::clicked, this, [this, i]() { navigate(i); });
             navBtns_.append(btn);
-            panels_.append(panel);
-            stack_->addWidget(panel);
+            auto* ph = new QWidget(stack_);
+            ph->setObjectName(QStringLiteral("SettingPlaceholder"));
+            panelPlaceholders_.append(ph);
+            stack_->addWidget(ph);
         }
 
         scroll->setWidget(stack_);
@@ -306,15 +313,31 @@ public:
     }
 
     void onCorePacket(const QJsonObject& packet) override {
-        for (SettingPanel* panel : panels_) panel->onCorePacket(packet);
+        for (SettingPanel* panel : panels_) {
+            if (panel) panel->onCorePacket(packet);
+        }
     }
 
     void refreshTheme() override {
-        for (SettingPanel* panel : panels_) panel->refreshTheme();
+        for (SettingPanel* panel : panels_) {
+            if (panel) panel->refreshTheme();
+        }
         updatePagerStyle();
     }
 
 private:
+    void ensurePanel(int index) {
+        if (index < 0 || index >= panels_.size() || panels_[index]) return;
+        if (index >= panelFactories_.size()) return;
+        panels_[index] = panelFactories_[index]();
+        QWidget* ph = panelPlaceholders_.value(index);
+        if (!ph) return;
+        const int idx = stack_->indexOf(ph);
+        stack_->removeWidget(ph);
+        ph->deleteLater();
+        panelPlaceholders_[index] = nullptr;
+        stack_->insertWidget(idx, panels_[index]);
+    }
     int totalPages() const {
         return qMax(1, (navBtns_.size() + kPageSize - 1) / kPageSize);
     }
@@ -350,9 +373,15 @@ private:
     }
 
     void navigate(int index) {
-        stack_->setCurrentIndex(index);
+        ensurePanel(index);
+        if (!panels_[index]) return;
+        stack_->setCurrentIndex(stack_->indexOf(panels_[index]));
         for (int i = 0; i < navBtns_.size(); ++i) navBtns_[i]->setActive(i == index);
-        if (panels_.value(index) == account_ && account_) account_->queryLogin();
+        if (panels_[index] && panels_[index]->panelName() == QStringLiteral("账号")) {
+            if (auto* account = dynamic_cast<AccountSettingsPanel*>(panels_[index])) {
+                account->queryLogin();
+            }
+        }
     }
 
     CoreClient* core_ = nullptr;
@@ -363,8 +392,8 @@ private:
     QStackedWidget* stack_ = nullptr;
     QVector<SettingNavBtn*> navBtns_;
     QVector<SettingPanel*> panels_;
-    SystemSettingsPanel* system_ = nullptr;
-    AccountSettingsPanel* account_ = nullptr;
+    QVector<QWidget*> panelPlaceholders_;
+    QVector<std::function<SettingPanel*()>> panelFactories_;
     int curPage_ = 0;
 };
 

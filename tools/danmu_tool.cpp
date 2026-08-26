@@ -71,8 +71,10 @@ static void showTutorialDialog(QWidget* parent) {
 class DanmuBubble final : public QWidget {
 public:
     DanmuBubble(const QString& kind, const QString& user, const QString& text,
-                const QString& gift, const ToolSkin& skin, QWidget* parent)
-        : QWidget(parent), skin_(skin), kind_(kind), user_(user), text_(text), gift_(gift) {
+                const QString& gift, const ToolSkin& skin, QWidget* parent,
+                std::function<void(DanmuBubble*)> onRelease = nullptr)
+        : QWidget(parent), skin_(skin), kind_(kind), user_(user), text_(text), gift_(gift),
+          onRelease_(std::move(onRelease)) {
         setAttribute(Qt::WA_TransparentForMouseEvents);
         loadGiftIcon();
 
@@ -85,9 +87,11 @@ public:
             update();
         });
         QObject::connect(fade_, &QVariantAnimation::finished, this, [this]() {
+            if (phase_ < 0) return;
             if (phase_ == 0) {
                 phase_ = 1;
                 QTimer::singleShot(kDanmuStayMs, this, [this]() {
+                    if (phase_ != 1) return;
                     phase_ = 2;
                     fade_->setDuration(kDanmuFadeOutMs);
                     fade_->setStartValue(1.0);
@@ -95,11 +99,42 @@ public:
                     fade_->start();
                 });
             } else if (phase_ == 2) {
-                deleteLater();
+                if (onRelease_) onRelease_(this);
+                else deleteLater();
             }
         });
         relayout();
         fade_->start();
+    }
+
+    void reuse(const QString& kind, const QString& user, const QString& text,
+               const QString& gift, const ToolSkin& skin) {
+        kind_ = kind;
+        user_ = user;
+        text_ = text;
+        gift_ = gift;
+        skin_ = skin;
+        prepareForPool();
+        phase_ = 0;
+        opacity_ = 0;
+        loadGiftIcon();
+        relayout();
+        fade_->stop();
+        fade_->setDuration(kDanmuFadeInMs);
+        fade_->setStartValue(0.0);
+        fade_->setEndValue(1.0);
+        show();
+        fade_->start();
+    }
+
+    void prepareForPool() {
+        phase_ = -1;
+        if (fade_) fade_->stop();
+        stopGiftAnim();
+        giftPm_ = QPixmap();
+        giftW_ = 0;
+        giftH_ = 0;
+        opacity_ = 0;
     }
 
     void refreshSkin(const ToolSkin& skin) {
@@ -162,15 +197,99 @@ protected:
         p.drawText(x, y + QFontMetrics(bodySt.font()).ascent(), text_);
     }
 
-private:
+    void stopGiftAnim() {
+        if (giftAnimTimer_) {
+            giftAnimTimer_->stop();
+            giftAnimTimer_->deleteLater();
+            giftAnimTimer_ = nullptr;
+        }
+        if (giftLoadTimer_) {
+            giftLoadTimer_->stop();
+            giftLoadTimer_->deleteLater();
+            giftLoadTimer_ = nullptr;
+        }
+        giftFrames_.clear();
+        giftDelays_.clear();
+        giftFrameIdx_ = 0;
+        giftAnimPath_.clear();
+        giftFrameCount_ = 0;
+        giftAnimSide_ = 0;
+    }
+
+    void decodeNextGiftFrame() {
+        if (giftAnimPath_.isEmpty() || giftAnimSide_ <= 0) {
+            if (giftLoadTimer_) giftLoadTimer_->stop();
+            return;
+        }
+        const int next = giftFrames_.size();
+        if (next >= giftFrameCount_) {
+            if (giftLoadTimer_) giftLoadTimer_->stop();
+            return;
+        }
+        QPixmap frame;
+        int delay = 100;
+        if (!liveaio::resources::decodeGiftAnimFrame(
+                giftAnimPath_, next, giftAnimSide_, &frame, &delay)) {
+            giftFrameCount_ = giftFrames_.size();
+            if (giftLoadTimer_) giftLoadTimer_->stop();
+            return;
+        }
+        giftFrames_.push_back(frame);
+        giftDelays_.push_back(delay);
+        if (giftFrames_.size() >= giftFrameCount_ && giftLoadTimer_) giftLoadTimer_->stop();
+    }
+
     void loadGiftIcon() {
+        stopGiftAnim();
         giftPm_ = QPixmap();
         giftW_ = 0;
         giftH_ = 0;
         if (kind_ != QLatin1String("gift") || gift_.isEmpty()) return;
         const QString icon = resolveGiftIconPath(g_appRoot, gift_);
         if (icon.isEmpty()) return;
-        const auto still = skin_.presentImage(icon, skin_.metrics().giftIconSize);
+
+        const int side = skin_.metrics().giftIconSize;
+        if (liveaio::resources::giftIconIsAnimated(icon)) {
+            giftAnimPath_ = icon;
+            giftAnimSide_ = side;
+            giftFrameCount_ = liveaio::resources::giftIconFrameCount(icon);
+
+            QPixmap frame;
+            int delay = 100;
+            if (liveaio::resources::decodeGiftAnimFrame(icon, 0, side, &frame, &delay)) {
+                giftFrames_.push_back(frame);
+                giftDelays_.push_back(delay);
+                giftPm_ = frame;
+                const qreal dpr = giftPm_.devicePixelRatio();
+                giftW_ = std::max(1, int(std::lround(giftPm_.width() / dpr)));
+                giftH_ = std::max(1, int(std::lround(giftPm_.height() / dpr)));
+
+                if (giftFrameCount_ > 1) {
+                    giftAnimTimer_ = new QTimer(this);
+                    giftAnimTimer_->setTimerType(Qt::PreciseTimer);
+                    QObject::connect(giftAnimTimer_, &QTimer::timeout, this, [this]() {
+                        if (giftFrames_.size() <= 1) return;
+                        giftFrameIdx_ = (giftFrameIdx_ + 1) % giftFrames_.size();
+                        giftPm_ = giftFrames_.at(giftFrameIdx_);
+                        update();
+                        if (giftAnimTimer_) {
+                            giftAnimTimer_->start(
+                                std::max(30, giftDelays_.value(giftFrameIdx_, 100)));
+                        }
+                    });
+                    giftAnimTimer_->start(std::max(30, giftDelays_.value(0, 100)));
+
+                    giftLoadTimer_ = new QTimer(this);
+                    QObject::connect(giftLoadTimer_, &QTimer::timeout, this, [this]() {
+                        decodeNextGiftFrame();
+                    });
+                    giftLoadTimer_->start(30);
+                }
+                return;
+            }
+        }
+
+        const auto still = skin_.presentImage(icon, side);
         giftPm_ = still.pixmap;
         giftW_ = still.logicalW;
         giftH_ = still.logicalH;
@@ -179,11 +298,20 @@ private:
     ToolSkin skin_;
     QString kind_, user_, text_, gift_;
     QPixmap giftPm_;
+    QVector<QPixmap> giftFrames_;
+    QVector<int> giftDelays_;
+    int giftFrameIdx_ = 0;
+    QString giftAnimPath_;
+    int giftFrameCount_ = 0;
+    int giftAnimSide_ = 0;
+    QTimer* giftAnimTimer_ = nullptr;
+    QTimer* giftLoadTimer_ = nullptr;
     int giftW_ = 0;
     int giftH_ = 0;
     QVariantAnimation* fade_ = nullptr;
     qreal opacity_ = 0.0;
     int phase_ = 0;
+    std::function<void(DanmuBubble*)> onRelease_;
 };
 
 // 弹幕内容区：气泡随机落点，无额外绘制。
@@ -201,14 +329,34 @@ private:
     std::function<void()> onResume_;
 };
 
-class DanmuOverlayWindow final : public RippleOverlayWindow {
+class DanmuOverlayController final : public QObject {
 public:
-    DanmuOverlayWindow()
-        : RippleOverlayWindow(QStringLiteral("弹幕机"), kDanmuGeoKey) {
-        setMinimumSize(200, 150);
-        restoreGeometryFromConfig(420, 320);
+    static constexpr int kPoolCap = 16;
+
+    explicit DanmuOverlayController(QObject* parent = nullptr) : QObject(parent) {}
+
+    bool isMounted() const {
+        return OverlayHostService::instance().isToolActive(OverlayToolId::Danmu);
+    }
+
+    void show(std::function<void()> onClosed) {
+        auto& host = OverlayHostService::instance();
+        root_ = nullptr;
         skin_ = activeDanmuSkin();
-        attachRoot(new DanmuRoot(this, [this]() { onFrameResumed(); }));
+        auto* shell = host.shell();
+        root_ = new DanmuRoot(shell, [this]() { onFrameResumed(); });
+        host.show(OverlayToolId::Danmu, QStringLiteral("弹幕机"), kDanmuGeoKey, 200, 150, 420, 320,
+                  root_, [this, onClosed]() {
+                      unmount();
+                      if (onClosed) onClosed();
+                  });
+    }
+
+    void unmount() {
+        clearAllBubbles();
+        drainBubblePool();
+        liveaio::resources::releaseGiftPixmapCaches();
+        root_ = nullptr;
     }
 
     void refreshSkin() {
@@ -216,17 +364,19 @@ public:
         for (auto* b : bubbles_) {
             if (b) b->refreshSkin(skin_);
         }
-        root()->update();
+        if (root_) root_->update();
     }
 
     void addMessage(const QString& kind, const QString& user, const QString& text,
                     const QString& gift) {
-        if (root()->resizeFrozen()) {
+        if (!root_) return;
+        if (root_->resizeFrozen()) {
             pending_.append({kind, user, text, gift});
             if (pending_.size() > 80) pending_.remove(0, pending_.size() - 80);
             return;
         }
-        auto* bubble = new DanmuBubble(kind, user, text, gift, skin_, root()->content());
+        auto* bubble = acquireBubble(kind, user, text, gift);
+        if (!bubble) return;
         placeBubble(bubble);
     }
 
@@ -234,6 +384,13 @@ public:
         const auto pending = pending_;
         pending_.clear();
         for (const auto& msg : pending) addMessage(msg.kind, msg.user, msg.text, msg.gift);
+    }
+
+    void clearAllBubbles() {
+        pending_.clear();
+        const auto alive = bubbles_;
+        bubbles_.clear();
+        for (auto* b : alive) releaseBubble(b);
     }
 
 private:
@@ -244,12 +401,48 @@ private:
         QString gift;
     };
 
+    DanmuBubble* acquireBubble(const QString& kind, const QString& user, const QString& text,
+                               const QString& gift) {
+        if (!root_) return nullptr;
+        QWidget* content = root_->content();
+        while (!pool_.isEmpty()) {
+            auto* b = pool_.takeLast();
+            if (b) {
+                b->setParent(content);
+                b->reuse(kind, user, text, gift, skin_);
+                return b;
+            }
+        }
+        return new DanmuBubble(kind, user, text, gift, skin_, content,
+                               [this](DanmuBubble* bub) { releaseBubble(bub); });
+    }
+
+    void releaseBubble(DanmuBubble* bubble) {
+        if (!bubble) return;
+        bubble->prepareForPool();
+        bubble->hide();
+        bubble->setParent(nullptr);
+        bubbles_.removeAll(bubble);
+        if (pool_.size() < kPoolCap) pool_.append(bubble);
+        else bubble->deleteLater();
+    }
+
+    void drainBubblePool() {
+        for (auto* b : pool_) {
+            if (b) b->deleteLater();
+        }
+        pool_.clear();
+    }
+
     void onFrameResumed() {
-        syncRadiusAfterResize();
+        if (!root_) return;
+        auto* shell = OverlayHostService::instance().shell();
+        if (shell) {
+            shell->syncRadiusAfterResize();
+        }
         flushPending();
     }
 
-    // 1cm 安全边距（按屏幕 DPI 折算）。
     static int bubbleMargin() {
         if (auto* screen = QApplication::primaryScreen()) {
             return std::max(20, static_cast<int>(screen->logicalDotsPerInch() / 2.54));
@@ -257,9 +450,9 @@ private:
         return 20;
     }
 
-    // 旧行为：在内容区随机找一个与现有气泡不重叠的位置，找不到就丢弃。
     void placeBubble(DanmuBubble* bubble) {
-        QWidget* area = root()->content();
+        if (!root_) return;
+        QWidget* area = root_->content();
         const int m = bubbleMargin();
         const int bw = bubble->width();
         const int bh = bubble->height();
@@ -268,7 +461,7 @@ private:
         const int xMax = area->width() - m - bw;
         const int yMax = area->height() - m - bh;
         if (xMax < xMin || yMax < yMin) {
-            bubble->deleteLater();
+            releaseBubble(bubble);
             return;
         }
 
@@ -304,18 +497,68 @@ private:
             if (overlaps) continue;
             bubble->move(pos);
             bubbles_.append(bubble);
-            QObject::connect(bubble, &QObject::destroyed, this, [this, bubble]() {
-                bubbles_.removeAll(bubble);
-            });
             bubble->show();
             return;
         }
-        bubble->deleteLater();
+        releaseBubble(bubble);
     }
 
+    DanmuRoot* root_ = nullptr;
     ToolSkin skin_;
     QVector<DanmuBubble*> bubbles_;
+    QVector<DanmuBubble*> pool_;
     QVector<PendingMsg> pending_;
+};
+
+class DanmuToolRuntime final : public ToolRuntimeBase {
+public:
+    explicit DanmuToolRuntime(QObject* parent, std::function<void()> tryRelease)
+        : ToolRuntimeBase(parent), tryRelease_(std::move(tryRelease)) {}
+
+    QString toolId() const override { return QStringLiteral("danmu"); }
+
+    bool isOverlayActive() const override {
+        return overlayCtrl_ && overlayCtrl_->isMounted();
+    }
+
+    void onCorePacket(const QJsonObject& packet) override {
+        if (packet.value(QStringLiteral("op")).toString() != QStringLiteral("danmu.show")) return;
+        if (!overlayCtrl_ || !overlayCtrl_->isMounted()) return;
+        const QString kind = packet.value(QStringLiteral("kind")).toString();
+        const QString user = packet.value(QStringLiteral("user")).toString();
+        QString text = packet.value(QStringLiteral("text")).toString();
+        const QString gift = packet.value(QStringLiteral("gift")).toString();
+        if (kind == QLatin1String("like")) {
+            text = QStringLiteral("点了%1个赞")
+                       .arg(qMax(1, packet.value(QStringLiteral("count")).toInt(1)));
+        } else if (kind == QLatin1String("follow")) {
+            text = QStringLiteral("关注了");
+        }
+        const QString suffix =
+            configValue(QStringLiteral("danmu_%1_suffix").arg(kind), QString()).toString();
+        overlayCtrl_->addMessage(kind, user, text + suffix, gift);
+    }
+
+    void toggleOverlay(std::function<void()> onClosed) {
+        auto& host = OverlayHostService::instance();
+        if (host.isToolActive(OverlayToolId::Danmu)) {
+            host.teardown();
+            return;
+        }
+        if (!overlayCtrl_) overlayCtrl_ = new DanmuOverlayController(this);
+        overlayCtrl_->show([this, onClosed]() {
+            if (onClosed) onClosed();
+            if (tryRelease_) tryRelease_();
+        });
+    }
+
+    void refreshOverlaySkin() {
+        if (overlayCtrl_) overlayCtrl_->refreshSkin();
+    }
+
+private:
+    DanmuOverlayController* overlayCtrl_ = nullptr;
+    std::function<void()> tryRelease_;
 };
 
 // ─────────────────────────────────────────────
@@ -328,7 +571,8 @@ public:
     static constexpr int kSide = 24;
     static constexpr int kScrollGutter = 8;
 
-    explicit DanmuToolWindow(CoreClient* core) : ToolWindowBase(core) {
+    explicit DanmuToolWindow(CoreClient* core, DanmuToolRuntime* runtime)
+        : ToolWindowBase(core), runtime_(runtime) {
         setWindowTitle(QStringLiteral("设置"));
         setFixedSize(kWidth, kHeight);
 
@@ -345,34 +589,11 @@ public:
         pushSettings();
     }
 
-    ~DanmuToolWindow() override {
-        if (overlay_) {
-            overlay_->setOnClosed(nullptr);
-            overlay_->deleteLater();
-            overlay_ = nullptr;
-        }
-    }
-
     QString toolId() const override { return QStringLiteral("danmu"); }
 
-    void onCorePacket(const QJsonObject& packet) override {
-        if (packet.value(QStringLiteral("op")).toString() != QStringLiteral("danmu.show")) return;
-        if (!overlay_ || !overlay_->isVisible()) return;
-        const QString kind = packet.value(QStringLiteral("kind")).toString();
-        const QString user = packet.value(QStringLiteral("user")).toString();
-        QString text = packet.value(QStringLiteral("text")).toString();
-        const QString gift = packet.value(QStringLiteral("gift")).toString();
-        if (kind == QLatin1String("like")) {
-            text = QStringLiteral("点了%1个赞")
-                       .arg(qMax(1, packet.value(QStringLiteral("count")).toInt(1)));
-        } else if (kind == QLatin1String("follow")) {
-            text = QStringLiteral("关注了");
-        }
-        overlay_->addMessage(kind, user, text + suffixFor(kind), gift);
-    }
+    void onCorePacket(const QJsonObject&) override {}
 
     void refreshTheme() override {
-        setStyleSheet(toolQss());
         refreshSwitchStyles(false);
         refreshOpenBtn();
         styleTutorialBtn();
@@ -404,6 +625,8 @@ private:
             {QStringLiteral("关注"), [this](QVBoxLayout* l) { buildFollowPanel(l); }},
             {QStringLiteral("点赞"), [this](QVBoxLayout* l) { buildLikePanel(l); }},
         };
+        tabBuilders_ = tabs;
+        tabBuilt_.resize(tabs.size());
         for (int i = 0; i < tabs.size(); ++i) {
             auto* navBtn = new QPushButton(tabs[i].first, topbar);
             navBtn->setObjectName(QStringLiteral("TabBtn"));
@@ -414,14 +637,10 @@ private:
             navBtns_.append(navBtn);
             tbLay->addWidget(navBtn);
 
-            auto* inner = new QWidget;
-            auto* innerLay = new QVBoxLayout(inner);
-            innerLay->setContentsMargins(kSide + kScrollGutter / 2, 20,
-                                         kSide + kScrollGutter / 2, 20);
-            innerLay->setSpacing(16);
-            tabs[i].second(innerLay);
-            innerLay->addStretch();
-            stack_->addWidget(scrollPage(inner));
+            auto* ph = new QWidget;
+            ph->setObjectName(QStringLiteral("TabPlaceholder"));
+            tabPlaceholders_.append(ph);
+            stack_->addWidget(ph);
         }
         tbLay->addStretch();
         mainLay->addWidget(topbar);
@@ -430,7 +649,31 @@ private:
         navigate(0);
     }
 
+    void ensureTab(int index) {
+        if (index < 0 || index >= tabBuilders_.size() || tabBuilt_.value(index)) return;
+        tabBuilt_[index] = true;
+        auto* inner = new QWidget;
+        auto* innerLay = new QVBoxLayout(inner);
+        innerLay->setContentsMargins(kSide + kScrollGutter / 2, 20,
+                                     kSide + kScrollGutter / 2, 20);
+        innerLay->setSpacing(16);
+        tabBuilders_[index].second(innerLay);
+        innerLay->addStretch();
+        QWidget* page = scrollPage(inner);
+        QWidget* ph = tabPlaceholders_.value(index);
+        if (ph) {
+            const int idx = stack_->indexOf(ph);
+            stack_->removeWidget(ph);
+            ph->deleteLater();
+            tabPlaceholders_[index] = nullptr;
+            stack_->insertWidget(idx, page);
+        } else {
+            stack_->addWidget(page);
+        }
+    }
+
     void navigate(int index) {
+        ensureTab(index);
         curNav_ = index;
         stack_->setCurrentIndex(index);
         for (int i = 0; i < navBtns_.size(); ++i) {
@@ -560,14 +803,14 @@ private:
         trow->addWidget(tlbl);
         trow->addStretch();
 
+        skinCombo_ = new liveaio::util::ThemedComboBox;
+        QStringList skinNames;
         const auto skins = liveaio::resources::listSkins(g_appRoot, QStringLiteral("danmu"));
-        QStringList names;
         for (const auto& entry : skins) {
             skinNameToId_.insert(entry.name, entry.id);
-            names << entry.name;
+            skinNames << entry.name;
         }
-        skinCombo_ = new liveaio::util::ThemedComboBox;
-        skinCombo_->addItems(names);
+        skinCombo_->addItems(skinNames);
         const QString activeId = configValue(
             liveaio::resources::skinConfigKey(QStringLiteral("danmu")),
             QStringLiteral("default")).toString();
@@ -773,27 +1016,19 @@ private:
     void onSkinChanged(const QString& name) {
         const QString id = skinNameToId_.value(name, QStringLiteral("default"));
         writeConfigValue(liveaio::resources::skinConfigKey(QStringLiteral("danmu")), id);
-        if (overlay_) overlay_->refreshSkin();
+        if (runtime_) runtime_->refreshOverlaySkin();
     }
 
     void toggleOverlay() {
-        if (!overlay_) {
-            overlay_ = new DanmuOverlayWindow;
-            overlay_->setOnClosed([this]() { refreshOpenBtn(); });
-        }
-        if (overlay_->isVisible()) {
-            overlay_->hide();
-        } else {
-            overlay_->show();
-            overlay_->activateWindow();
-        }
+        if (!runtime_) return;
+        runtime_->toggleOverlay([this]() { refreshOpenBtn(); });
         refreshOpenBtn();
     }
 
     void refreshOpenBtn() {
         if (!openBtn_) return;
         const auto& C = theme();
-        const bool open = overlay_ && overlay_->isVisible();
+        const bool open = OverlayHostService::instance().isToolActive(OverlayToolId::Danmu);
         openBtn_->setText(open ? QStringLiteral("关闭弹幕窗") : QStringLiteral("打开弹幕窗"));
         if (open) {
             openBtn_->setStyleSheet(QStringLiteral(
@@ -825,6 +1060,9 @@ private:
         });
     }
 
+    QVector<QWidget*> tabPlaceholders_;
+    QVector<bool> tabBuilt_;
+    QVector<QPair<QString, std::function<void(QVBoxLayout*)>>> tabBuilders_;
     QStackedWidget* stack_ = nullptr;
     QVector<QPushButton*> navBtns_;
     int curNav_ = 0;
@@ -840,11 +1078,15 @@ private:
     QPushButton* openBtn_ = nullptr;
     QPushButton* tutorialBtn_ = nullptr;
     liveaio::util::ThemedComboBox* skinCombo_ = nullptr;
-    DanmuOverlayWindow* overlay_ = nullptr;
+    DanmuToolRuntime* runtime_ = nullptr;
 };
 
-static ToolWindowBase* createDanmuTool(CoreClient* core) {
-    return new DanmuToolWindow(core);
+static ToolRuntimeBase* createDanmuRuntime(QObject* parent, std::function<void()> tryRelease) {
+    return new DanmuToolRuntime(parent, std::move(tryRelease));
+}
+
+static ToolWindowBase* createDanmuTool(CoreClient* core, DanmuToolRuntime* runtime) {
+    return new DanmuToolWindow(core, runtime);
 }
 
 }  // namespace liveaio::tools

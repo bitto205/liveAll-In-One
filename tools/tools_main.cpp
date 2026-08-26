@@ -49,7 +49,22 @@ using liveaio::util::prepareAppAlphaFormat;
 
 namespace liveaio::tools {
 
-// 同进程插件：工具窗注册表与 core 连接由这里持有，关闭后自动注销。
+static void warmToolCatalogs(QObject* context) {
+    if (g_appRoot.isEmpty()) return;
+    liveaio::resources::ensureGiftCatalogAsync(g_appRoot, context, []() {
+        liveaio::resources::giftNamesCached(g_appRoot);
+        liveaio::resources::listSkins(g_appRoot, QStringLiteral("danmu"));
+        liveaio::resources::listSkins(g_appRoot, QStringLiteral("overtime"));
+    });
+}
+
+struct ToolEntry {
+    QString id;
+    ToolRuntimeBase* runtime = nullptr;
+    ToolWindowBase* panel = nullptr;
+};
+
+// 同进程插件：工具 runtime + 设置窗生命周期由这里持有。
 class ToolsSession final : public QObject {
 public:
     static ToolsSession& instance() {
@@ -58,26 +73,48 @@ public:
     }
 
     bool openTool(const QString& id) {
-        if (auto* existing = opened_.value(id)) {
-            existing->show();
-            existing->raise();
-            existing->activateWindow();
+        ensureCore();
+        ToolEntry* entry = ensureEntry(id);
+        if (!entry) return false;
+
+        if (entry->panel) {
+            entry->panel->applyChromeStyle();
+            entry->panel->show();
+            entry->panel->raise();
+            entry->panel->activateWindow();
             return true;
         }
-        ensureCore();
-        ToolWindowBase* win = nullptr;
-        if (id == QStringLiteral("memo")) win = createMemoTool(core_);
-        else if (id == QStringLiteral("danmu")) win = createDanmuTool(core_);
-        else if (id == QStringLiteral("overtime")) win = createOvertimeTool(core_);
-        if (!win) return false;
 
-        opened_.insert(id, win);
-        QObject::connect(win, &QObject::destroyed, this, [this, id]() { opened_.remove(id); });
-        win->setAttribute(Qt::WA_DeleteOnClose, true);
-        win->show();
-        win->raise();
-        win->activateWindow();
+        ToolWindowBase* panel = nullptr;
+        if (id == QStringLiteral("memo")) {
+            panel = createMemoTool(core_);
+        } else if (id == QStringLiteral("danmu")) {
+            panel = createDanmuTool(core_, static_cast<DanmuToolRuntime*>(entry->runtime));
+        } else if (id == QStringLiteral("overtime")) {
+            panel = createOvertimeTool(core_, static_cast<ot::OvertimeToolRuntime*>(entry->runtime));
+        }
+        if (!panel) return false;
+
+        panel->applyChromeStyle();
+        entry->panel = panel;
+        panel->setPanelCloseHandler([this](const QString& toolId) { onPanelClosed(toolId); });
+        panel->show();
+        panel->raise();
+        panel->activateWindow();
         return true;
+    }
+
+    void warm() { ensureCore(); }
+
+    ot::GiftPickerPopup* giftPicker() { return ot::sessionGiftPicker(); }
+
+    void refreshOpenPanelsTheme() {
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            if (it->panel) {
+                it->panel->applyChromeStyle();
+                it->panel->refreshTheme();
+            }
+        }
     }
 
 private:
@@ -92,9 +129,43 @@ private:
         prepareAppAlphaFormat();
         core_ = new CoreClient(this);
         installConfigBridge();
+        ot::setGiftPickerParent(this);
         core_->setPacketCallback([this](const QJsonObject& packet) { dispatchPacket(packet); });
         core_->setStatusCallback([this](bool connected) { dispatchStatus(connected); });
         core_->connectToCore();
+        warmToolCatalogs(this);
+    }
+
+    ToolEntry* ensureEntry(const QString& id) {
+        if (entries_.contains(id)) return &entries_[id];
+        ToolEntry entry;
+        entry.id = id;
+        if (id == QStringLiteral("danmu")) {
+            entry.runtime = createDanmuRuntime(this, [this, id]() { tryReleaseTool(id); });
+        } else if (id == QStringLiteral("overtime")) {
+            entry.runtime = createOvertimeRuntime(this, [this, id]() { tryReleaseTool(id); });
+        }
+        entries_.insert(id, entry);
+        return &entries_[id];
+    }
+
+    void onPanelClosed(const QString& id) {
+        if (!entries_.contains(id)) return;
+        ToolEntry& entry = entries_[id];
+        entry.panel = nullptr;
+        tryReleaseTool(id);
+    }
+
+    void tryReleaseTool(const QString& id) {
+        if (!entries_.contains(id)) return;
+        ToolEntry& entry = entries_[id];
+        if (entry.panel) return;
+        if (entry.runtime && entry.runtime->isOverlayActive()) return;
+        if (entry.runtime) {
+            entry.runtime->deleteLater();
+            entry.runtime = nullptr;
+        }
+        entries_.remove(id);
     }
 
     void dispatchPacket(const QJsonObject& packet) {
@@ -103,22 +174,31 @@ private:
             && op != QStringLiteral("tick") && op != QStringLiteral("ledger")) {
             return;
         }
-        for (auto* tool : opened_) {
-            if (tool) tool->onCorePacket(packet);
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            ToolEntry& entry = it.value();
+            if (entry.runtime) entry.runtime->onCorePacket(packet);
+            else if (entry.panel) entry.panel->onCorePacket(packet);
         }
     }
 
     void dispatchStatus(bool connected) {
-        for (auto* tool : opened_) {
-            if (tool) tool->onCoreStatus(connected);
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            ToolEntry& entry = it.value();
+            if (entry.runtime) entry.runtime->onCoreStatus(connected);
+            if (entry.panel) entry.panel->onCoreStatus(connected);
         }
     }
 
     CoreClient* core_ = nullptr;
-    QMap<QString, ToolWindowBase*> opened_;
+    QMap<QString, ToolEntry> entries_;
 };
 
 }  // namespace liveaio::tools
+
+extern "C" LIVEAIO_TOOLS_API void LiveAIO_ToolsWarm(void) {
+    if (!QApplication::instance()) return;
+    liveaio::tools::ToolsSession::instance().warm();
+}
 
 extern "C" LIVEAIO_TOOLS_API int LiveAIO_ToolsOpen(const char* tool_id) {
     if (!QApplication::instance()) return 1;
@@ -132,4 +212,7 @@ extern "C" LIVEAIO_TOOLS_API void LiveAIO_ToolsApplyTheme(const char* theme_name
     const QString name = QString::fromUtf8(theme_name ? theme_name : "").trimmed();
     if (name.isEmpty()) return;
     liveaio::util::applyThemeName(name);
+    // 只刷工具窗自身样式，禁止 qApp->setStyleSheet(toolQss) 盖掉主窗 shellQss。
+    liveaio::tools::ToolsSession::instance().refreshOpenPanelsTheme();
+    if (auto* picker = liveaio::tools::ot::sessionGiftPicker()) picker->refreshTheme();
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
@@ -28,7 +29,8 @@ const (
 // BrowserOptions controls Chromium launch for routes 1/2 and login.
 type BrowserOptions struct {
 	Root          string
-	ForceSystem   bool
+	ForceSystem   bool // 登录等场景强制系统浏览器
+	PreferBundled bool // 线路 1/2 采集：只用 browsers/ headless，禁止回退系统
 	Headless      bool
 	TrimResources bool
 	UserDataDir   string
@@ -38,6 +40,7 @@ type BrowserOptions struct {
 type BrowserSession struct {
 	Ctx         context.Context
 	System      bool
+	Exe         string
 	cancel      context.CancelFunc
 	allocCancel context.CancelFunc
 }
@@ -100,13 +103,22 @@ func findSystemBrowser() string {
 }
 
 func launchBrowser(parent context.Context, opt BrowserOptions) (*BrowserSession, error) {
-	forceSystem := opt.ForceSystem || preferSystemFromConfig(opt.Root) || os.Getenv(envUseSystem) == "1"
+	forceSystem := false
+	if !opt.PreferBundled {
+		forceSystem = opt.ForceSystem || preferSystemFromConfig(opt.Root) || os.Getenv(envUseSystem) == "1"
+	}
 	exe := ""
 	system := false
 	if !forceSystem {
 		exe = findBundledExe(opt.Root)
 	}
 	if exe == "" {
+		if opt.PreferBundled {
+			return nil, fmt.Errorf(
+				"bundled headless shell not found under %s (expect browsers/chromium_headless_shell-*/chrome-headless-shell-win64/chrome-headless-shell.exe)",
+				filepath.Join(opt.Root, "browsers"),
+			)
+		}
 		exe = findSystemBrowser()
 		system = true
 		if exe == "" {
@@ -118,7 +130,6 @@ func launchBrowser(parent context.Context, opt BrowserOptions) (*BrowserSession,
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.UserAgent(defaultUA),
-		chromedp.WindowSize(1920, 1080),
 	)
 	if opt.Headless {
 		opts = append(opts, chromedp.Flag("headless", "new"))
@@ -129,11 +140,22 @@ func launchBrowser(parent context.Context, opt BrowserOptions) (*BrowserSession,
 		opts = append(opts, chromedp.UserDataDir(opt.UserDataDir))
 	}
 	if opt.TrimResources {
-		opts = append(opts, chromedp.Flag("blink-settings", "imagesEnabled=false"))
+		// 采集只要进房 + WSS/JS 运行时；挡住样式/图/流/礼物插件等。
+		opts = append(opts,
+			chromedp.WindowSize(800, 450),
+			chromedp.Flag("blink-settings", "imagesEnabled=false"),
+			chromedp.Flag("autoplay-policy", "document-user-activation-required"),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("disable-software-rasterizer", true),
+			chromedp.Flag("disable-webgl", true),
+			chromedp.Flag("mute-audio", true),
+		)
+	} else {
+		opts = append(opts, chromedp.WindowSize(1920, 1080))
 	}
 	allocCtx, allocCancel := chromedp.NewExecAllocator(parent, opts...)
 	ctx, cancel := chromedp.NewContext(allocCtx)
-	s := &BrowserSession{Ctx: ctx, System: system, cancel: cancel, allocCancel: allocCancel}
+	s := &BrowserSession{Ctx: ctx, System: system, Exe: exe, cancel: cancel, allocCancel: allocCancel}
 	if err := chromedp.Run(ctx); err != nil {
 		s.Close()
 		return nil, fmt.Errorf("chromedp start: %w", err)
@@ -141,10 +163,107 @@ func launchBrowser(parent context.Context, opt BrowserOptions) (*BrowserSession,
 	_ = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		return network.Enable().Do(ctx)
 	}))
+	if opt.TrimResources {
+		installWSOnlyFilter(ctx)
+	}
 	_ = applyStorageState(ctx, statePath(opt.Root))
 	_ = chromedp.Run(ctx, chromedp.Evaluate(`Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); window.chrome = { runtime: {} };`, nil))
 	return s, nil
 }
+
+// installWSOnlyFilter intercepts only non-WS resources (CSS/img/font/media/gift UI/stream).
+// Never pause Document/Script/XHR needed for enter+WSS — pausing those deadlocks Navigate.
+func installWSOnlyFilter(ctx context.Context) {
+	chromedp.ListenTarget(ctx, func(ev any) {
+		e, ok := ev.(*fetch.EventRequestPaused)
+		if !ok || e == nil {
+			return
+		}
+		reqID := e.RequestID
+		u := ""
+		if e.Request != nil {
+			u = e.Request.URL
+		}
+		allow := capturePausedAllowed(e.ResourceType, u)
+		go func() {
+			if allow {
+				_ = fetch.ContinueRequest(reqID).Do(ctx)
+				return
+			}
+			_ = fetch.FailRequest(reqID, network.ErrorReasonBlockedByClient).Do(ctx)
+		}()
+	})
+	patterns := []*fetch.RequestPattern{
+		{ResourceType: network.ResourceTypeStylesheet},
+		{ResourceType: network.ResourceTypeImage},
+		{ResourceType: network.ResourceTypeMedia},
+		{ResourceType: network.ResourceTypeFont},
+		{ResourceType: network.ResourceTypeTextTrack},
+		{ResourceType: network.ResourceTypeManifest},
+		{ResourceType: network.ResourceTypePing},
+		{ResourceType: network.ResourceTypePrefetch},
+		{ResourceType: network.ResourceTypeCSPViolationReport},
+		{ResourceType: network.ResourceTypeSignedExchange},
+		{ResourceType: network.ResourceTypeFedCM},
+		// 播放器 / 礼物特效 / 拉流（按 URL，任意 ResourceType）
+		{URLPattern: "*lottie*"},
+		{URLPattern: "*GiftEffect*"},
+		{URLPattern: "*GiftTray*"},
+		{URLPattern: "*GiftMenu*"},
+		{URLPattern: "*new-player*"},
+		{URLPattern: "*player-merged*"},
+		{URLPattern: "*webcast/gift/*"},
+		{URLPattern: "*exhibition/*"},
+		{URLPattern: "*.flv*"},
+		{URLPattern: "*.m3u8*"},
+		{URLPattern: "*.mp4*"},
+		{URLPattern: "*flive.douyincdn*"},
+		{URLPattern: "*bytefcdn*"},
+		{URLPattern: "*douyincdn.com*stream-*"},
+	}
+	_ = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return fetch.Enable().WithPatterns(patterns).Do(ctx)
+	}))
+}
+
+func capturePausedAllowed(rt network.ResourceType, rawURL string) bool {
+	switch rt {
+	case network.ResourceTypeStylesheet, network.ResourceTypeImage,
+		network.ResourceTypeMedia, network.ResourceTypeFont,
+		network.ResourceTypeTextTrack, network.ResourceTypeManifest,
+		network.ResourceTypePing, network.ResourceTypePrefetch,
+		network.ResourceTypeCSPViolationReport, network.ResourceTypeSignedExchange,
+		network.ResourceTypeFedCM:
+		return false
+	}
+	u := strings.ToLower(rawURL)
+	for _, bad := range []string{
+		"lottie", "gifteffect", "gifttray", "giftmenu",
+		"new-player", "player-merged", "/webcast/gift/", "/exhibition/",
+		".flv", ".m3u8", ".mp4", "flive.douyincdn", "bytefcdn", "/stream-",
+	} {
+		if strings.Contains(u, bad) {
+			return false
+		}
+	}
+	// 误拦到 Document/Script/进房 XHR 时放行，避免卡死。
+	return true
+}
+
+const killMediaJS = `(() => {
+  const kill = () => {
+    document.querySelectorAll('video,audio').forEach(el => {
+      try { el.pause(); el.removeAttribute('src'); el.load(); el.remove(); } catch (e) {}
+    });
+  };
+  kill();
+  if (!window.__DY_KILL_MEDIA__) {
+    window.__DY_KILL_MEDIA__ = true;
+    try {
+      new MutationObserver(kill).observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) {}
+  }
+})()`
 
 func (s *BrowserSession) Close() {
 	if s == nil {
@@ -158,11 +277,22 @@ func (s *BrowserSession) Close() {
 	}
 }
 
-func enterTimeout(system bool) time.Duration {
-	if system {
-		return 28 * time.Second
+func moduleAckTimeout() time.Duration { return 60 * time.Second }
+
+// ControlEnded is true for WebcastControlMessage 关播 (status=3).
+func ControlEnded(status any) bool {
+	switch v := status.(type) {
+	case float64:
+		return int(v) == 3
+	case int:
+		return v == 3
+	case int32:
+		return int(v) == 3
+	case int64:
+		return v == 3
+	default:
+		return false
 	}
-	return 15 * time.Second
 }
 
 type storageState struct {
@@ -280,6 +410,17 @@ func isRoomEnterURL(u string) bool {
 }
 
 func isLiving(status int) bool { return status == enterLiving }
+
+func describeEnterStatus(status int) string {
+	switch status {
+	case enterLiving:
+		return "开播中"
+	case enterEnded:
+		return "未开播/已结束"
+	default:
+		return "未知"
+	}
+}
 
 func asInt(v any, def int) int {
 	switch t := v.(type) {
@@ -610,16 +751,21 @@ const hookJS = `(() => {
 })();`
 
 func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
+	logf := p.Logf
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
 	if p.LiveID == "" {
 		return fmt.Errorf("live_id required")
 	}
 	sess, err := launchBrowser(ctx, BrowserOptions{
-		Root: p.Root, ForceSystem: p.ForceSystem, Headless: true, TrimResources: true,
+		Root: p.Root, PreferBundled: true, Headless: true, TrimResources: true,
 	})
 	if err != nil {
 		return err
 	}
 	defer sess.Close()
+	logf("browser launched", "exe", sess.Exe, "system", sess.System, "bundled", !sess.System, "headless", true, "live_id", p.LiveID)
 
 	var (
 		mu          sync.Mutex
@@ -653,6 +799,18 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 		liveOK = true
 		emitStatus(true)
 	}
+	// endLive: 开播后关播（control / WSS），与进房失败区分。
+	endLive := func(reason string) {
+		mu.Lock()
+		if stopped || !liveOK {
+			mu.Unlock()
+			return
+		}
+		stopped = true
+		mu.Unlock()
+		logf("live ended", "reason", reason)
+		emitStatus(false)
+	}
 	applyEnter := func(enter *EnterInfo) {
 		if enter == nil {
 			return
@@ -664,9 +822,13 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 		}
 		enterSeen = true
 		mu.Unlock()
+		logf("enter status",
+			"status", enter.Status, "desc", describeEnterStatus(enter.Status),
+			"room_status", enter.RoomStatus, "title", enter.Title)
 		if isLiving(enter.Status) {
 			confirm()
 		} else {
+			logf("not living", "status", enter.Status, "desc", describeEnterStatus(enter.Status))
 			fail()
 		}
 	}
@@ -686,17 +848,23 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 			if !want {
 				return
 			}
-			var body []byte
-			var errB error
-			_ = chromedp.Run(sess.Ctx, chromedp.ActionFunc(func(c context.Context) error {
-				b, er := network.GetResponseBody(e.RequestID).Do(c)
-				body, errB = b, er
-				return nil
-			}))
-			if errB != nil || len(body) == 0 {
-				return
-			}
-			applyEnter(parseRoomEnterPayload(body))
+			// Never chromedp.Run inside ListenTarget synchronously — it deadlocks the CDP event loop.
+			reqID := e.RequestID
+			go func() {
+				var body []byte
+				errB := chromedp.Run(sess.Ctx, chromedp.ActionFunc(func(c context.Context) error {
+					b, er := network.GetResponseBody(reqID).Do(c)
+					if er != nil {
+						return er
+					}
+					body = b
+					return nil
+				}))
+				if errB != nil || len(body) == 0 {
+					return
+				}
+				applyEnter(parseRoomEnterPayload(body))
+			}()
 		case *network.EventWebSocketCreated:
 			if strings.Contains(e.URL, "/push/v2/") {
 				mu.Lock()
@@ -721,6 +889,14 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 			if p.OnFrame != nil && len(raw) > 0 {
 				p.OnFrame(raw)
 			}
+			if ok, msgs := TryParseFrame(raw); ok {
+				for _, m := range msgs {
+					if t, _ := m["type"].(string); t == "control" && ControlEnded(m["status"]) {
+						endLive("control")
+						break
+					}
+				}
+			}
 		case *network.EventWebSocketClosed:
 			mu.Lock()
 			was := pushSockets[e.RequestID] && liveOK && !stopped
@@ -729,6 +905,7 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 			}
 			mu.Unlock()
 			if was {
+				logf("live ended", "reason", "wss_closed")
 				emitStatus(false)
 			}
 		case *runtime.EventConsoleAPICalled:
@@ -741,14 +918,17 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 	}
 
 	url := fmt.Sprintf("https://live.douyin.com/%s", p.LiveID)
+	logf("navigate live page", "url", url)
 	if err := chromedp.Run(sess.Ctx, chromedp.Navigate(url)); err != nil {
 		return err
 	}
+	_ = chromedp.Run(sess.Ctx, chromedp.Evaluate(killMediaJS, nil))
 	if jsHook {
 		_ = chromedp.Run(sess.Ctx, chromedp.Evaluate(hookJS, nil))
 	}
 
-	deadline := time.Now().Add(enterTimeout(sess.System))
+	// 线路 1/2：只认开播/关播，不对「是否开播」设超时；仅在页面/模块完全无应答时超时。
+	ackDeadline := time.Now().Add(moduleAckTimeout())
 	ticker := time.NewTicker(400 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -762,34 +942,42 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 			doneEnter := enterSeen || liveOK || stopped
 			alive := liveOK && !stopped
 			failed := stopped && !liveOK
+			ended := stopped && liveOK
+			enterReqN := len(enterReqs)
 			mu.Unlock()
 
-			if !doneEnter && time.Now().After(deadline) {
+			if !doneEnter && time.Now().After(ackDeadline) {
 				fb, _ := extractEnterFromPage(sess.Ctx)
 				if fb != nil {
 					applyEnter(fb)
-				} else {
+				} else if enterReqN == 0 {
 					fail()
-					return fmt.Errorf("enter status timeout")
+					return fmt.Errorf("module no response: enter never requested")
+				} else {
+					// 已有 enter 网络应答，继续等 status（开播/关播）
+					ackDeadline = time.Now().Add(moduleAckTimeout())
+					logf("waiting enter status", "enter_reqs", enterReqN)
 				}
 			}
 			if failed {
 				return fmt.Errorf("not living")
 			}
 			if jsHook && alive {
-				drainHookQueue(sess.Ctx, p)
+				if drainHookQueue(sess.Ctx, p) {
+					endLive("control")
+				}
 			}
 			mu.Lock()
-			s := stopped && liveOK
+			ended = stopped && liveOK
 			mu.Unlock()
-			if s {
+			if ended {
 				return nil
 			}
 		}
 	}
 }
 
-func drainHookQueue(ctx context.Context, p Params) {
+func drainHookQueue(ctx context.Context, p Params) (ended bool) {
 	var rawJSON string
 	err := chromedp.Run(ctx, chromedp.Evaluate(`(() => {
 		const q = window.__DY_MSG_Q;
@@ -797,20 +985,23 @@ func drainHookQueue(ctx context.Context, p Params) {
 		return JSON.stringify(q.splice(0, q.length));
 	})()`, &rawJSON))
 	if err != nil || rawJSON == "" || rawJSON == "null" {
-		return
+		return false
 	}
 	var items []map[string]any
 	if json.Unmarshal([]byte(rawJSON), &items) != nil {
-		return
+		return false
 	}
 	for _, it := range items {
-		if p.OnMessage == nil {
-			continue
-		}
 		m := Msg{}
 		for k, v := range it {
 			m[k] = v
 		}
-		p.OnMessage(m)
+		if t, _ := m["type"].(string); t == "control" && ControlEnded(m["status"]) {
+			ended = true
+		}
+		if p.OnMessage != nil {
+			p.OnMessage(m)
+		}
 	}
+	return ended
 }

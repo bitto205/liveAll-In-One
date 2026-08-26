@@ -155,7 +155,8 @@ public:
         mainTab_ = new MemoMainTab(this);
         mainTab_->setOnCleared([this]() { stackItems_.clear(); });
         addTabPage(mainTab_);
-        addTabPage(buildSettingsTab());
+        addTabPlaceholder();
+        setTabFactory(1, [this]() { return buildSettingsTab(); });
         switchTab(0);
 
         refreshTheme();
@@ -188,7 +189,6 @@ public:
     }
 
     void refreshTheme() override {
-        setStyleSheet(toolQss());
         mainTab_->refreshTheme();
         applyAddBtnStyle();
     }
@@ -248,6 +248,13 @@ private:
         auto* root = new QVBoxLayout(page);
         root->setContentsMargins(0, 0, 0, 0);
         root->addWidget(scrollPage(inner));
+        liveaio::util::onThemeChange(page, [inner](const QString&) {
+            const auto& C = theme();
+            inner->setStyleSheet(QStringLiteral(
+                "QFrame#Card { background: %1; border-radius: 10px; border: 1px solid %2; }"
+                "QLabel#SectionTitle { color: %3; }"
+            ).arg(C.card, C.border, C.text));
+        });
         return page;
     }
 

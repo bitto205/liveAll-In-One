@@ -45,6 +45,7 @@ type Params struct {
 	OnFrame     func([]byte)
 	OnMessage   func(Msg)
 	OnStatus    func(connected bool)
+	Logf        func(string, ...any)
 }
 
 // Driver is one capture route. Run blocks until ctx is cancelled or a fatal error.
@@ -102,6 +103,7 @@ type Manager struct {
 	OnFrame   func([]byte)
 	OnMessage func(Msg)
 	OnStatus  func(connected bool)
+	OnError   func(error)
 }
 
 func NewCapture(root, tcp string, logf func(string, ...any)) *Manager {
@@ -150,6 +152,7 @@ func (m *Manager) Start(route, liveID string, forceSystem bool) error {
 	p := Params{
 		Root: m.root, CoreTCP: m.tcp, LiveID: liveID, ForceSystem: forceSystem,
 		OnFrame: m.OnFrame, OnMessage: m.OnMessage, OnStatus: m.OnStatus,
+		Logf: m.logf,
 	}
 	m.mu.Lock()
 	m.current = id
@@ -167,6 +170,9 @@ func (m *Manager) Start(route, liveID string, forceSystem bool) error {
 	go func() {
 		if err := drv.Run(ctx, p); err != nil && ctx.Err() == nil {
 			m.logf("route stopped", "route", string(id), "err", err)
+			if m.OnError != nil {
+				m.OnError(err)
+			}
 		}
 	}()
 	m.setStop(cancel)

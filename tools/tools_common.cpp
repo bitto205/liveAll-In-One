@@ -26,6 +26,7 @@
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QTcpSocket>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -47,13 +48,16 @@ using liveaio::util::qssOutlined;
 using liveaio::util::qssMutedLabel;
 using liveaio::util::scrollPage;
 using liveaio::util::theme;
-using liveaio::util::toolQss;
+using liveaio::util::deferNextTick;
+using liveaio::util::WidgetDeferredDestroy;
 
 static constexpr const char* kCoreHost = "127.0.0.1";
 static constexpr quint16 kCorePort = 19877;
 
 static QString g_appRoot;
 static std::function<void(const QJsonObject&)> g_sendPacket;
+static QVariantMap g_configCache;
+static bool g_configCacheLoaded = false;
 
 struct ToolMeta {
     QString id;
@@ -83,30 +87,36 @@ static QVariantMap readConfigMap() {
     return doc.object().toVariantMap();
 }
 
+static void mergeConfigValues(const QVariantMap& values) {
+    for (auto it = values.constBegin(); it != values.constEnd(); ++it) {
+        g_configCache.insert(it.key(), it.value());
+    }
+    g_configCacheLoaded = true;
+}
+
 static QVariant configValue(const QString& key, const QVariant& fallback = {}) {
+    if (g_configCacheLoaded) {
+        const auto it = g_configCache.constFind(key);
+        if (it != g_configCache.constEnd()) return it.value();
+    }
     const QVariantMap map = readConfigMap();
     const auto it = map.constFind(key);
     return it == map.constEnd() ? fallback : it.value();
 }
 
-// core 是 config.json 的唯一写者；未连上时才回退到本地写入。
+// core 是 config.json 的唯一写者；乐观更新缓存，未连上时入队 ready 后 flush。
 static void writeConfigValue(const QString& key, const QVariant& value) {
-    if (g_sendPacket) {
-        g_sendPacket(QJsonObject{
-            {QStringLiteral("op"), QStringLiteral("config.set")},
-            {QStringLiteral("key"), key},
-            {QStringLiteral("value"), QJsonValue::fromVariant(value)},
-        });
-        return;
-    }
-    QVariantMap map = readConfigMap();
-    map.insert(key, value);
-    QFile file(QDir(g_appRoot).filePath(QStringLiteral("config.json")));
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
-    file.write(QJsonDocument(QJsonObject::fromVariantMap(map)).toJson(QJsonDocument::Indented));
+    g_configCache.insert(key, value);
+    g_configCacheLoaded = true;
+    if (g_sendPacket) g_sendPacket(QJsonObject{
+        {QStringLiteral("op"), QStringLiteral("config.set")},
+        {QStringLiteral("key"), key},
+        {QStringLiteral("value"), QJsonValue::fromVariant(value)},
+    });
 }
 
 static void installConfigBridge() {
+    mergeConfigValues(readConfigMap());
     liveaio::util::setConfigAccessors(
         [](const QString& key, const QVariant& fallback) { return configValue(key, fallback); },
         [](const QString& key, const QVariant& value) { writeConfigValue(key, value); });
@@ -117,7 +127,7 @@ static void installConfigBridge() {
 class CoreClient final : public QObject {
 public:
     explicit CoreClient(QObject* parent = nullptr) : QObject(parent), socket_(new QTcpSocket(this)) {
-        g_sendPacket = [this](const QJsonObject& packet) { send(packet); };
+        g_sendPacket = [this](const QJsonObject& packet) { queueOrSend(packet); };
         QObject::connect(socket_, &QTcpSocket::readyRead, this, [this]() { onReadyRead(); });
         QObject::connect(socket_, &QTcpSocket::connected, this, [this]() {
             connected_ = true;
@@ -135,14 +145,60 @@ public:
     void setStatusCallback(std::function<void(bool)> cb) { statusCallback_ = std::move(cb); }
     bool isReady() const { return ready_; }
 
-    void send(const QJsonObject& packet) {
-        if (socket_->state() != QAbstractSocket::ConnectedState) return;
+    void send(const QJsonObject& packet) { queueOrSend(packet); }
+
+private:
+    void queueOrSend(const QJsonObject& packet) {
+        const QString op = packet.value(QStringLiteral("op")).toString();
+        if (op == QStringLiteral("config.set") && !ready_) {
+            pendingSets_.append(packet);
+            return;
+        }
+        if (socket_->state() != QAbstractSocket::ConnectedState) {
+            if (op == QStringLiteral("config.set")) pendingSets_.append(packet);
+            return;
+        }
         QByteArray out = QJsonDocument(packet).toJson(QJsonDocument::Compact);
         out.push_back('\n');
         socket_->write(out);
     }
 
-private:
+    void onReady() {
+        ready_ = true;
+        send(QJsonObject{{QStringLiteral("op"), QStringLiteral("config.get")}});
+        flushPendingSets();
+    }
+
+    void flushPendingSets() {
+        if (!ready_ || socket_->state() != QAbstractSocket::ConnectedState) return;
+        const auto pending = pendingSets_;
+        pendingSets_.clear();
+        for (const QJsonObject& p : pending) send(p);
+    }
+
+    bool handleConfigPacket(const QJsonObject& packet) {
+        const QString op = packet.value(QStringLiteral("op")).toString();
+        if (op == QStringLiteral("config.value")) {
+            if (packet.contains(QStringLiteral("values"))) {
+                mergeConfigValues(packet.value(QStringLiteral("values")).toObject().toVariantMap());
+            } else if (packet.contains(QStringLiteral("key"))) {
+                g_configCache.insert(packet.value(QStringLiteral("key")).toString(),
+                                     packet.value(QStringLiteral("value")).toVariant());
+                g_configCacheLoaded = true;
+            }
+            return true;
+        }
+        if (op == QStringLiteral("config.ok")) {
+            const QString key = packet.value(QStringLiteral("key")).toString();
+            if (!key.isEmpty()) {
+                g_configCache.insert(key, packet.value(QStringLiteral("value")).toVariant());
+                g_configCacheLoaded = true;
+            }
+            return true;
+        }
+        return false;
+    }
+
     void onReadyRead() {
         buffer_.append(socket_->readAll());
         while (true) {
@@ -155,17 +211,31 @@ private:
             const auto doc = QJsonDocument::fromJson(line, &err);
             if (err.error != QJsonParseError::NoError || !doc.isObject()) continue;
             QJsonObject packet = doc.object();
-            if (packet.value(QStringLiteral("op")).toString() == QStringLiteral("ready")) ready_ = true;
+            const QString op = packet.value(QStringLiteral("op")).toString();
+            if (op == QStringLiteral("ready")) onReady();
+            if (handleConfigPacket(packet)) continue;
             if (packetCallback_) packetCallback_(packet);
         }
     }
 
     QTcpSocket* socket_;
     QByteArray buffer_;
+    QVector<QJsonObject> pendingSets_;
     bool connected_ = false;
     bool ready_ = false;
     std::function<void(const QJsonObject&)> packetCallback_;
     std::function<void(bool)> statusCallback_;
+};
+
+class ToolsSession;
+
+class ToolRuntimeBase : public QObject {
+public:
+    explicit ToolRuntimeBase(QObject* parent = nullptr) : QObject(parent) {}
+    virtual QString toolId() const = 0;
+    virtual bool isOverlayActive() const { return false; }
+    virtual void onCorePacket(const QJsonObject&) {}
+    virtual void onCoreStatus(bool) {}
 };
 
 class ToolWindowBase : public QMainWindow {
@@ -177,7 +247,14 @@ public:
     virtual QString toolId() const = 0;
     virtual void onCorePacket(const QJsonObject& packet) = 0;
     virtual void onCoreStatus(bool connected) { Q_UNUSED(connected); }
-    virtual void refreshTheme() { setStyleSheet(toolQss()); }
+    virtual void refreshTheme() {}
+    virtual void onPanelClosing() {}
+    // 工具窗样式写在窗自身，禁止写到 qApp，以免盖掉主窗 shellQss。
+    virtual void applyChromeStyle() { setStyleSheet(liveaio::util::toolQss()); }
+
+    void setPanelCloseHandler(std::function<void(const QString&)> handler) {
+        panelCloseHandler_ = std::move(handler);
+    }
 
 protected:
     void sendCore(const QJsonObject& packet) const {
@@ -185,8 +262,17 @@ protected:
     }
     CoreClient* core() const { return core_; }
 
+    void closeEvent(QCloseEvent* event) override {
+        onPanelClosing();
+        if (panelCloseHandler_) panelCloseHandler_(toolId());
+        event->accept();
+        hide();
+        deleteLater();
+    }
+
 private:
     CoreClient* core_;
+    std::function<void(const QString&)> panelCloseHandler_;
 };
 
 // 旧 memo/danmu/overtime 设置窗共用的顶部 Tab 壳。
@@ -226,6 +312,7 @@ public:
     }
 
     void switchTab(int index) {
+        ensureTab(index);
         stack_->setCurrentIndex(index);
         for (int i = 0; i < tabs_.size(); ++i) {
             tabs_[i]->setProperty("active", i == index);
@@ -234,11 +321,51 @@ public:
         }
     }
 
+    void addTabPlaceholder() {
+        auto* ph = new QWidget(stack_);
+        ph->setObjectName(QStringLiteral("TabPlaceholder"));
+        stack_->addWidget(ph);
+        tabPlaceholders_.append(ph);
+        tabBuilt_.append(false);
+    }
+
+    void replaceTabPlaceholder(int index, QWidget* page) {
+        if (index < 0 || index >= tabPlaceholders_.size()) {
+            addTabPage(page);
+            return;
+        }
+        QWidget* ph = tabPlaceholders_.value(index);
+        if (!ph) {
+            addTabPage(page);
+            return;
+        }
+        const int idx = stack_->indexOf(ph);
+        stack_->removeWidget(ph);
+        ph->deleteLater();
+        tabPlaceholders_[index] = nullptr;
+        stack_->insertWidget(idx, page);
+    }
+
 protected:
     void addTabPage(QWidget* page) { stack_->addWidget(page); }
 
+    void ensureTab(int index) {
+        if (index < 0 || index >= tabFactories_.size() || !tabFactories_[index]) return;
+        if (tabBuilt_.value(index)) return;
+        tabBuilt_[index] = true;
+        if (tabFactories_[index]) replaceTabPlaceholder(index, tabFactories_[index]());
+    }
+
+    void setTabFactory(int index, std::function<QWidget*()> factory) {
+        if (index >= tabFactories_.size()) tabFactories_.resize(index + 1);
+        tabFactories_[index] = std::move(factory);
+    }
+
     QStackedWidget* stack_ = nullptr;
     QVector<QPushButton*> tabs_;
+    QVector<QWidget*> tabPlaceholders_;
+    QVector<std::function<QWidget*()>> tabFactories_;
+    QVector<bool> tabBuilt_;
 };
 
 // ─────────────────────────────────────────────
@@ -335,6 +462,8 @@ protected:
     }
 
     virtual void onContentGeometryChanged() {}
+    // 拖拽中低帧率刷新内容（默认走完整布局；加班机等可改成轻量布局）。
+    virtual void onContentGeometryWhileResizing() { onContentGeometryChanged(); }
     virtual void onResizeResume() {}
 
     QMainWindow* hostWindow() const { return win_; }
@@ -371,7 +500,14 @@ protected:
         const int btnTotal = kBtnW * 2;
         btnBox_->setGeometry(width() - btnTotal, 0, btnTotal, kTopbarH);
         content_->setGeometry(0, kTopbarH, width(), height() - kTopbarH);
-        if (!freeze_->frozen()) onContentGeometryChanged();
+        // 边框已展开时半径跟随窗口，否则放大后圆形 clip 会裁掉新边框。
+        if (freeze_->frozen() && r_ > kTopbarH * 0.5) r_ = maxRadius();
+        update();
+        if (freeze_->frozen()) {
+            requestThrottledContentLayout();
+        } else {
+            onContentGeometryChanged();
+        }
     }
 
     void mousePressEvent(QMouseEvent* event) override {
@@ -459,7 +595,19 @@ private:
         circle_->update();
     }
 
+    void requestThrottledContentLayout() {
+        if (!contentThrottle_) {
+            contentThrottle_ = new QTimer(this);
+            contentThrottle_->setSingleShot(true);
+            QObject::connect(contentThrottle_, &QTimer::timeout, this, [this]() {
+                if (freeze_->frozen()) onContentGeometryWhileResizing();
+            });
+        }
+        if (!contentThrottle_->isActive()) contentThrottle_->start(kContentThrottleMs);
+    }
+
     void handleResizeResume() {
+        if (contentThrottle_) contentThrottle_->stop();
         onContentGeometryChanged();
         onResizeResume();
     }
@@ -487,12 +635,15 @@ private:
         }
     }
 
+    static constexpr int kContentThrottleMs = 80;  // 拖拽中内容约 12fps
+
     QMainWindow* win_ = nullptr;
     QWidget* btnBox_ = nullptr;
     QWidget* content_ = nullptr;
     QPushButton* minBtn_ = nullptr;
     QPushButton* closeBtn_ = nullptr;
     CircleButton* circle_ = nullptr;
+    QTimer* contentThrottle_ = nullptr;
     std::unique_ptr<liveaio::util::OverlayResizeFreeze> freeze_;
     std::function<void()> onCircleClicked_;
     std::function<void()> onMinimize_;
@@ -520,13 +671,23 @@ public:
         anim_->setEasingCurve(QEasingCurve::OutCubic);
         QObject::connect(anim_, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
             animR_ = v.toReal();
-            root_->setRadius(animR_);
+            if (root_) root_->setRadius(animR_);
         });
     }
 
     void setOnClosed(std::function<void()> cb) { onClosed_ = std::move(cb); }
 
+    void setGeometryKey(const QString& key) { geoKey_ = key; }
+
+    RippleOverlayRoot* takeRoot() {
+        RippleOverlayRoot* r = root_;
+        setCentralWidget(nullptr);
+        root_ = nullptr;
+        return r;
+    }
+
     void toggleFrame() {
+        if (!root_) return;
         shown_ = !shown_;
         anim_->stop();
         anim_->setStartValue(animR_);
@@ -539,19 +700,8 @@ public:
         lower();
     }
 
-protected:
-    void attachRoot(RippleOverlayRoot* root) {
-        root_ = root;
-        setCentralWidget(root_);
-        root_->setOnCircleClicked([this]() { toggleFrame(); });
-        root_->setOnMinimize([this]() { minimizeOverlay(); });
-    }
-
-    RippleOverlayRoot* root() const { return root_; }
-    bool frameShown() const { return shown_; }
-    bool animRunning() const { return anim_->state() == QAbstractAnimation::Running; }
-
     void syncRadiusAfterResize() {
+        if (!root_) return;
         if (shown_ && !animRunning()) animR_ = root_->maxRadius();
         root_->setRadius(animR_);
     }
@@ -577,12 +727,25 @@ protected:
         else resize(w, h);
     }
 
+protected:
+    void attachRoot(RippleOverlayRoot* root) {
+        root_ = root;
+        setCentralWidget(root_);
+        root_->setOnCircleClicked([this]() { toggleFrame(); });
+        root_->setOnMinimize([this]() { minimizeOverlay(); });
+    }
+
+    RippleOverlayRoot* root() const { return root_; }
+    bool frameShown() const { return shown_; }
+    bool animRunning() const { return anim_->state() == QAbstractAnimation::Running; }
+
     void showEvent(QShowEvent* event) override {
         QMainWindow::showEvent(event);
         if (!firstShow_) return;
         firstShow_ = false;
         // 布局完成后才知道 maxRadius，延后一帧初始化半径。
         QTimer::singleShot(0, this, [this]() {
+            if (!root_) return;
             qreal r = root_->maxRadius();
             if (r <= 0) r = 800.0;
             animR_ = r;
@@ -616,6 +779,110 @@ private:
     bool shown_ = true;
     bool firstShow_ = true;
     std::function<void()> onClosed_;
+};
+
+class SharedOverlayShell final : public RippleOverlayWindow {
+public:
+    SharedOverlayShell()
+        : RippleOverlayWindow(QStringLiteral("悬浮窗"),
+                              QStringLiteral("overlay_shell_geometry")) {}
+
+    void prepare(const QString& title, const QString& geoKey, int minW, int minH, int defW, int defH) {
+        setWindowTitle(title);
+        setGeometryKey(geoKey);
+        setMinimumSize(minW, minH);
+        restoreGeometryFromConfig(defW, defH);
+    }
+
+    void mountRoot(RippleOverlayRoot* newRoot, WidgetDeferredDestroy& destroyer) {
+        if (!newRoot) return;
+        RippleOverlayRoot* old = takeRoot();
+        if (old && old != newRoot) destroyer.enqueue(old);
+        attachRoot(newRoot);
+        syncRadiusAfterResize();
+    }
+
+    void afterShowContent() {
+        syncRadiusAfterResize();
+        if (root()) root()->updateGeometry();
+    }
+
+    bool hasMountedContent() const { return root() != nullptr; }
+};
+
+enum class OverlayToolId { None, Danmu, Overtime };
+
+class OverlayHostService final : public QObject {
+public:
+    static OverlayHostService& instance() {
+        static OverlayHostService* host = new OverlayHostService(qApp);
+        return *host;
+    }
+
+    OverlayToolId activeTool() const { return active_; }
+    bool isVisible() const { return shell_ && shell_->isVisible(); }
+    bool isToolActive(OverlayToolId id) const { return active_ == id && isVisible(); }
+
+    SharedOverlayShell* shell() {
+        ensureShell();
+        return shell_;
+    }
+
+    void show(OverlayToolId tool, const QString& title, const QString& geoKey, int minW, int minH,
+              int defW, int defH, RippleOverlayRoot* root, std::function<void()> onClosed) {
+        if (!root) return;
+
+        std::function<void()> prevClosed = closedCb_;
+        closedCb_ = std::move(onClosed);
+
+        if (active_ != OverlayToolId::None || (shell_ && shell_->hasMountedContent())) {
+            detachContent(prevClosed);
+        }
+
+        ensureShell();
+        shell_->prepare(title, geoKey, minW, minH, defW, defH);
+        shell_->setOnClosed([this]() { teardown(closedCb_); });
+        shell_->mountRoot(root, destroyer_);
+        active_ = tool;
+        shell_->show();
+        shell_->activateWindow();
+        QTimer::singleShot(0, shell_, [this]() {
+            if (shell_) shell_->afterShowContent();
+        });
+    }
+
+    void teardown(std::function<void()> done = nullptr) {
+        std::function<void()> cb = done ? done : closedCb_;
+        closedCb_ = nullptr;
+        detachContent(cb);
+    }
+
+    void teardownFast() {
+        closedCb_ = nullptr;
+        detachContent(nullptr);
+    }
+
+private:
+    explicit OverlayHostService(QObject* parent) : QObject(parent), destroyer_(this) {}
+
+    // 固定顺序：hide → 通知 controller 释资源 → takeRoot → 分帧 deleteLater
+    void detachContent(std::function<void()> notify) {
+        if (shell_) shell_->hide();
+        active_ = OverlayToolId::None;
+        if (notify) notify();
+        if (shell_) {
+            if (auto* r = shell_->takeRoot()) destroyer_.enqueue(r);
+        }
+    }
+
+    void ensureShell() {
+        if (!shell_) shell_ = new SharedOverlayShell;
+    }
+
+    OverlayToolId active_ = OverlayToolId::None;
+    SharedOverlayShell* shell_ = nullptr;
+    WidgetDeferredDestroy destroyer_;
+    std::function<void()> closedCb_;
 };
 
 // 旧 memo._section：卡片 + 标题 + 若干「文字 / 控件」行。

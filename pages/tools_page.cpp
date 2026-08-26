@@ -58,12 +58,14 @@ public:
         }
         openFn_ = reinterpret_cast<OpenFn>(lib_->resolve("LiveAIO_ToolsOpen"));
         themeFn_ = reinterpret_cast<ThemeFn>(lib_->resolve("LiveAIO_ToolsApplyTheme"));
+        warmFn_ = reinterpret_cast<WarmFn>(lib_->resolve("LiveAIO_ToolsWarm"));
         if (!openFn_) {
             loadError_ = QStringLiteral("LiveAIOTools.dll 缺少 LiveAIO_ToolsOpen 导出");
             if (error) *error = loadError_;
             return false;
         }
         applyTheme(liveaio::util::currentThemeName());
+        if (warmFn_) warmFn_();
         return true;
     }
 
@@ -86,6 +88,7 @@ public:
 private:
     using OpenFn = int (*)(const char*);
     using ThemeFn = void (*)(const char*);
+    using WarmFn = void (*)();
 
     static QString locateDll() {
         const QStringList candidates = {
@@ -102,6 +105,7 @@ private:
     QLibrary* lib_ = nullptr;
     OpenFn openFn_ = nullptr;
     ThemeFn themeFn_ = nullptr;
+    WarmFn warmFn_ = nullptr;
     QString loadError_;
 };
 

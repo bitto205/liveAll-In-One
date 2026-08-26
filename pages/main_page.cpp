@@ -1,7 +1,9 @@
 // pages/main_page.cpp — 主窗口壳，对齐旧 PySide MainPage。
-// 圆角窗口卡片 + 14px 阴影留白 + 36px 自绘标题栏 + 220/64 侧栏动画 + 按需建页。
+// 无边框圆角卡片（不自绘阴影）+ 36px 标题栏 + 220/64 侧栏动画；侧栏页首次进入才建。
 
 namespace liveaio::pages {
+
+using liveaio::util::deferNextTick;
 
 struct PageMeta {
     QString icon;
@@ -25,8 +27,8 @@ public:
         setWindowTitle(QStringLiteral("LiveAIO"));
         setWindowFlags(Qt::FramelessWindowHint | Qt::Window);
         setAttribute(Qt::WA_TranslucentBackground, true);
-        setMinimumSize(900 + kWindowShadowMargin * 2, 600 + kWindowShadowMargin * 2);
-        resize(1200 + kWindowShadowMargin * 2, 750 + kWindowShadowMargin * 2);
+        setMinimumSize(900, 600);
+        resize(1200, 750);
 
         pages_.resize(metas_.size());
         pages_.fill(nullptr);
@@ -34,19 +36,31 @@ public:
 
         buildUi();
         connectNav();
+        ensureMainPage(0);
         navigateMain(0);
 
         applyTheme();
         liveaio::util::onThemeChange(this, [this](const QString&) { applyTheme(); });
     }
 
+    void raiseFromTray() { restoreWindowChrome(); }
+
     void onCorePacket(const QJsonObject& packet) {
+        const QString op = packet.value(QStringLiteral("op")).toString();
         // 托盘或第二次启动请求显示界面：本进程已在跑，直接抬起窗口。
-        if (packet.value(QStringLiteral("op")).toString() == QStringLiteral("ui.focus")) {
-            showNormal();
-            raise();
-            activateWindow();
+        if (op == QStringLiteral("ui.focus")) {
+            restoreWindowChrome();
             return;
+        }
+        if (op == QStringLiteral("config.value")) {
+            const QJsonObject values = packet.value(QStringLiteral("values")).toObject();
+            if (values.contains(QStringLiteral("minimize_to_tray"))) {
+                g_minimizeToTray = values.value(QStringLiteral("minimize_to_tray")).toBool(true);
+            }
+        } else if (op == QStringLiteral("config.ok")) {
+            if (packet.value(QStringLiteral("key")).toString() == QStringLiteral("minimize_to_tray")) {
+                g_minimizeToTray = packet.value(QStringLiteral("value")).toBool(true);
+            }
         }
         for (auto* page : pages_) {
             if (page) page->onCorePacket(packet);
@@ -78,26 +92,31 @@ protected:
             return;
         }
         event->accept();
-        if (core_) {
-            core_->uiCommand(QStringLiteral("quit.shutdown_all"));
-            core_->shutdownCore();
-        }
+        if (core_) core_->requestFullShutdown();
         qApp->quit();
     }
 
+    void showEvent(QShowEvent* event) override {
+        QWidget::showEvent(event);
+        restoreWindowChrome(false);
+    }
+
 private:
+    void restoreWindowChrome(bool activate = true) {
+        showNormal();
+        if (activate) {
+            raise();
+            activateWindow();
+        }
+        applyTheme();
+    }
     void buildUi() {
         auto* rootLay = new QVBoxLayout(this);
-        rootLay->setContentsMargins(kWindowShadowMargin, kWindowShadowMargin,
-                                    kWindowShadowMargin, kWindowShadowMargin);
+        rootLay->setContentsMargins(0, 0, 0, 0);
 
         card_ = new QFrame(this);
         card_->setObjectName(QStringLiteral("WindowCard"));
-        auto* shadow = new QGraphicsDropShadowEffect(card_);
-        shadow->setBlurRadius(32);
-        shadow->setOffset(0, 4);
-        shadow->setColor(QColor(0, 0, 0, 55));
-        card_->setGraphicsEffect(shadow);
+        card_->setAttribute(Qt::WA_StyledBackground, true);
         rootLay->addWidget(card_);
 
         auto* cardLay = new QVBoxLayout(card_);
@@ -124,8 +143,17 @@ private:
 
         stack_ = new QStackedWidget(body);
         stack_->setObjectName(QStringLiteral("ContentArea"));
-        for (int i = 0; i < metas_.size(); ++i) stack_->addWidget(new QWidget(stack_));
-        stack_->addWidget(new QWidget(stack_));
+        stack_->setAttribute(Qt::WA_StyledBackground, true);
+        for (int i = 0; i < metas_.size(); ++i) {
+            auto* ph = new QWidget(stack_);
+            ph->setObjectName(QStringLiteral("PagePlaceholder"));
+            placeholders_.append(ph);
+            stack_->addWidget(ph);
+        }
+        settingsPlaceholder_ = new QWidget(stack_);
+        settingsPlaceholder_->setObjectName(QStringLiteral("PagePlaceholder"));
+        stack_->addWidget(settingsPlaceholder_);
+        settingsIndex_ = stack_->count() - 1;
         bodyLay->addWidget(stack_, 1);
 
         cardLay->addWidget(body, 1);
@@ -141,37 +169,41 @@ private:
         }
     }
 
-    void replaceStackWidget(int index, QWidget* widget) {
-        QWidget* old = stack_->widget(index);
-        stack_->removeWidget(old);
-        if (old) old->deleteLater();
-        stack_->insertWidget(index, widget);
+    void ensureMainPage(int index) {
+        if (index < 0 || index >= pages_.size() || pages_[index]) return;
+        QWidget* ph = placeholders_.value(index);
+        if (!ph) return;
+        pages_[index] = metas_[index].factory(core_, stack_);
+        if (!pages_[index]) return;
+        const int idx = stack_->indexOf(ph);
+        stack_->removeWidget(ph);
+        ph->deleteLater();
+        placeholders_[index] = nullptr;
+        stack_->insertWidget(idx, pages_[index]);
     }
 
-    BasePage* ensurePage(int index) {
-        if (index == settingsIndex_) {
-            if (!settingsPage_) {
-                settingsPage_ = new SettingsPage(core_, stack_);
-                replaceStackWidget(index, settingsPage_);
-            }
-            return settingsPage_;
-        }
-        if (index < 0 || index >= metas_.size()) return nullptr;
-        if (!pages_[index]) {
-            pages_[index] = metas_[index].factory(core_, stack_);
-            replaceStackWidget(index, pages_[index]);
-        }
-        return pages_[index];
+    void ensureSettingsPage() {
+        if (settingsPage_) return;
+        settingsPage_ = new SettingsPage(core_, stack_);
+        if (!settingsPlaceholder_) return;
+        const int idx = stack_->indexOf(settingsPlaceholder_);
+        stack_->removeWidget(settingsPlaceholder_);
+        settingsPlaceholder_->deleteLater();
+        settingsPlaceholder_ = nullptr;
+        stack_->insertWidget(idx, settingsPage_);
+        settingsIndex_ = idx;
     }
 
     void navigateMain(int index) {
-        ensurePage(index);
-        stack_->setCurrentIndex(index);
+        if (index < 0 || index >= pages_.size()) return;
+        ensureMainPage(index);
+        if (!pages_[index]) return;
+        stack_->setCurrentIndex(stack_->indexOf(pages_[index]));
         sidebar_->setActiveMain(index);
     }
 
     void navigateSettings() {
-        ensurePage(settingsIndex_);
+        ensureSettingsPage();
         stack_->setCurrentIndex(settingsIndex_);
         sidebar_->setActiveSettings();
     }
@@ -192,7 +224,9 @@ private:
     Sidebar* sidebar_ = nullptr;
     QStackedWidget* stack_ = nullptr;
     QVector<BasePage*> pages_;
+    QVector<QWidget*> placeholders_;
     SettingsPage* settingsPage_ = nullptr;
+    QWidget* settingsPlaceholder_ = nullptr;
     int settingsIndex_ = 0;
 };
 

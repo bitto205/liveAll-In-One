@@ -13,16 +13,16 @@
     "overlay": {
       "roles": {
         "title": {
-          "pixel_size": 13,
+          "pixel_size": 20,
           "align": "center",
           "v_align": "bottom",
-          "max_px": 13
+          "max_px": 32
         },
         "timer": {
-          "pixel_size": 13,
+          "pixel_size": 56,
           "align": "center",
           "bold": true,
-          "max_px": 32
+          "max_px": 96
         },
         "gift_name": {
           "pixel_size": 13,
