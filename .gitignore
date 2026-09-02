@@ -37,3 +37,5 @@ aqtinstall.log
 
 .audit_py_ui/
 scripts/
+
+build/
