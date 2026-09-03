@@ -8,7 +8,9 @@
 #include <QGraphicsDropShadowEffect>
 #include <QGridLayout>
 #include <QHeaderView>
+#include <QImage>
 #include <QLinearGradient>
+#include <QEvent>
 #include <QMessageBox>
 #include <QMetaType>
 #include <QMouseEvent>
@@ -25,6 +27,14 @@
 #include <QTextEdit>
 #include <QTimer>
 #include <QVariantAnimation>
+
+#ifdef Q_OS_WIN
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <windowsx.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -45,6 +55,7 @@ using liveaio::util::prepareAppAlphaFormat;
 #include "memo_tool.cpp"
 #include "danmu_tool.cpp"
 #include "overtime_tool.cpp"
+#include "leaf_tool.cpp"
 #include "liveaio_tools_api.h"
 
 namespace liveaio::tools {
@@ -92,6 +103,8 @@ public:
             panel = createDanmuTool(core_, static_cast<DanmuToolRuntime*>(entry->runtime));
         } else if (id == QStringLiteral("overtime")) {
             panel = createOvertimeTool(core_, static_cast<ot::OvertimeToolRuntime*>(entry->runtime));
+        } else if (id == QStringLiteral("leaf")) {
+            panel = leaf::createLeafTool(core_, static_cast<leaf::LeafToolRuntime*>(entry->runtime));
         }
         if (!panel) return false;
 
@@ -107,6 +120,55 @@ public:
     void warm() { ensureCore(); }
 
     ot::GiftPickerPopup* giftPicker() { return ot::sessionGiftPicker(); }
+
+    bool overlayCommand(const QString& id, const QString& action) {
+        ensureCore();
+        const OverlayToolId tool = id == QStringLiteral("danmu")
+            ? OverlayToolId::Danmu
+            : id == QStringLiteral("overtime") ? OverlayToolId::Overtime
+            : id == QStringLiteral("leaf") ? OverlayToolId::Leaf
+            : OverlayToolId::None;
+        if (tool == OverlayToolId::None) return false;
+
+        ToolEntry* entry = ensureEntry(id);
+        if (!entry || !entry->runtime) return false;
+        auto& host = OverlayHostService::instance();
+        const bool active = host.isToolActive(tool);
+        if (action == QStringLiteral("open")) {
+            if (active) return true;
+        } else if (action == QStringLiteral("toggle")) {
+            if (id == QStringLiteral("danmu")) {
+                static_cast<DanmuToolRuntime*>(entry->runtime)->toggleOverlay(nullptr);
+            } else if (id == QStringLiteral("overtime")) {
+                static_cast<ot::OvertimeToolRuntime*>(entry->runtime)
+                    ->toggleOverlay(ot::loadSettings(), nullptr);
+            } else {
+                static_cast<leaf::LeafToolRuntime*>(entry->runtime)->toggleOverlay(nullptr);
+            }
+            return true;
+        } else {
+            return host.command(tool, action);
+        }
+
+        if (id == QStringLiteral("danmu")) {
+            static_cast<DanmuToolRuntime*>(entry->runtime)->toggleOverlay(nullptr);
+        } else if (id == QStringLiteral("overtime")) {
+            static_cast<ot::OvertimeToolRuntime*>(entry->runtime)
+                ->toggleOverlay(ot::loadSettings(), nullptr);
+        } else {
+            static_cast<leaf::LeafToolRuntime*>(entry->runtime)->toggleOverlay(nullptr);
+        }
+        return true;
+    }
+
+    int overlayState(const QString& id) {
+        const OverlayToolId tool = id == QStringLiteral("danmu")
+            ? OverlayToolId::Danmu
+            : id == QStringLiteral("overtime") ? OverlayToolId::Overtime
+            : id == QStringLiteral("leaf") ? OverlayToolId::Leaf
+            : OverlayToolId::None;
+        return OverlayHostService::instance().stateBits(tool);
+    }
 
     void refreshOpenPanelsTheme() {
         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
@@ -144,6 +206,8 @@ private:
             entry.runtime = createDanmuRuntime(this, [this, id]() { tryReleaseTool(id); });
         } else if (id == QStringLiteral("overtime")) {
             entry.runtime = createOvertimeRuntime(this, [this, id]() { tryReleaseTool(id); });
+        } else if (id == QStringLiteral("leaf")) {
+            entry.runtime = leaf::createLeafRuntime(this, [this, id]() { tryReleaseTool(id); });
         }
         entries_.insert(id, entry);
         return &entries_[id];
@@ -205,6 +269,21 @@ extern "C" LIVEAIO_TOOLS_API int LiveAIO_ToolsOpen(const char* tool_id) {
     const QString id = QString::fromUtf8(tool_id ? tool_id : "").trimmed();
     if (id.isEmpty()) return 2;
     return liveaio::tools::ToolsSession::instance().openTool(id) ? 0 : 3;
+}
+
+extern "C" LIVEAIO_TOOLS_API int LiveAIO_ToolsOverlayCommand(
+    const char* tool_id, const char* action) {
+    if (!QApplication::instance()) return 1;
+    const QString id = QString::fromUtf8(tool_id ? tool_id : "").trimmed();
+    const QString cmd = QString::fromUtf8(action ? action : "").trimmed();
+    if (id.isEmpty() || cmd.isEmpty()) return 2;
+    return liveaio::tools::ToolsSession::instance().overlayCommand(id, cmd) ? 0 : 3;
+}
+
+extern "C" LIVEAIO_TOOLS_API int LiveAIO_ToolsOverlayState(const char* tool_id) {
+    if (!QApplication::instance()) return 0;
+    const QString id = QString::fromUtf8(tool_id ? tool_id : "").trimmed();
+    return liveaio::tools::ToolsSession::instance().overlayState(id);
 }
 
 extern "C" LIVEAIO_TOOLS_API void LiveAIO_ToolsApplyTheme(const char* theme_name) {

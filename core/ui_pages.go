@@ -15,13 +15,16 @@ import (
 )
 
 var (
-	pagesInitMu  sync.Mutex
-	pagesProcMu  sync.Mutex
-	pagesRun     uintptr
-	pagesShow    uintptr
-	pagesDir     string
-	pagesRunning bool
-	pagesEverRan bool
+	pagesInitMu         sync.Mutex
+	pagesProcMu         sync.Mutex
+	pagesRun            uintptr
+	pagesShow           uintptr
+	pagesSetStartHidden uintptr
+	pagesOverlayCommand uintptr
+	pagesOverlayState   uintptr
+	pagesDir            string
+	pagesRunning        bool
+	pagesEverRan        bool
 )
 
 // OpenPages loads LiveAIOPages.dll (once) and shows the pages UI.
@@ -68,9 +71,82 @@ func initPagesDLL(root string) error {
 	if show, err := windows.GetProcAddress(h, "LiveAIO_PagesShow"); err == nil {
 		pagesShow = show
 	}
+	if proc, err := windows.GetProcAddress(h, "LiveAIO_PagesSetStartHidden"); err == nil {
+		pagesSetStartHidden = proc
+	}
+	if proc, err := windows.GetProcAddress(h, "LiveAIO_PagesOverlayCommand"); err == nil {
+		pagesOverlayCommand = proc
+	}
+	if proc, err := windows.GetProcAddress(h, "LiveAIO_PagesOverlayState"); err == nil {
+		pagesOverlayState = proc
+	}
 	pagesDir = dir
 	_ = h // keep module loaded for process lifetime
 	return nil
+}
+
+// OverlayCommand controls a transparent tool window without raising the main UI.
+func OverlayCommand(root, tool, action string) error {
+	pagesInitMu.Lock()
+	if pagesRun == 0 {
+		if err := initPagesDLL(root); err != nil {
+			pagesInitMu.Unlock()
+			return err
+		}
+	}
+	proc := pagesOverlayCommand
+	pagesInitMu.Unlock()
+	if proc == 0 {
+		return fmt.Errorf("LiveAIO_PagesOverlayCommand export not found")
+	}
+
+	pagesProcMu.Lock()
+	running := pagesRunning
+	pagesProcMu.Unlock()
+	startedHidden := false
+	if !running {
+		if pagesSetStartHidden != 0 {
+			_, _, _ = syscall.SyscallN(pagesSetStartHidden, 1)
+		}
+		if err := showPages(root); err != nil {
+			return err
+		}
+		startedHidden = true
+	}
+
+	toolPtr, _ := syscall.BytePtrFromString(tool)
+	actionPtr, _ := syscall.BytePtrFromString(action)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		rc, _, _ := syscall.SyscallN(
+			proc,
+			uintptr(unsafe.Pointer(toolPtr)),
+			uintptr(unsafe.Pointer(actionPtr)),
+		)
+		if rc == 0 {
+			runtime.KeepAlive(toolPtr)
+			runtime.KeepAlive(actionPtr)
+			return nil
+		}
+		if !startedHidden || time.Now().After(deadline) {
+			return fmt.Errorf("overlay command %s/%s failed: %d", tool, action, rc)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// OverlayState returns bits 1=open, 2=frame shown, 4=locked without starting UI.
+func OverlayState(tool string) int {
+	pagesProcMu.Lock()
+	running := pagesRunning
+	pagesProcMu.Unlock()
+	if !running || pagesOverlayState == 0 {
+		return 0
+	}
+	toolPtr, _ := syscall.BytePtrFromString(tool)
+	state, _, _ := syscall.SyscallN(pagesOverlayState, uintptr(unsafe.Pointer(toolPtr)))
+	runtime.KeepAlive(toolPtr)
+	return int(state)
 }
 
 func findPagesDLL(root string) (string, error) {

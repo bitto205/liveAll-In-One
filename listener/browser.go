@@ -12,7 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"liveaio/util/connectdiag"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/fetch"
@@ -43,6 +46,9 @@ type BrowserSession struct {
 	Exe         string
 	cancel      context.CancelFunc
 	allocCancel context.CancelFunc
+
+	trimPhase atomic.Int32 // 1=bootstrap(仅拦流) 2=post-WSS 止血
+	trimOnce  sync.Once
 }
 
 func statePath(root string) string { return filepath.Join(root, "state.json") }
@@ -164,56 +170,76 @@ func launchBrowser(parent context.Context, opt BrowserOptions) (*BrowserSession,
 		return network.Enable().Do(ctx)
 	}))
 	if opt.TrimResources {
-		installWSOnlyFilter(ctx)
+		s.installBootstrapFilter()
 	}
 	_ = applyStorageState(ctx, statePath(opt.Root))
 	_ = chromedp.Run(ctx, chromedp.Evaluate(`Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); window.chrome = { runtime: {} };`, nil))
 	return s, nil
 }
 
-// installWSOnlyFilter intercepts only non-WS resources (CSS/img/font/media/gift UI/stream).
-// Never pause Document/Script/XHR needed for enter+WSS — pausing those deadlocks Navigate.
-func installWSOnlyFilter(ctx context.Context) {
-	chromedp.ListenTarget(ctx, func(ev any) {
+// Phase 1：只拦拉流，Document/Script/XHR 全放行（进房 + 建 WSS 必需）。
+// Phase 2：WSS /push/v2/ 建立后，再拦 CSS/图/字体/礼物 UI 等。
+func (s *BrowserSession) installBootstrapFilter() {
+	s.trimPhase.Store(1)
+	chromedp.ListenTarget(s.Ctx, func(ev any) {
 		e, ok := ev.(*fetch.EventRequestPaused)
 		if !ok || e == nil {
 			return
 		}
-		reqID := e.RequestID
 		u := ""
 		if e.Request != nil {
 			u = e.Request.URL
 		}
-		allow := capturePausedAllowed(e.ResourceType, u)
+		allow := captureAllow(s.trimPhase.Load(), e.ResourceType, u)
+		reqID := e.RequestID
 		go func() {
 			if allow {
-				_ = fetch.ContinueRequest(reqID).Do(ctx)
+				_ = fetch.ContinueRequest(reqID).Do(s.Ctx)
 				return
 			}
-			_ = fetch.FailRequest(reqID, network.ErrorReasonBlockedByClient).Do(ctx)
+			_ = fetch.FailRequest(reqID, network.ErrorReasonBlockedByClient).Do(s.Ctx)
 		}()
 	})
-	patterns := []*fetch.RequestPattern{
-		{ResourceType: network.ResourceTypeStylesheet},
-		{ResourceType: network.ResourceTypeImage},
+	_ = chromedp.Run(s.Ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return fetch.Enable().WithPatterns(captureBootstrapPatterns()).Do(ctx)
+	}))
+}
+
+func (s *BrowserSession) applyPostWSSTrim(logf func(string, ...any)) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	s.trimOnce.Do(func() {
+		go func() {
+			if !s.trimPhase.CompareAndSwap(1, 2) {
+				return
+			}
+			logf("wss trim phase2", "desc", "block css/img/font/gift ui, kill video dom")
+			_ = chromedp.Run(s.Ctx,
+				chromedp.ActionFunc(func(ctx context.Context) error {
+					return fetch.Enable().WithPatterns(captureTrimPatterns()).Do(ctx)
+				}),
+				chromedp.ActionFunc(func(ctx context.Context) error {
+					patterns := []*network.BlockPattern{
+						{URLPattern: "*://*/webcast/gift/*", Block: true},
+						{URLPattern: "*://*/*/exhibition/*", Block: true},
+					}
+					if err := network.SetBlockedURLs().WithURLPatterns(patterns).Do(ctx); err != nil {
+						return cdp.Execute(ctx, network.CommandSetBlockedURLs, map[string]any{
+							"urls": []string{"*webcast/gift/*", "*exhibition/*", "*mcs.*", "*snssdk*"},
+						}, nil)
+					}
+					return nil
+				}),
+				chromedp.Evaluate(killMediaJS, nil),
+			)
+		}()
+	})
+}
+
+func captureBootstrapPatterns() []*fetch.RequestPattern {
+	return []*fetch.RequestPattern{
 		{ResourceType: network.ResourceTypeMedia},
-		{ResourceType: network.ResourceTypeFont},
-		{ResourceType: network.ResourceTypeTextTrack},
-		{ResourceType: network.ResourceTypeManifest},
-		{ResourceType: network.ResourceTypePing},
-		{ResourceType: network.ResourceTypePrefetch},
-		{ResourceType: network.ResourceTypeCSPViolationReport},
-		{ResourceType: network.ResourceTypeSignedExchange},
-		{ResourceType: network.ResourceTypeFedCM},
-		// 播放器 / 礼物特效 / 拉流（按 URL，任意 ResourceType）
-		{URLPattern: "*lottie*"},
-		{URLPattern: "*GiftEffect*"},
-		{URLPattern: "*GiftTray*"},
-		{URLPattern: "*GiftMenu*"},
-		{URLPattern: "*new-player*"},
-		{URLPattern: "*player-merged*"},
-		{URLPattern: "*webcast/gift/*"},
-		{URLPattern: "*exhibition/*"},
 		{URLPattern: "*.flv*"},
 		{URLPattern: "*.m3u8*"},
 		{URLPattern: "*.mp4*"},
@@ -221,32 +247,69 @@ func installWSOnlyFilter(ctx context.Context) {
 		{URLPattern: "*bytefcdn*"},
 		{URLPattern: "*douyincdn.com*stream-*"},
 	}
-	_ = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		return fetch.Enable().WithPatterns(patterns).Do(ctx)
-	}))
 }
 
-func capturePausedAllowed(rt network.ResourceType, rawURL string) bool {
-	switch rt {
-	case network.ResourceTypeStylesheet, network.ResourceTypeImage,
-		network.ResourceTypeMedia, network.ResourceTypeFont,
-		network.ResourceTypeTextTrack, network.ResourceTypeManifest,
-		network.ResourceTypePing, network.ResourceTypePrefetch,
-		network.ResourceTypeCSPViolationReport, network.ResourceTypeSignedExchange,
-		network.ResourceTypeFedCM:
-		return false
-	}
+func captureTrimPatterns() []*fetch.RequestPattern {
+	out := append([]*fetch.RequestPattern{}, captureBootstrapPatterns()...)
+	out = append(out,
+		&fetch.RequestPattern{ResourceType: network.ResourceTypeStylesheet},
+		&fetch.RequestPattern{ResourceType: network.ResourceTypeImage},
+		&fetch.RequestPattern{ResourceType: network.ResourceTypeFont},
+		&fetch.RequestPattern{ResourceType: network.ResourceTypeTextTrack},
+		&fetch.RequestPattern{ResourceType: network.ResourceTypeManifest},
+		&fetch.RequestPattern{ResourceType: network.ResourceTypePing},
+		&fetch.RequestPattern{ResourceType: network.ResourceTypePrefetch},
+		&fetch.RequestPattern{ResourceType: network.ResourceTypeCSPViolationReport},
+		&fetch.RequestPattern{ResourceType: network.ResourceTypeSignedExchange},
+		&fetch.RequestPattern{ResourceType: network.ResourceTypeFedCM},
+		&fetch.RequestPattern{URLPattern: "*lottie*"},
+		&fetch.RequestPattern{URLPattern: "*GiftEffect*"},
+		&fetch.RequestPattern{URLPattern: "*GiftTray*"},
+		&fetch.RequestPattern{URLPattern: "*GiftMenu*"},
+		&fetch.RequestPattern{URLPattern: "*new-player*"},
+		&fetch.RequestPattern{URLPattern: "*player-merged*"},
+		&fetch.RequestPattern{URLPattern: "*webcast/gift/*"},
+		&fetch.RequestPattern{URLPattern: "*exhibition/*"},
+	)
+	return out
+}
+
+func captureAllow(phase int32, rt network.ResourceType, rawURL string) bool {
 	u := strings.ToLower(rawURL)
 	for _, bad := range []string{
-		"lottie", "gifteffect", "gifttray", "giftmenu",
-		"new-player", "player-merged", "/webcast/gift/", "/exhibition/",
-		".flv", ".m3u8", ".mp4", "flive.douyincdn", "bytefcdn", "/stream-",
+		".flv", ".m3u8", ".mp4", ".webm",
+		"/stream-", "flive.douyincdn", "bytefcdn", "douyincdn.com/thirdgame",
 	} {
 		if strings.Contains(u, bad) {
 			return false
 		}
 	}
-	// 误拦到 Document/Script/进房 XHR 时放行，避免卡死。
+	if rt == network.ResourceTypeMedia {
+		return false
+	}
+	if phase < 2 {
+		return true
+	}
+	return captureTrimAllow(rt, u)
+}
+
+func captureTrimAllow(rt network.ResourceType, rawURL string) bool {
+	switch rt {
+	case network.ResourceTypeStylesheet, network.ResourceTypeImage,
+		network.ResourceTypeFont, network.ResourceTypeTextTrack,
+		network.ResourceTypeManifest, network.ResourceTypePing,
+		network.ResourceTypePrefetch, network.ResourceTypeCSPViolationReport,
+		network.ResourceTypeSignedExchange, network.ResourceTypeFedCM:
+		return false
+	}
+	for _, bad := range []string{
+		"lottie", "gifteffect", "gifttray", "giftmenu",
+		"new-player", "player-merged", "/webcast/gift/", "/exhibition/",
+	} {
+		if strings.Contains(rawURL, bad) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -758,6 +821,7 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 	if p.LiveID == "" {
 		return fmt.Errorf("live_id required")
 	}
+	logf("capture begin", "route", string(p.Route), "live_id", p.LiveID, "js_hook", jsHook)
 	sess, err := launchBrowser(ctx, BrowserOptions{
 		Root: p.Root, PreferBundled: true, Headless: true, TrimResources: true,
 	})
@@ -772,6 +836,8 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 		liveOK      bool
 		enterSeen   bool
 		stopped     bool
+		wssOK       bool
+		offlineAt   time.Time
 		pushSockets = map[network.RequestID]bool{}
 		enterReqs   = map[network.RequestID]bool{}
 	)
@@ -828,8 +894,11 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 		if isLiving(enter.Status) {
 			confirm()
 		} else {
+			mu.Lock()
+			offlineAt = time.Now()
+			mu.Unlock()
 			logf("not living", "status", enter.Status, "desc", describeEnterStatus(enter.Status))
-			fail()
+			emitStatus(false)
 		}
 	}
 
@@ -869,7 +938,9 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 			if strings.Contains(e.URL, "/push/v2/") {
 				mu.Lock()
 				pushSockets[e.RequestID] = true
+				wssOK = true
 				mu.Unlock()
+				sess.applyPostWSSTrim(logf)
 			}
 		case *network.EventWebSocketFrameReceived:
 			mu.Lock()
@@ -919,16 +990,22 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 
 	url := fmt.Sprintf("https://live.douyin.com/%s", p.LiveID)
 	logf("navigate live page", "url", url)
-	if err := chromedp.Run(sess.Ctx, chromedp.Navigate(url)); err != nil {
-		return err
-	}
-	_ = chromedp.Run(sess.Ctx, chromedp.Evaluate(killMediaJS, nil))
-	if jsHook {
-		_ = chromedp.Run(sess.Ctx, chromedp.Evaluate(hookJS, nil))
-	}
+	navStarted := time.Now()
+	go func() {
+		navCtx, navCancel := context.WithTimeout(sess.Ctx, 45*time.Second)
+		defer navCancel()
+		if err := chromedp.Run(navCtx, chromedp.Navigate(url)); err != nil {
+			logf("navigate incomplete", "err", err)
+		}
+		if jsHook {
+			_ = chromedp.Run(sess.Ctx, chromedp.Evaluate(hookJS, nil))
+		}
+	}()
 
 	// 线路 1/2：只认开播/关播，不对「是否开播」设超时；仅在页面/模块完全无应答时超时。
 	ackDeadline := time.Now().Add(moduleAckTimeout())
+	enterHangN := 0
+	badRoomProbed := false
 	ticker := time.NewTicker(400 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -941,9 +1018,39 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 			mu.Lock()
 			doneEnter := enterSeen || liveOK || stopped
 			alive := liveOK && !stopped
-			failed := stopped && !liveOK
-			ended := stopped && liveOK
+			offline := enterSeen && !liveOK && !stopped
+			offAt := offlineAt
+			wss := wssOK
+			seenEnter := enterSeen
 			enterReqN := len(enterReqs)
+			mu.Unlock()
+
+			if offline && (wss || (!offAt.IsZero() && time.Since(offAt) > 3*time.Second)) {
+				logf("capture idle", "reason", "not_living", "wss", wss)
+				emitStatus(false)
+				return errNotLiving()
+			}
+
+			if !doneEnter {
+				if fb, _ := extractEnterFromPage(sess.Ctx); fb != nil {
+					applyEnter(fb)
+				}
+			}
+
+			if connectdiag.BrowserStuck(enterReqN, seenEnter, wss) && !badRoomProbed &&
+				time.Since(navStarted) >= connectdiag.BadRoomMinWait {
+				badRoomProbed = true
+				if err := connectdiag.TryBadRoom(sess.Ctx, enterReqN, seenEnter, time.Since(navStarted)); err != nil {
+					logf("page signal", "bad_room", true, "reason", "landing_title")
+					emitStatus(false)
+					return err
+				}
+			}
+
+			mu.Lock()
+			doneEnter = enterSeen || liveOK || stopped
+			seenEnter = enterSeen
+			enterReqN = len(enterReqs)
 			mu.Unlock()
 
 			if !doneEnter && time.Now().After(ackDeadline) {
@@ -952,15 +1059,17 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 					applyEnter(fb)
 				} else if enterReqN == 0 {
 					fail()
-					return fmt.Errorf("module no response: enter never requested")
+					return connectdiag.ClassifyBrowserFault(sess.Ctx, enterReqN, seenEnter, nil)
 				} else {
+					enterHangN++
+					if enterHangN > 2 {
+						fail()
+						return connectdiag.ClassifyBrowserFault(sess.Ctx, enterReqN, seenEnter, nil)
+					}
 					// 已有 enter 网络应答，继续等 status（开播/关播）
 					ackDeadline = time.Now().Add(moduleAckTimeout())
 					logf("waiting enter status", "enter_reqs", enterReqN)
 				}
-			}
-			if failed {
-				return fmt.Errorf("not living")
 			}
 			if jsHook && alive {
 				if drainHookQueue(sess.Ctx, p) {
@@ -968,7 +1077,7 @@ func runBrowserCapture(ctx context.Context, p Params, jsHook bool) error {
 				}
 			}
 			mu.Lock()
-			ended = stopped && liveOK
+			ended := stopped && liveOK
 			mu.Unlock()
 			if ended {
 				return nil

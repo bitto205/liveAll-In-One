@@ -99,7 +99,7 @@ LiveAIO.exe                 C++ 薄宿主：LoadLibrary 各模块
 
 ### 1.4 C++ UI 懒加载与 overlay
 
-Pages/Tools 的懒加载矩阵、进程级透明 overlay 单壳、Async-by-default 规则见 [`CPP_UI_CONTRACT.md`](CPP_UI_CONTRACT.md)（§懒加载矩阵、§透明 overlay、§Async-by-default）。
+Pages/Tools 的懒加载矩阵、同 Qt 实例内的独立透明 overlay 双窗、Async-by-default 规则见 [`CPP_UI_CONTRACT.md`](CPP_UI_CONTRACT.md)（§懒加载矩阵、§透明 overlay、§Async-by-default）。
 
 ---
 

@@ -292,6 +292,47 @@ inline QString qssLineEdit() {
     ).arg(C.card, C.text, C.border, C.activeLine);
 }
 
+// 原生 QToolTip 在透明/无边框窗上易渲染成黑块，各窗 QSS 应统一带上。
+inline QString qssTooltip() {
+    const ThemePalette& C = theme();
+    return QStringLiteral(
+        "QToolTip { color: %1; background-color: %2; border: 1px solid %3;"
+        " border-radius: 6px; padding: 6px 10px; font-size: 12px; }"
+    ).arg(C.text, C.card, C.border);
+}
+
+// 抑制 Windows 下 flat 按钮的原生 hover/focus 黑框。
+inline QString qssNativeButtonGuard() {
+    return QStringLiteral(
+        "QPushButton { outline: none; }"
+        "QPushButton:focus { outline: none; }"
+        "QPushButton:flat { background: transparent; border: none; }"
+        "QPushButton:flat:hover { background: transparent; border: none; }"
+        "QPushButton:flat:pressed { background: transparent; border: none; }"
+    );
+}
+
+inline QString popupChromeQss() { return qssTooltip() + qssNativeButtonGuard(); }
+
+inline void suppressButtonFocus(QPushButton* btn) {
+    if (!btn) return;
+    btn->setFocusPolicy(Qt::NoFocus);
+    btn->setAutoDefault(false);
+    btn->setDefault(false);
+}
+
+// 自绘顶栏/悬浮窗图标钮：关焦点并禁止系统 hover 底纹。
+inline void polishFlatChromeButton(QPushButton* btn) {
+    if (!btn) return;
+    suppressButtonFocus(btn);
+    btn->setFlat(true);
+    btn->setStyleSheet(QStringLiteral(
+        "QPushButton { background: transparent; border: none; outline: none;"
+        " padding: 0; margin: 0; }"
+        "QPushButton:hover { background: transparent; border: none; }"
+        "QPushButton:pressed { background: transparent; border: none; }"));
+}
+
 // 主窗口壳几何常量（圆角半径）。
 inline constexpr int kWindowShadowMargin = 0;
 inline constexpr int kWindowCornerRadius = 10;
@@ -339,7 +380,8 @@ inline QString shellQss() {
         "#SettingPageTitle { font-size: 20px; font-weight: 600; color: %1; background: transparent; }"
     ).arg(C.text, C.bg, C.winEdge, C.border, C.textMuted, C.btnHover,
           C.sidebar, C.hover, C.active, C.card, C.activeLine,
-          QString::number(kWindowCornerRadius));
+          QString::number(kWindowCornerRadius))
+        + qssTooltip() + qssNativeButtonGuard();
 }
 
 // 旧 _danmu_spin_qss：自绘上下箭头的紧凑 QSpinBox。
@@ -393,7 +435,7 @@ inline QString toolQss() {
         "QScrollBar::handle:vertical { background: %4; border-radius: 2px; }"
         "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
     ).arg(C.text, C.bg, C.sidebar, C.border, C.textMuted, C.hover, C.activeLine, C.card)
-        + spinBoxQss();
+        + spinBoxQss() + qssTooltip() + qssNativeButtonGuard();
 }
 
 // ─────────────────────────────────────────────
@@ -490,6 +532,7 @@ public:
             auto* btn = new QPushButton(text, this);
             btn->setFlat(true);
             btn->setCursor(Qt::PointingHandCursor);
+            suppressButtonFocus(btn);
             const bool isCurrent = (text == current);
             btn->setStyleSheet(QStringLiteral(
                 "QPushButton { background: transparent; color: %1; border: none;"
@@ -505,6 +548,7 @@ public:
         }
         adjustSize();
         setFixedWidth(width);
+        setStyleSheet(popupChromeQss());
     }
 
 protected:
@@ -748,12 +792,18 @@ public:
         setObjectName(QStringLiteral("WinBtn_close"));
         setFixedSize(kW, kH);
         setCursor(Qt::ArrowCursor);
-        setFlat(true);
-        setAttribute(Qt::WA_Hover);
-        setStyleSheet(QStringLiteral("border: none; background: transparent;"));
+        polishFlatChromeButton(this);
     }
 
 protected:
+    bool event(QEvent* e) override {
+        if (e->type() == QEvent::Enter || e->type() == QEvent::Leave
+            || e->type() == QEvent::HoverEnter || e->type() == QEvent::HoverLeave) {
+            update();
+        }
+        return QPushButton::event(e);
+    }
+
     void paintEvent(QPaintEvent*) override {
         const ThemePalette& C = theme();
         QPainter p(this);
@@ -807,6 +857,7 @@ public:
         auto* minBtn = new QPushButton(QStringLiteral("─"), this);
         minBtn->setObjectName(QStringLiteral("WinBtn"));
         minBtn->setCursor(Qt::ArrowCursor);
+        suppressButtonFocus(minBtn);
         QObject::connect(minBtn, &QPushButton::clicked, this, [this]() {
             if (window()) window()->showMinimized();
         });
@@ -865,6 +916,7 @@ public:
         setFixedHeight(kHeight);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         setCursor(Qt::PointingHandCursor);
+        suppressButtonFocus(this);
 
         auto* lay = new QHBoxLayout(this);
         lay->setContentsMargins(0, 0, 0, 0);
@@ -990,6 +1042,7 @@ private:
         toggleBtn->setFixedHeight(44);
         toggleBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         toggleBtn->setCursor(Qt::PointingHandCursor);
+        suppressButtonFocus(toggleBtn);
         QObject::connect(toggleBtn, &QPushButton::clicked, this, [this]() { toggle(); });
 
         auto* tLay = new QHBoxLayout(toggleBtn);

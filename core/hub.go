@@ -49,11 +49,25 @@ func startHub(ctx context.Context, root, tcp string, log *slog.Logger, shutdown 
 	h.capture.OnMessage = func(m listener.Msg) { h.afterMessage(m) }
 	h.capture.OnStatus = func(connected bool) {
 		h.connected = connected
-		h.send(h.statusEnvelope())
+		env := h.statusEnvelope()
+		if connected && h.route != "3" {
+			env["msg"] = listener.MsgConnected
+		} else if connected {
+			env["msg"] = "监听已开启"
+		}
+		h.send(env)
 	}
 	h.capture.OnError = func(err error) {
 		h.connected = false
-		h.send(Envelope{"op": OpError, "code": "listen", "route": h.route, "msg": err.Error()})
+		code := "listen"
+		msg := err.Error()
+		if h.route != "3" {
+			if ce, ok := listener.AsConnectError(err); ok {
+				code = string(ce.Code)
+				msg = ce.Error()
+			}
+		}
+		h.send(Envelope{"op": OpError, "code": code, "route": h.route, "msg": msg})
 		h.send(h.statusEnvelope())
 	}
 	h.overtime = NewOvertime(
@@ -175,7 +189,14 @@ func (h *hub) startRoute4() {
 	}
 	if err := cl.Start(); err != nil {
 		h.log.Error("shellipc start", "err", err)
-		h.send(Envelope{"op": OpError, "code": "shellipc", "msg": err.Error()})
+		code := "shellipc"
+		msg := err.Error()
+		if ce, ok := listener.AsConnectError(err); ok {
+			code = string(ce.Code)
+			msg = ce.Error()
+		}
+		h.send(Envelope{"op": OpError, "code": code, "route": h.route, "msg": msg})
+		h.send(h.statusEnvelope())
 		return
 	}
 	h.shell = cl
@@ -188,7 +209,13 @@ func (h *hub) startListen(route string, forceSystem bool) error {
 	}
 	if err := h.capture.Start(route, h.liveID, forceSystem); err != nil {
 		h.log.Error("listen", "route", route, "err", err)
-		h.send(Envelope{"op": OpError, "code": "listen", "route": route, "msg": err.Error()})
+		code := "listen"
+		msg := err.Error()
+		if ce, ok := listener.AsConnectError(err); ok {
+			code = string(ce.Code)
+			msg = ce.Error()
+		}
+		h.send(Envelope{"op": OpError, "code": code, "route": route, "msg": msg})
 		return err
 	}
 	return nil
@@ -380,6 +407,10 @@ func (h *hub) statusEnvelope() Envelope {
 func (h *hub) afterMessage(m listener.Msg) {
 	t, _ := m["type"].(string)
 	if t == "control" && listener.ControlEnded(m["status"]) {
+		if h.route == "3" {
+			h.log.Info("live ended", "via", "control", "route", "3")
+			return
+		}
 		if h.connected {
 			h.connected = false
 			h.send(h.statusEnvelope())

@@ -17,6 +17,29 @@ static ToolSkin activeDanmuSkin() {
                           id.isEmpty() ? QStringLiteral("default") : id);
 }
 
+static void pushSavedDanmuSettings() {
+    if (!g_sendPacket) return;
+    g_sendPacket(QJsonObject{
+        {QStringLiteral("op"), QStringLiteral("tool.danmu.set")},
+        {QStringLiteral("settings"), QJsonObject{
+            {QStringLiteral("danmu_chat_on"),
+             configValue(QStringLiteral("danmu_chat_on"), true).toBool()},
+            {QStringLiteral("danmu_gift_on"),
+             configValue(QStringLiteral("danmu_gift_on"), true).toBool()},
+            {QStringLiteral("danmu_gift_min_diamonds"),
+             configValue(QStringLiteral("danmu_gift_min_diamonds"), 0).toInt()},
+            {QStringLiteral("danmu_follow_on"),
+             configValue(QStringLiteral("danmu_follow_on"), true).toBool()},
+            {QStringLiteral("danmu_like_on"),
+             configValue(QStringLiteral("danmu_like_on"), true).toBool()},
+            {QStringLiteral("danmu_like_threshold"),
+             configValue(QStringLiteral("danmu_like_threshold"), 10).toInt()},
+            {QStringLiteral("danmu_like_accumulate"),
+             configValue(QStringLiteral("danmu_like_accumulate"), true).toBool()},
+        }},
+    });
+}
+
 static void showTutorialDialog(QWidget* parent) {
     const QDir imageDir(QDir(g_appRoot).filePath(QStringLiteral("image")));
     const QStringList files = imageDir.entryList(
@@ -343,7 +366,7 @@ public:
         auto& host = OverlayHostService::instance();
         root_ = nullptr;
         skin_ = activeDanmuSkin();
-        auto* shell = host.shell();
+        auto* shell = host.shell(OverlayToolId::Danmu);
         root_ = new DanmuRoot(shell, [this]() { onFrameResumed(); });
         host.show(OverlayToolId::Danmu, QStringLiteral("弹幕机"), kDanmuGeoKey, 200, 150, 420, 320,
                   root_, [this, onClosed]() {
@@ -436,7 +459,7 @@ private:
 
     void onFrameResumed() {
         if (!root_) return;
-        auto* shell = OverlayHostService::instance().shell();
+        auto* shell = OverlayHostService::instance().shell(OverlayToolId::Danmu);
         if (shell) {
             shell->syncRadiusAfterResize();
         }
@@ -542,9 +565,10 @@ public:
     void toggleOverlay(std::function<void()> onClosed) {
         auto& host = OverlayHostService::instance();
         if (host.isToolActive(OverlayToolId::Danmu)) {
-            host.teardown();
+            host.teardown(OverlayToolId::Danmu);
             return;
         }
+        pushSavedDanmuSettings();
         if (!overlayCtrl_) overlayCtrl_ = new DanmuOverlayController(this);
         overlayCtrl_->show([this, onClosed]() {
             if (onClosed) onClosed();
@@ -633,6 +657,7 @@ private:
             navBtn->setFixedHeight(46);
             navBtn->setCursor(Qt::PointingHandCursor);
             navBtn->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+            liveaio::util::suppressButtonFocus(navBtn);
             QObject::connect(navBtn, &QPushButton::clicked, this, [this, i]() { navigate(i); });
             navBtns_.append(navBtn);
             tbLay->addWidget(navBtn);
@@ -773,7 +798,6 @@ private:
         tutorialBtn_ = new QPushButton(QStringLiteral("教程"));
         tutorialBtn_->setFixedHeight(34);
         tutorialBtn_->setCursor(Qt::PointingHandCursor);
-        tutorialBtn_->setToolTip(QStringLiteral("查看使用教程"));
         QObject::connect(tutorialBtn_, &QPushButton::clicked, this, [this]() {
             showTutorialDialog(this);
         });
@@ -788,7 +812,7 @@ private:
 
         auto* desc = new QLabel(
             QStringLiteral("透明悬浮窗，叠加在直播软件上方显示弹幕。"
-                           "窗口采集请在直播伴侣素材设置-高级设置-选择绿幕抠图（10.5+）。"));
+                           "窗口采集请在直播伴侣素材里开启透明背景。"));
         desc->setWordWrap(true);
         desc->setObjectName(QStringLiteral("ToolTip"));
         cl->addWidget(desc);

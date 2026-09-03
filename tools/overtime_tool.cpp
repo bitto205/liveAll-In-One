@@ -415,6 +415,7 @@ public:
         auto* sbtn = new QPushButton(QStringLiteral("搜索"), this);
         sbtn->setFixedSize(52, 30);
         sbtn->setCursor(Qt::PointingHandCursor);
+        liveaio::util::suppressButtonFocus(sbtn);
         QObject::connect(sbtn, &QPushButton::clicked, this, [this]() { refreshGrid(); });
         sr->addWidget(search_, 1);
         sr->addWidget(sbtn);
@@ -465,7 +466,7 @@ public:
             " border-radius: 4px; font-size: 12px; }"
             "QPushButton:hover { border-color: %2; }"
             "QLabel { background: transparent; border: none; color: %3; }"
-        ).arg(C.card, C.activeLine, C.text, C.border));
+        ).arg(C.card, C.activeLine, C.text, C.border) + liveaio::util::popupChromeQss());
     }
 
 protected:
@@ -853,9 +854,11 @@ public:
 
     void setOnPush(std::function<void(const QString&, int)> cb) { onPush_ = std::move(cb); }
 
+    void setClosedTip(const QString& tip) { closedTip_ = tip; }
+
     void setPushEnabled(bool enabled) {
         pushBtn_->setEnabled(enabled);
-        pushBtn_->setToolTip(enabled ? QString() : QStringLiteral("请先打开加班机悬浮窗"));
+        pushBtn_->setToolTip(enabled ? QString() : closedTip_);
     }
 
     void refreshTheme() {
@@ -944,6 +947,7 @@ private:
     }
 
     QString gift_;
+    QString closedTip_ = QStringLiteral("请先打开加班机悬浮窗");
     QPushButton* pickBtn_ = nullptr;
     QLabel* iconLbl_ = nullptr;
     IntField* count_ = nullptr;
@@ -1325,7 +1329,7 @@ public:
             "#UserTimeStatsTable QScrollBar::add-line:vertical,"
             "#UserTimeStatsTable QScrollBar::sub-line:vertical { height: 0; }"
         ).arg(C.text, C.bg, QString::number(kWinRadius), C.winEdge, C.textMuted, C.closeHover,
-              C.card, C.hover, C.sidebar));
+              C.card, C.hover, C.sidebar) + liveaio::util::popupChromeQss());
         hint_->setStyleSheet(QStringLiteral("color: %1; font-size: 12px; background: transparent;")
                                  .arg(C.textMuted));
     }
@@ -1421,6 +1425,7 @@ private:
         closeBtn->setObjectName(QStringLiteral("UserTimeCloseBtn"));
         closeBtn->setFixedSize(32, 32);
         closeBtn->setCursor(Qt::PointingHandCursor);
+        liveaio::util::suppressButtonFocus(closeBtn);
         QObject::connect(closeBtn, &QPushButton::clicked, this, [this]() { close(); });
         tb->addWidget(title);
         tb->addStretch();
@@ -2017,6 +2022,47 @@ private:
     std::function<void()> onResume_;
 };
 
+static QJsonObject overtimeRuleToWire(const Rule& r) {
+    const bool isRandom = r.mode == QStringLiteral("随机");
+    QString mode = QStringLiteral("add");
+    if (r.mode == QStringLiteral("减")) mode = QStringLiteral("sub");
+    else if (isRandom) mode = QStringLiteral("random");
+    const QString unit = isRandom ? r.randomUnit : r.unit;
+    QString wireUnit = QStringLiteral("s");
+    if (unit == QStringLiteral("时")) wireUnit = QStringLiteral("h");
+    else if (unit == QStringLiteral("分")) wireUnit = QStringLiteral("m");
+    return QJsonObject{
+        {QStringLiteral("gift"), r.gift},
+        {QStringLiteral("mode"), mode},
+        {QStringLiteral("value"), r.value},
+        {QStringLiteral("unit"), wireUnit},
+        {QStringLiteral("min"), isRandom ? -r.randomNeg : 0},
+        {QStringLiteral("max"), isRandom ? r.randomPos : 0},
+    };
+}
+
+static void pushOvertimeSettingsToCore(const Settings& s) {
+    if (!g_sendPacket) return;
+    QJsonArray rules;
+    for (const Rule& r : s.rules) rules.push_back(overtimeRuleToWire(r));
+    g_sendPacket(QJsonObject{
+        {QStringLiteral("op"), QStringLiteral("tool.overtime.set")},
+        {QStringLiteral("settings"), QJsonObject{
+            {QStringLiteral("hours"), s.hours},
+            {QStringLiteral("minutes"), s.minutes},
+            {QStringLiteral("seconds"), s.seconds},
+            {QStringLiteral("rules"), rules},
+        }},
+    });
+}
+
+static void sendOvertimeCommand(const QString& cmd) {
+    if (g_sendPacket) g_sendPacket(QJsonObject{
+        {QStringLiteral("op"), QStringLiteral("tool.overtime.cmd")},
+        {QStringLiteral("cmd"), cmd},
+    });
+}
+
 class OvertimeOverlayController final : public QObject {
 public:
     explicit OvertimeOverlayController(QObject* parent = nullptr) : QObject(parent) {}
@@ -2031,7 +2077,7 @@ public:
         auto& host = OverlayHostService::instance();
         const QSize def = defaultWindowSize();
         root_ = nullptr;
-        auto* shell = host.shell();
+        auto* shell = host.shell(OverlayToolId::Overtime);
         root_ = new OvertimeRoot(shell, [this]() { onFrameResumed(); });
         host.show(OverlayToolId::Overtime, QStringLiteral("加班机"),
                   QStringLiteral("overtime_window_geometry"),
@@ -2106,7 +2152,9 @@ public:
 private:
     void onFrameResumed() {
         if (!root_) return;
-        if (auto* shell = OverlayHostService::instance().shell()) shell->syncRadiusAfterResize();
+        if (auto* shell = OverlayHostService::instance().shell(OverlayToolId::Overtime)) {
+            shell->syncRadiusAfterResize();
+        }
         root_->block()->setRemainingDisplay(remaining_);
         if (!lastLogLeft_.isEmpty()) root_->block()->setGiftLog(lastLogLeft_, lastLogDelta_);
     }
@@ -2176,15 +2224,19 @@ public:
     void toggleOverlay(const Settings& settings, std::function<void()> onClosed) {
         auto& host = OverlayHostService::instance();
         if (host.isToolActive(OverlayToolId::Overtime)) {
-            host.teardown();
+            host.teardown(OverlayToolId::Overtime);
             return;
         }
+        pushOvertimeSettingsToCore(settings);
+        sendOvertimeCommand(QStringLiteral("clear_ledger"));
+        sendOvertimeCommand(QStringLiteral("reset"));
         if (!overlayCtrl_) overlayCtrl_ = new OvertimeOverlayController(this);
         overlayCtrl_->userLedger()->setOnChanged([this]() {
             if (ledgerSync_) ledgerSync_();
         });
         overlayCtrl_->show(settings, [this, onClosed]() {
             if (overlayCtrl_) overlayCtrl_->userLedger()->setOnChanged(nullptr);
+            sendOvertimeCommand(QStringLiteral("pause"));
             if (onClosed) onClosed();
             if (tryRelease_) tryRelease_();
         });
@@ -2293,7 +2345,8 @@ private:
             "QLineEdit, QTextEdit { background: %8; color: %2; border: 1px solid %4;"
             " border-radius: 6px; padding: 4px 8px; font-size: 13px; }"
             "QLineEdit:focus, QTextEdit:focus { border-color: %7; }"
-        ).arg(C.bg, C.text, C.sidebar, C.border, C.textMuted, C.hover, C.activeLine, C.card);
+        ).arg(C.bg, C.text, C.sidebar, C.border, C.textMuted, C.hover, C.activeLine, C.card)
+            + liveaio::util::popupChromeQss();
     }
 
     static QLabel* pageTitle(const QString& text) {
@@ -2349,6 +2402,7 @@ private:
             btn->setFixedHeight(46);
             btn->setCursor(Qt::PointingHandCursor);
             btn->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+            liveaio::util::suppressButtonFocus(btn);
             QObject::connect(btn, &QPushButton::clicked, this, [this, i]() { navigate(i); });
             navBtns_.append(btn);
             tb->addWidget(btn);
@@ -2401,7 +2455,6 @@ private:
         tutorialBtn_ = new QPushButton(QStringLiteral("教程"), card);
         tutorialBtn_->setFixedHeight(34);
         tutorialBtn_->setCursor(Qt::PointingHandCursor);
-        tutorialBtn_->setToolTip(QStringLiteral("查看使用教程"));
         QObject::connect(tutorialBtn_, &QPushButton::clicked, this, [this]() {
             showTutorialDialog(this);
         });
@@ -2415,7 +2468,7 @@ private:
         cl->addLayout(row);
         cl->addWidget(cardDesc(
             QStringLiteral("透明悬浮窗，叠加在直播软件上方显示加班倒计时。"
-                           "窗口采集请在直播伴侣素材设置-高级设置-选择绿幕抠图（10.5+）。")));
+                           "窗口采集请在直播伴侣素材里开启透明背景。")));
         lay->addWidget(card);
 
         auto* themeCard = makeCard();
@@ -2560,11 +2613,7 @@ private:
     void toggleOverlay() {
         if (!runtime_) return;
         const Settings s = loadSettings();
-        pushSettings(s);
-        sendCommand(QStringLiteral("clear_ledger"));
-        sendCommand(QStringLiteral("reset"));
         runtime_->toggleOverlay(s, [this]() {
-            sendCommand(QStringLiteral("pause"));
             refreshOpenBtn();
             syncUserTimeLedger();
         });

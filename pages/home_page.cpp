@@ -199,7 +199,6 @@ private:
         desc->setWordWrap(false);
         desc->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
         desc->setFixedHeight(QFontMetrics(desc->font()).height());
-        desc->setToolTip(meta.desc);
         lay->addWidget(desc);
 
         labels_.insert(route, CardLabels{name, badge, desc});
@@ -633,7 +632,7 @@ private:
             connBtn_->setText(QStringLiteral("断开连接"));
             connBtn_->setEnabled(true);
             connBtn_->setStyleSheet(qssDanger(44));
-            connLabel_->setText(QStringLiteral("✅  已连接"));
+            connLabel_->setText(QStringLiteral("✅  监听中"));
             connLabel_->setStyleSheet(qssAccentLabel());
             connLabel_->setVisible(true);
             break;
@@ -1209,7 +1208,7 @@ inline void WebRoutePage::onStatusChange(bool connected) {
         preempted_ = false;
         wasConnecting_ = false;
         setConnState(BtnState::Connected);
-        toast(QStringLiteral("直播间连接成功 🎉"));
+        toast(QStringLiteral("直播间已连接"));
         return;
     }
     if (preempted_) {
@@ -1275,7 +1274,7 @@ inline void Route3Page::onStatusChange(bool connected) {
         preempted_ = false;
         wasConnecting_ = false;
         setConnState(BtnState::Connected);
-        toast(QStringLiteral("直播间连接成功 🎉"));
+        toast(QStringLiteral("监听已开启，等待伴侣开播"));
         return;
     }
     if (preempted_) {
@@ -1285,14 +1284,14 @@ inline void Route3Page::onStatusChange(bool connected) {
     const bool wasConnected = state_ == BtnState::Connected;
     if (wasConnecting_ && !wasConnected) {
         setConnState(BtnState::Error);
-        connLabel_->setText(QStringLiteral("⚠️  直播间已断开或没有连接"));
+        connLabel_->setText(QStringLiteral("⚠️  启动失败，请检查环境后重试"));
         connLabel_->setStyleSheet(qssErrorLabel());
         connLabel_->setVisible(true);
-        toast(QStringLiteral("直播间已断开"), true);
+        toast(QStringLiteral("启动失败"), true);
     } else {
         setConnState(BtnState::Idle);
         connLabel_->setVisible(false);
-        if (wasConnected) toast(QStringLiteral("直播已断开"), true);
+        if (wasConnected) toast(QStringLiteral("已断开连接"));
     }
     wasConnecting_ = false;
 }
@@ -1347,7 +1346,7 @@ inline void Route4Page::onStatusChange(bool connected) {
         preempted_ = false;
         wasConnecting_ = false;
         setConnState(BtnState::Connected);
-        toast(QStringLiteral("直播间连接成功 🎉"));
+        toast(QStringLiteral("直播间已连接"));
         return;
     }
     if (preempted_) {

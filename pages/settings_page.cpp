@@ -32,6 +32,7 @@ public:
         setFixedHeight(46);
         setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
         setCursor(Qt::PointingHandCursor);
+        liveaio::util::suppressButtonFocus(this);
     }
 
     void setActive(bool on) {

@@ -3,7 +3,9 @@
 ## 数据
 - `gift/gift_info.json` + `gift/icon/*` — 礼物图鉴与图标
 - `skin/<tool>/<id>/skin.json` — 工具皮肤
-- `image/` — 应用图标等
+- `image/` — 应用图标与小游戏素材
+  - `zaidoopro-painting-8032889.png` — 捡叶子叶子贴图（约 0.5×0.5 cm 绘制）
+  - `trash_can.png` / `trash_can_open.png` — 捡叶子翻盖垃圾桶（合盖 / 开盖）
 
 ## 接口归属
 | 能力 | Go | C++ |

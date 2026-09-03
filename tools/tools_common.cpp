@@ -3,8 +3,11 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QChildEvent>
 #include <QCloseEvent>
+#include <QCursor>
 #include <QDir>
+#include <QEnterEvent>
 #include <QFile>
 #include <QFormLayout>
 #include <QFrame>
@@ -13,11 +16,13 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
+#include <QLineF>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMainWindow>
 #include <QMap>
 #include <QObject>
+#include <QPointer>
 #include <QPushButton>
 #include <QScreen>
 #include <QScrollArea>
@@ -74,6 +79,8 @@ static const QList<ToolMeta>& toolCatalog() {
          QStringLiteral("透明悬浮弹幕显示窗口"), QStringLiteral("💬")},
         {QStringLiteral("overtime"), QStringLiteral("加班机"),
          QStringLiteral("透明悬浮加班显示窗口"), QStringLiteral("⏱")},
+        {QStringLiteral("leaf"), QStringLiteral("捡叶子"),
+         QStringLiteral("送礼堆叶子，拖到垃圾桶消除"), QStringLiteral("🍃")},
     };
     return catalog;
 }
@@ -300,6 +307,7 @@ public:
             btn->setFixedHeight(barHeight);
             btn->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
             btn->setCursor(Qt::PointingHandCursor);
+            liveaio::util::suppressButtonFocus(btn);
             QObject::connect(btn, &QPushButton::clicked, this, [this, i]() { switchTab(i); });
             tabs_.append(btn);
             tb->addWidget(btn);
@@ -376,11 +384,16 @@ class RippleOverlayRoot : public QWidget {
 public:
     static constexpr int kBorderW = 2;
     static constexpr int kTopbarH = 32;
-    static constexpr int kResizeHit = 8;
-    static constexpr int kCircleD = 14;
-    static constexpr int kCircleOff = 5;
-    static constexpr int kAnimMs = 280;
+    static constexpr int kResizeHit = 18;
     static constexpr int kBtnW = 32;
+    static constexpr int kIconDraw = 18;
+    static constexpr int kCircleOff = 0;
+    static constexpr qreal kIconStroke = 1.35;
+    static constexpr qreal kIconBoxRadius = 2.0;
+    static constexpr qreal kIconBoxInset = 4.8;
+    static constexpr int kAnimMs = 320;
+    static constexpr int kLockAnimMs = 180;
+    static constexpr int kHoverAnimMs = 120;
 
     explicit RippleOverlayRoot(QMainWindow* win, QWidget* parent = nullptr)
         : QWidget(parent), win_(win) {
@@ -389,34 +402,37 @@ public:
         freeze_ = std::make_unique<liveaio::util::OverlayResizeFreeze>(
             win, [this]() { handleResizeResume(); });
 
-        btnBox_ = new QWidget(this);
-        auto* btnLay = new QHBoxLayout(btnBox_);
-        btnLay->setContentsMargins(0, 0, 0, 0);
-        btnLay->setSpacing(0);
-        minBtn_ = new QPushButton(QStringLiteral("─"), btnBox_);
-        minBtn_->setToolTip(QStringLiteral("收起边框并置底（保持渲染）"));
-        closeBtn_ = new QPushButton(QStringLiteral("✕"), btnBox_);
-        for (auto* btn : {minBtn_, closeBtn_}) {
-            btn->setCursor(Qt::ArrowCursor);
-            btnLay->addWidget(btn);
-        }
-        btnBox_->setVisible(false);
-        QObject::connect(minBtn_, &QPushButton::clicked, this, [this]() {
-            if (onMinimize_) onMinimize_();
-        });
-        QObject::connect(closeBtn_, &QPushButton::clicked, this, [this]() { win_->close(); });
+        leftBox_ = new QWidget(this);
+        auto* leftLay = new QHBoxLayout(leftBox_);
+        leftLay->setContentsMargins(kCircleOff, 0, 0, 0);
+        leftLay->setSpacing(0);
+        leftLay->setAlignment(Qt::AlignVCenter);
 
-        circle_ = new CircleButton(this);
-        circle_->move(kCircleOff, kCircleOff);
-        circle_->raise();
-        QObject::connect(circle_, &QPushButton::clicked, this, [this]() {
-            if (onCircleClicked_) onCircleClicked_();
+        frame_ = new FrameBoxButton(leftBox_);
+        QObject::connect(frame_, &QPushButton::clicked, this, [this]() {
+            if (onFrameClicked_) onFrameClicked_();
+        });
+        leftLay->addWidget(frame_);
+
+        lock_ = new LockBoxButton(leftBox_);
+        QObject::connect(lock_, &QPushButton::clicked, this, [this]() {
+            if (onLockClicked_) onLockClicked_();
+        });
+        leftLay->addWidget(lock_);
+
+        hideTimer_ = new QTimer(this);
+        hideTimer_->setSingleShot(true);
+        hideTimer_->setInterval(2000);
+        QObject::connect(hideTimer_, &QTimer::timeout, this, [this]() {
+            if (transitioning_) return;
+            if (!pointerNearControls()) hideControlsNow();
         });
 
         content_ = new QWidget(this);
         content_->setAttribute(Qt::WA_TranslucentBackground);
         content_->setAttribute(Qt::WA_TransparentForMouseEvents);
         content_->setStyleSheet(QStringLiteral("background: transparent;"));
+        watchMouseTree(content_);
 
         refreshChrome();
         liveaio::util::onThemeChange(this, [this](const QString&) {
@@ -425,25 +441,82 @@ public:
         });
     }
 
-    void setOnCircleClicked(std::function<void()> cb) { onCircleClicked_ = std::move(cb); }
+    void setOnFrameClicked(std::function<void()> cb) { onFrameClicked_ = std::move(cb); }
+    void setOnLockClicked(std::function<void()> cb) { onLockClicked_ = std::move(cb); }
     void setOnMinimize(std::function<void()> cb) { onMinimize_ = std::move(cb); }
+    void setOnClose(std::function<void()> cb) { onClose_ = std::move(cb); }
+
+    void setChromeState(bool borderShown, bool locked, bool transitioning) {
+        borderShown_ = borderShown;
+        locked_ = locked;
+        transitioning_ = transitioning;
+        if (transitioning) {
+            hideTimer_->stop();
+            frame_->setProgress(borderShown ? 1.0 : 0.0, true);
+            lock_->setLocked(locked);
+        } else {
+            frame_->setProgress(borderShown ? 1.0 : 0.0, false);
+            lock_->setLocked(locked);
+            lock_->setAccentProgress(borderShown ? 1.0 : 0.0);
+        }
+        refreshControlVisibility();
+    }
 
     bool resizeFrozen() const { return freeze_->frozen(); }
     QWidget* content() const { return content_; }
     qreal radius() const { return r_; }
 
+    // 空白处点穿到后面的窗口；只拦边框/按钮，以及子类声明的内容命中。
+    bool wantsMouseAt(const QPoint& local) const {
+        if (dragging_ || resizing_) return true;
+        if (auto* grab = QWidget::mouseGrabber()) {
+            if (grab == this || isAncestorOf(grab) || grab == win_) return true;
+        }
+        if (leftBox_ && leftBox_->isVisible() && leftBox_->geometry().contains(local)) {
+            return true;
+        }
+        const QPoint center(static_cast<int>(centerX()), static_cast<int>(centerY()));
+        if (QLineF(local, center).length() <= proximityRadiusPx()) return true;
+        if (!locked_) {
+            if (borderShown_ && local.y() >= 0 && local.y() < kTopbarH) return true;
+            if (edgeAt(local) != Edge::None) return true;
+            if (minBtnRect().contains(local) || closeBtnRect().contains(local)) return true;
+        }
+        if (content_ && content_->geometry().contains(local)) {
+            const QPoint cp(local.x() - content_->x(), local.y() - content_->y());
+            if (contentWantsMouse(cp)) return true;
+        }
+        return false;
+    }
+
+    void syncHoverCursor(const QPoint& local) {
+        updateProximity(local);
+        updateBorderActionHover(local);
+        if (locked_) return;
+        const Edge edge = edgeAt(local);
+        if (edge != Edge::None) {
+            applyCursor(cursorFor(edge), local);
+            return;
+        }
+        if (local.y() >= 0 && local.y() < kTopbarH) {
+            applyCursor(Qt::ArrowCursor, local);
+        }
+    }
+
     qreal maxRadius() const {
-        const qreal c = centerOffset();
-        return std::max(std::max(std::hypot(c, c), std::hypot(width() - c, c)),
-                        std::max(std::hypot(c, height() - c),
-                                 std::hypot(width() - c, height() - c)));
+        const qreal cx = centerX();
+        const qreal cy = centerY();
+        return std::max(std::max(std::hypot(cx, cy), std::hypot(width() - cx, cy)),
+                        std::max(std::hypot(cx, height() - cy),
+                                 std::hypot(width() - cx, height() - cy)));
     }
 
     void setRadius(qreal r) {
         r_ = r;
-        // 用可见性而不是 setMask 控制按钮，避免半透明窗上 mask 抖动。
-        btnBox_->setVisible(r >= std::hypot(width() - centerOffset(),
-                                            kTopbarH - centerOffset()));
+        const qreal maxR = std::max(maxRadius(), 1.0);
+        const qreal progress = std::clamp(r_ / maxR, 0.0, 1.0);
+        frame_->setProgress(progress, false);
+        lock_->setAccentProgress(progress);
         update();
     }
 
@@ -464,7 +537,11 @@ protected:
     virtual void onContentGeometryChanged() {}
     // 拖拽中低帧率刷新内容（默认走完整布局；加班机等可改成轻量布局）。
     virtual void onContentGeometryWhileResizing() { onContentGeometryChanged(); }
+    virtual void onResizeBegin() {}
     virtual void onResizeResume() {}
+    // 叶子等需要缩放同帧更新碰撞/绘制时返回 true，跳过节流。
+    virtual bool wantsSyncResizeLayout() const { return false; }
+    virtual bool contentWantsMouse(const QPoint&) const { return false; }
 
     QMainWindow* hostWindow() const { return win_; }
     bool resizing() const { return resizing_; }
@@ -472,13 +549,14 @@ protected:
     void paintEvent(QPaintEvent*) override {
         if (r_ <= 0) return;
         const auto& C = theme();
-        const qreal c = centerOffset();
+        const qreal cx = centerX();
+        const qreal cy = centerY();
 
         QPainter p(this);
         // 拖拽缩放时关抗锯齿，降低半透明窗圆形 clip 的重绘成本。
         p.setRenderHint(QPainter::Antialiasing, !resizing_);
         QPainterPath clip;
-        clip.addEllipse(c - r_, c - r_, r_ * 2, r_ * 2);
+        clip.addEllipse(cx - r_, cy - r_, r_ * 2, r_ * 2);
         p.setClipPath(clip);
 
         p.setPen(Qt::NoPen);
@@ -493,36 +571,59 @@ protected:
         p.drawLine(hw, 0, hw, height());
         p.drawLine(width() - hw, 0, width() - hw, height());
         p.drawLine(0, height() - hw, width(), height() - hw);
+
+        // 最小化/关闭画在边框 clip 内，与波纹同帧渲染，避免独立控件 mask 闪烁。
+        paintBorderActionButtons(p);
     }
 
     void resizeEvent(QResizeEvent* event) override {
         QWidget::resizeEvent(event);
-        const int btnTotal = kBtnW * 2;
-        btnBox_->setGeometry(width() - btnTotal, 0, btnTotal, kTopbarH);
+        const int leftTotal = kCircleOff + kBtnW * 2;
+        leftBox_->setGeometry(0, 0, leftTotal, kTopbarH);
         content_->setGeometry(0, kTopbarH, width(), height() - kTopbarH);
         // 边框已展开时半径跟随窗口，否则放大后圆形 clip 会裁掉新边框。
         if (freeze_->frozen() && r_ > kTopbarH * 0.5) r_ = maxRadius();
         update();
-        if (freeze_->frozen()) {
+        if (freeze_->frozen() && !wantsSyncResizeLayout()) {
             requestThrottledContentLayout();
         } else {
             onContentGeometryChanged();
         }
     }
 
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (event->type() == QEvent::ChildAdded) {
+            if (auto* w = qobject_cast<QWidget*>(static_cast<QChildEvent*>(event)->child())) {
+                watchMouseTree(w);
+            }
+            return QWidget::eventFilter(watched, event);
+        }
+        auto* w = qobject_cast<QWidget*>(watched);
+        if (!w || !content_ || locked_) return QWidget::eventFilter(watched, event);
+        if (w != content_ && !content_->isAncestorOf(w)) {
+            return QWidget::eventFilter(watched, event);
+        }
+        const auto type = event->type();
+        if (type != QEvent::MouseButtonPress && type != QEvent::MouseMove
+            && type != QEvent::MouseButtonRelease) {
+            return QWidget::eventFilter(watched, event);
+        }
+        auto* me = static_cast<QMouseEvent*>(event);
+        const QPoint local = w->mapTo(this, me->position().toPoint());
+        const QPoint global = me->globalPosition().toPoint();
+        if (tryChromeMouse(type, local, global, me->buttons(), me->button())) {
+            return true;
+        }
+        return QWidget::eventFilter(watched, event);
+    }
+
     void mousePressEvent(QMouseEvent* event) override {
         if (event->button() != Qt::LeftButton) return;
+        if (locked_) return;
         if (!win_->isActiveWindow()) win_->raise();
         const QPoint pos = event->position().toPoint();
-        const Edge edge = edgeAt(pos);
-        if (edge != Edge::None) {
-            freeze_->begin();
-            resizing_ = true;
-            resizeEdge_ = edge;
-            resizeStartGeo_ = win_->geometry();
-            resizeStartPos_ = event->globalPosition().toPoint();
-            return;
-        }
+        if (handleBorderActionPress(pos)) return;
+        if (beginResizeAt(pos, event->globalPosition().toPoint())) return;
         if (pos.y() < kTopbarH && r_ > kTopbarH * 0.5) {
             dragging_ = true;
             dragAnchor_ = event->globalPosition().toPoint() - win_->pos();
@@ -530,69 +631,371 @@ protected:
     }
 
     void mouseMoveEvent(QMouseEvent* event) override {
+        const QPoint pos = event->position().toPoint();
+        if (locked_) {
+            updateProximity(pos);
+            updateBorderActionHover(pos);
+            applyCursor(Qt::ArrowCursor, pos);
+            return;
+        }
         const QPoint gpos = event->globalPosition().toPoint();
         if (event->buttons() & Qt::LeftButton) {
-            if (resizing_) {
-                const QRect geo = resizeGeometry(
-                    resizeEdge_, gpos - resizeStartPos_, resizeStartGeo_);
-                if (geo.width() >= win_->minimumWidth()
-                    && geo.height() >= win_->minimumHeight()) {
-                    win_->setGeometry(geo);
-                }
-                return;
-            }
+            updateProximity(pos);
+            updateBorderActionHover(pos);
+            if (applyResizeDrag(gpos)) return;
             if (dragging_) {
                 win_->move(gpos - dragAnchor_);
                 return;
             }
         }
-        setCursor(cursorFor(edgeAt(event->position().toPoint())));
+        syncHoverCursor(pos);
+    }
+
+    void enterEvent(QEnterEvent* event) override {
+        QWidget::enterEvent(event);
+        updateProximity(event->position().toPoint());
+        updateBorderActionHover(event->position().toPoint());
+    }
+
+    void leaveEvent(QEvent* event) override {
+        QWidget::leaveEvent(event);
+        if (hoverAction_ != BorderAction::None) {
+            hoverAction_ = BorderAction::None;
+            update();
+        }
+        if (controlsNear_ && !hideTimer_->isActive()) hideTimer_->start();
     }
 
     void mouseReleaseEvent(QMouseEvent*) override {
-        const bool wasResize = resizing_;
-        dragging_ = false;
-        resizing_ = false;
-        resizeEdge_ = Edge::None;
-        setCursor(Qt::ArrowCursor);
-        if (wasResize) freeze_->end();
+        endResizeDrag();
     }
 
 private:
-    // 左上角圆圈：始终可见，点击切换边框。
-    class CircleButton final : public QPushButton {
+    enum class BorderAction { None, Minimize, Close };
+
+    static QPen crispIconPen(const QColor& color) {
+        QPen pen(color, kIconStroke, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+        pen.setCosmetic(false);
+        return pen;
+    }
+
+    static void beginCrispIconPaint(QPainter& p, const QWidget* w) {
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setRenderHint(QPainter::TextAntialiasing, false);
+        p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+        const qreal padX = (w->width() - kIconDraw) / 2.0;
+        const qreal padY = (w->height() - kIconDraw) / 2.0;
+        p.translate(padX, padY);
+    }
+
+    static QRectF iconBox() {
+        return QRectF(kIconBoxInset, kIconBoxInset,
+                      kIconDraw - kIconBoxInset * 2.0,
+                      kIconDraw - kIconBoxInset * 2.0);
+    }
+
+    static QColor accentIconColor(qreal accent) {
+        const QColor expanded(theme().text);
+        const QColor collapsed(148, 148, 148);
+        const qreal t = std::clamp(accent, 0.0, 1.0);
+        return QColor(
+            static_cast<int>(collapsed.red() + (expanded.red() - collapsed.red()) * t),
+            static_cast<int>(collapsed.green() + (expanded.green() - collapsed.green()) * t),
+            static_cast<int>(collapsed.blue() + (expanded.blue() - collapsed.blue()) * t));
+    }
+
+    static void drawCrispRoundBox(QPainter& p, const QRectF& box, qreal radius,
+                                  const QColor& color, qreal fillStrength = 0.0) {
+        p.setPen(crispIconPen(color));
+        if (fillStrength > 0.001) {
+            QColor fill = color;
+            fill.setAlphaF(std::clamp(fillStrength, 0.0, 1.0));
+            p.setBrush(fill);
+        } else {
+            p.setBrush(Qt::NoBrush);
+        }
+        p.drawRoundedRect(box, radius, radius);
+    }
+
+    static void startHoverAnimation(QVariantAnimation* anim, qreal from, qreal to) {
+        anim->stop();
+        anim->setStartValue(from);
+        anim->setEndValue(to);
+        anim->start();
+    }
+
+    static void polishChromeButton(QPushButton* btn) {
+        liveaio::util::polishFlatChromeButton(btn);
+    }
+
+    QRect minBtnRect() const { return QRect(width() - kBtnW * 2, 0, kBtnW, kTopbarH); }
+    QRect closeBtnRect() const { return QRect(width() - kBtnW, 0, kBtnW, kTopbarH); }
+
+    bool borderActionsEnabled() const {
+        return borderShown_ && !transitioning_ && !locked_;
+    }
+
+    BorderAction hitBorderAction(const QPoint& pos) const {
+        if (pos.y() < 0 || pos.y() >= kTopbarH) return BorderAction::None;
+        if (closeBtnRect().contains(pos)) return BorderAction::Close;
+        if (minBtnRect().contains(pos)) return BorderAction::Minimize;
+        return BorderAction::None;
+    }
+
+    bool handleBorderActionPress(const QPoint& pos) {
+        if (!borderActionsEnabled()) return false;
+        switch (hitBorderAction(pos)) {
+        case BorderAction::Minimize:
+            if (onMinimize_) onMinimize_();
+            return true;
+        case BorderAction::Close:
+            // 工具关闭按钮直接注销宿主槽，不绕一轮窗口关闭事件。
+            if (onClose_) onClose_();
+            else win_->close();
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    void updateBorderActionHover(const QPoint& pos) {
+        const BorderAction next = borderActionsEnabled() ? hitBorderAction(pos) : BorderAction::None;
+        if (next == hoverAction_) return;
+        hoverAction_ = next;
+        update(QRect(width() - kBtnW * 2, 0, kBtnW * 2, kTopbarH));
+    }
+
+    void paintBorderActionButtons(QPainter& p) {
+        const auto& C = theme();
+        auto paintOne = [&](const QRect& rect, const QString& label, bool closeStyle) {
+            const bool hovered = borderActionsEnabled()
+                && ((closeStyle && hoverAction_ == BorderAction::Close)
+                    || (!closeStyle && hoverAction_ == BorderAction::Minimize));
+            if (hovered) {
+                p.fillRect(rect, QColor(closeStyle ? C.closeHover : C.btnHover));
+            }
+            const QColor base(C.textMuted);
+            const QColor hot(closeStyle ? QStringLiteral("#ffffff") : C.text);
+            p.setPen(hovered ? hot : base);
+            QFont f = font();
+            f.setPixelSize(14);
+            f.setStyleStrategy(QFont::PreferAntialias);
+            p.setFont(f);
+            p.setRenderHint(QPainter::TextAntialiasing, true);
+            p.drawText(rect, Qt::AlignHCenter | Qt::AlignVCenter, label);
+        };
+        paintOne(minBtnRect(), QStringLiteral("─"), false);
+        paintOne(closeBtnRect(), QStringLiteral("✕"), true);
+    }
+
+    // 边框按钮：悬浮框显示时为横线，隐藏时展开为圆角方框。
+    class FrameBoxButton final : public QPushButton {
     public:
-        explicit CircleButton(QWidget* parent) : QPushButton(parent) {
-            setFixedSize(kCircleD, kCircleD);
+        explicit FrameBoxButton(QWidget* parent) : QPushButton(parent) {
+            setFixedSize(kBtnW, kTopbarH);
             setCursor(Qt::PointingHandCursor);
-            setFlat(true);
-            setStyleSheet(QStringLiteral("background: transparent; border: none;"));
-            setToolTip(QStringLiteral("显示/隐藏边框"));
+            polishChromeButton(this);
+
+            hoverAnim_ = new QVariantAnimation(this);
+            hoverAnim_->setDuration(kHoverAnimMs);
+            hoverAnim_->setEasingCurve(QEasingCurve::OutCubic);
+            QObject::connect(hoverAnim_, &QVariantAnimation::valueChanged, this,
+                             [this](const QVariant& v) {
+                hoverT_ = v.toReal();
+                update();
+            });
+        }
+
+        void setProgress(qreal value, bool animate) {
+            const qreal target = std::clamp(value, 0.0, 1.0);
+            if (!animate) {
+                shapeAnim_.stop();
+                shapeT_ = target;
+                update();
+                return;
+            }
+            shapeAnim_.stop();
+            shapeAnim_.setDuration(kLockAnimMs);
+            shapeAnim_.setEasingCurve(QEasingCurve::InOutCubic);
+            shapeAnim_.setStartValue(shapeT_);
+            shapeAnim_.setEndValue(target);
+            if (!shapeConnected_) {
+                shapeConnected_ = true;
+                QObject::connect(&shapeAnim_, &QVariantAnimation::valueChanged, this,
+                                 [this](const QVariant& v) {
+                    shapeT_ = v.toReal();
+                    update();
+                });
+            }
+            shapeAnim_.start();
         }
 
     protected:
-        void paintEvent(QPaintEvent*) override {
-            QPainter p(this);
-            p.setRenderHint(QPainter::Antialiasing);
-            p.setPen(Qt::NoPen);
-            p.setBrush(QColor(theme().border));
-            p.drawEllipse(0, 0, kCircleD, kCircleD);
+        bool event(QEvent* e) override {
+            if (e->type() == QEvent::Enter) {
+                startHoverAnimation(hoverAnim_, hoverT_, 1.0);
+            } else if (e->type() == QEvent::Leave) {
+                startHoverAnimation(hoverAnim_, hoverT_, 0.0);
+            }
+            return QPushButton::event(e);
         }
+
+        void paintEvent(QPaintEvent*) override {
+            const auto& C = theme();
+            QPainter p(this);
+            if (hoverT_ > 0.001) {
+                QColor fill(C.btnHover);
+                fill.setAlphaF(fill.alphaF() * hoverT_);
+                p.fillRect(rect(), fill);
+            }
+
+            beginCrispIconPaint(p, this);
+            // shapeT_=1 边框展开 → 显示「一」；shapeT_=0 边框收起 → 显示「口」
+            const qreal boxT = 1.0 - shapeT_;
+            const QColor color = accentIconColor(shapeT_);
+            const QRectF full = iconBox();
+            const qreal halfH = full.height() * boxT / 2.0;
+            const QRectF shape(full.left(), full.center().y() - halfH,
+                               full.width(), halfH * 2.0);
+            if (shape.height() <= kIconStroke) {
+                p.setPen(crispIconPen(color));
+                p.drawLine(QPointF(full.left(), full.center().y()),
+                           QPointF(full.right(), full.center().y()));
+            } else {
+                const qreal radius = std::min(kIconBoxRadius, shape.height() / 2.0);
+                drawCrispRoundBox(p, shape, radius, color);
+            }
+        }
+
+    private:
+        QVariantAnimation shapeAnim_{this};
+        QVariantAnimation* hoverAnim_ = nullptr;
+        qreal shapeT_ = 1.0;
+        qreal hoverT_ = 0.0;
+        bool shapeConnected_ = false;
     };
 
-    static qreal centerOffset() { return kCircleOff + kCircleD / 2.0; }
+    class LockBoxButton final : public QPushButton {
+    public:
+        explicit LockBoxButton(QWidget* parent) : QPushButton(parent) {
+            setFixedSize(kBtnW, kTopbarH);
+            setCursor(Qt::PointingHandCursor);
+            setFlat(true);
+            polishChromeButton(this);
+
+            lockAnim_ = new QVariantAnimation(this);
+            lockAnim_->setDuration(kLockAnimMs);
+            lockAnim_->setEasingCurve(QEasingCurve::OutCubic);
+            QObject::connect(lockAnim_, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
+                lockT_ = v.toReal();
+                update();
+            });
+
+            hoverAnim_ = new QVariantAnimation(this);
+            hoverAnim_->setDuration(kHoverAnimMs);
+            hoverAnim_->setEasingCurve(QEasingCurve::OutCubic);
+            QObject::connect(hoverAnim_, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
+                hoverT_ = v.toReal();
+                update();
+            });
+        }
+
+        void setLocked(bool locked) {
+            if (isLocked_ == locked) return;
+            isLocked_ = locked;
+            lockAnim_->stop();
+            lockAnim_->setStartValue(lockT_);
+            lockAnim_->setEndValue(locked ? 1.0 : 0.0);
+            lockAnim_->start();
+        }
+
+        void setAccentProgress(qreal progress) {
+            accentT_ = std::clamp(progress, 0.0, 1.0);
+            update();
+        }
+
+    protected:
+        bool event(QEvent* e) override {
+            if (e->type() == QEvent::Enter) {
+                startHoverAnimation(hoverAnim_, hoverT_, 1.0);
+            } else if (e->type() == QEvent::Leave) {
+                startHoverAnimation(hoverAnim_, hoverT_, 0.0);
+            }
+            return QPushButton::event(e);
+        }
+
+        void paintEvent(QPaintEvent*) override {
+            const auto& C = theme();
+            QPainter p(this);
+            p.setRenderHint(QPainter::Antialiasing, false);
+            const QRect r = rect();
+            if (hoverT_ > 0.001) {
+                QColor fill(C.btnHover);
+                fill.setAlpha(static_cast<int>(fill.alpha() * hoverT_));
+                p.fillRect(r, fill);
+            }
+
+            beginCrispIconPaint(p, this);
+            const QColor iconColor = accentIconColor(accentT_);
+            drawCrispRoundBox(p, iconBox(), kIconBoxRadius, iconColor, lockT_);
+        }
+
+    private:
+        bool isLocked_ = false;
+        qreal accentT_ = 1.0;
+        qreal lockT_ = 0.0;
+        qreal hoverT_ = 0.0;
+        QVariantAnimation* lockAnim_ = nullptr;
+        QVariantAnimation* hoverAnim_ = nullptr;
+    };
+
+    static qreal centerX() { return kCircleOff + kBtnW / 2.0; }
+    static qreal centerY() { return kTopbarH / 2.0; }
 
     void refreshChrome() {
-        const auto& C = theme();
-        const QString style = QStringLiteral(
-            "QPushButton { background: transparent; border: none; color: %1; font-size: 12px;"
-            " min-width: %2px; max-width: %2px; min-height: %3px; max-height: %3px; }"
-            "QPushButton:hover { background: %4; color: %5; }"
-        ).arg(C.textMuted, QString::number(kBtnW), QString::number(kTopbarH),
-              C.btnHover, C.text);
-        minBtn_->setStyleSheet(style);
-        closeBtn_->setStyleSheet(style);
-        circle_->update();
+        frame_->update();
+        lock_->update();
+        update(QRect(width() - kBtnW * 2, 0, kBtnW * 2, kTopbarH));
+    }
+
+    int proximityRadiusPx() const {
+        const QScreen* screen = win_ ? win_->screen() : QApplication::primaryScreen();
+        const qreal dpi = screen ? screen->logicalDotsPerInch() : 96.0;
+        return std::max(48, static_cast<int>(std::lround(dpi * 3.0 / 2.54)));
+    }
+
+    bool pointerNearControls() const {
+        const QPoint local = mapFromGlobal(QCursor::pos());
+        const QPoint center(static_cast<int>(centerX()), static_cast<int>(centerY()));
+        return QLineF(local, center).length() <= proximityRadiusPx();
+    }
+
+    void updateProximity(const QPoint& local) {
+        if (transitioning_) return;
+        const QPoint center(static_cast<int>(centerX()), static_cast<int>(centerY()));
+        if (QLineF(local, center).length() <= proximityRadiusPx()) {
+            hideTimer_->stop();
+            controlsNear_ = true;
+            refreshControlVisibility();
+        } else if (controlsNear_ && !hideTimer_->isActive()) {
+            hideTimer_->start();
+        }
+    }
+
+    void hideControlsNow() {
+        if (transitioning_) return;
+        controlsNear_ = false;
+        refreshControlVisibility();
+    }
+
+    void refreshControlVisibility() {
+        const bool showChrome = borderShown_ || controlsNear_ || transitioning_;
+        frame_->setVisible(showChrome);
+        lock_->setVisible(showChrome);
+        leftBox_->raise();
+        frame_->raise();
+        lock_->raise();
+        update(QRect(width() - kBtnW * 2, 0, kBtnW * 2, kTopbarH));
     }
 
     void requestThrottledContentLayout() {
@@ -610,6 +1013,109 @@ private:
         if (contentThrottle_) contentThrottle_->stop();
         onContentGeometryChanged();
         onResizeResume();
+    }
+
+    void watchMouseTree(QWidget* w) {
+        if (!w) return;
+        w->installEventFilter(this);
+        w->setMouseTracking(true);
+        const auto kids = w->findChildren<QWidget*>(Qt::FindDirectChildrenOnly);
+        for (QWidget* c : kids) watchMouseTree(c);
+    }
+
+    void applyCursor(Qt::CursorShape shape, const QPoint& local) {
+        auto set = [shape](QWidget* w) {
+            if (w && w->cursor().shape() != shape) w->setCursor(shape);
+        };
+        set(this);
+        set(win_);
+        set(content_);
+        if (QWidget* hit = childAt(local)) {
+            set(hit);
+            for (QWidget* p = hit->parentWidget(); p && p != this; p = p->parentWidget()) {
+                set(p);
+            }
+        }
+#ifdef Q_OS_WIN
+        LPCWSTR id = IDC_ARROW;
+        switch (shape) {
+        case Qt::SizeHorCursor: id = IDC_SIZEWE; break;
+        case Qt::SizeVerCursor: id = IDC_SIZENS; break;
+        case Qt::SizeFDiagCursor: id = IDC_SIZENWSE; break;
+        case Qt::SizeBDiagCursor: id = IDC_SIZENESW; break;
+        case Qt::OpenHandCursor:
+        case Qt::ClosedHandCursor: id = IDC_HAND; break;
+        default: break;
+        }
+        SetCursor(LoadCursor(nullptr, id));
+#endif
+    }
+
+    bool beginResizeAt(const QPoint& localPos, const QPoint& globalPos) {
+        const Edge edge = edgeAt(localPos);
+        if (edge == Edge::None) return false;
+        freeze_->begin();
+        resizing_ = true;
+        onResizeBegin();
+        resizeEdge_ = edge;
+        resizeStartGeo_ = win_->geometry();
+        resizeStartPos_ = globalPos;
+        applyCursor(cursorFor(edge), localPos);
+        grabMouse();
+        return true;
+    }
+
+    bool applyResizeDrag(const QPoint& globalPos) {
+        if (!resizing_) return false;
+        const QRect geo = resizeGeometry(resizeEdge_, globalPos - resizeStartPos_, resizeStartGeo_);
+        if (geo.width() >= win_->minimumWidth() && geo.height() >= win_->minimumHeight()
+            && geo.width() > 0 && geo.height() > 0) {
+            win_->setGeometry(geo);
+        }
+        return true;
+    }
+
+    void endResizeDrag() {
+        const bool wasResize = resizing_;
+        if (wasResize && QWidget::mouseGrabber() == this) releaseMouse();
+        dragging_ = false;
+        resizing_ = false;
+        resizeEdge_ = Edge::None;
+        applyCursor(Qt::ArrowCursor, mapFromGlobal(QCursor::pos()));
+        if (wasResize) freeze_->end();
+    }
+
+    // 内容层（叶子画布等）盖住边框热区时，仍由外壳处理缩放。
+    bool tryChromeMouse(QEvent::Type type, const QPoint& local, const QPoint& global,
+                        Qt::MouseButtons buttons, Qt::MouseButton button) {
+        if (type == QEvent::MouseButtonPress) {
+            if (button != Qt::LeftButton) return false;
+            if (locked_) return false;
+            if (!win_->isActiveWindow()) win_->raise();
+            if (handleBorderActionPress(local)) return true;
+            return beginResizeAt(local, global);
+        }
+        if (type == QEvent::MouseMove) {
+            updateProximity(local);
+            updateBorderActionHover(local);
+            if (locked_) return false;
+            if (buttons & Qt::LeftButton) {
+                if (applyResizeDrag(global)) return true;
+            }
+            if (resizing_) return true;
+            const Edge edge = edgeAt(local);
+            if (edge != Edge::None && !(buttons & Qt::LeftButton)) {
+                applyCursor(cursorFor(edge), local);
+                return true;
+            }
+            return false;
+        }
+        if (type == QEvent::MouseButtonRelease) {
+            if (!resizing_) return false;
+            endResizeDrag();
+            return true;
+        }
+        return false;
     }
 
     Edge edgeAt(const QPoint& pos) const {
@@ -638,16 +1144,23 @@ private:
     static constexpr int kContentThrottleMs = 80;  // 拖拽中内容约 12fps
 
     QMainWindow* win_ = nullptr;
-    QWidget* btnBox_ = nullptr;
+    QWidget* leftBox_ = nullptr;
     QWidget* content_ = nullptr;
-    QPushButton* minBtn_ = nullptr;
-    QPushButton* closeBtn_ = nullptr;
-    CircleButton* circle_ = nullptr;
+    FrameBoxButton* frame_ = nullptr;
+    LockBoxButton* lock_ = nullptr;
+    QTimer* hideTimer_ = nullptr;
     QTimer* contentThrottle_ = nullptr;
     std::unique_ptr<liveaio::util::OverlayResizeFreeze> freeze_;
-    std::function<void()> onCircleClicked_;
+    std::function<void()> onFrameClicked_;
+    std::function<void()> onLockClicked_;
     std::function<void()> onMinimize_;
+    std::function<void()> onClose_;
     qreal r_ = 0.0;
+    bool borderShown_ = true;
+    bool locked_ = false;
+    bool transitioning_ = false;
+    bool controlsNear_ = false;
+    BorderAction hoverAction_ = BorderAction::None;
     bool dragging_ = false;
     QPoint dragAnchor_;
     bool resizing_ = false;
@@ -665,13 +1178,20 @@ public:
         setAttribute(Qt::WA_QuitOnClose, false);
         liveaio::util::enableCaptureTransparency(this);
         setWindowTitle(title);
+        setStyleSheet(liveaio::util::popupChromeQss());
+        liveaio::util::onThemeChange(this, [this](const QString&) {
+            setStyleSheet(liveaio::util::popupChromeQss());
+        });
 
         anim_ = new QVariantAnimation(this);
         anim_->setDuration(RippleOverlayRoot::kAnimMs);
-        anim_->setEasingCurve(QEasingCurve::OutCubic);
+        anim_->setEasingCurve(QEasingCurve::OutQuart);
         QObject::connect(anim_, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
             animR_ = v.toReal();
             if (root_) root_->setRadius(animR_);
+        });
+        QObject::connect(anim_, &QVariantAnimation::finished, this, [this]() {
+            if (root_) root_->setChromeState(shown_, locked_, false);
         });
     }
 
@@ -688,11 +1208,63 @@ public:
 
     void toggleFrame() {
         if (!root_) return;
+        if (locked_ && !shown_) return;
         shown_ = !shown_;
         anim_->stop();
+        root_->setChromeState(shown_, locked_, true);
         anim_->setStartValue(animR_);
         anim_->setEndValue(shown_ ? std::max(root_->maxRadius(), 1.0) : 0.0);
         anim_->start();
+    }
+
+    void setFrameShown(bool shown) {
+        if (shown_ == shown || (shown && locked_)) return;
+        toggleFrame();
+    }
+
+    void setLocked(bool locked) {
+        if (locked_ == locked) return;
+        const bool wasLocked = locked_;
+        locked_ = locked;
+        if (locked_ && shown_) {
+            shown_ = false;
+            anim_->stop();
+            if (root_) root_->setChromeState(false, true, true);
+            anim_->setStartValue(animR_);
+            anim_->setEndValue(0.0);
+            anim_->start();
+            return;
+        }
+        if (!locked_ && wasLocked) {
+            shown_ = true;
+            anim_->stop();
+            if (root_) root_->setChromeState(true, false, true);
+            anim_->setStartValue(animR_);
+            anim_->setEndValue(root_ ? std::max(root_->maxRadius(), 1.0) : 0.0);
+            anim_->start();
+            return;
+        }
+        if (root_) root_->setChromeState(shown_, locked_, false);
+    }
+
+    bool frameShown() const { return shown_; }
+    bool locked() const { return locked_; }
+
+    bool applyChromeCommand(const QString& action) {
+        if (action == QStringLiteral("frame.toggle")) setFrameShown(!shown_);
+        else if (action == QStringLiteral("frame.show")) setFrameShown(true);
+        else if (action == QStringLiteral("frame.hide")) setFrameShown(false);
+        else if (action == QStringLiteral("lock.toggle")) setLocked(!locked_);
+        else if (action == QStringLiteral("lock")) setLocked(true);
+        else if (action == QStringLiteral("unlock")) setLocked(false);
+        else return false;
+        return true;
+    }
+
+    void resetChromeForOpen() {
+        anim_->stop();
+        shown_ = true;
+        locked_ = false;
     }
 
     void minimizeOverlay() {
@@ -731,12 +1303,13 @@ protected:
     void attachRoot(RippleOverlayRoot* root) {
         root_ = root;
         setCentralWidget(root_);
-        root_->setOnCircleClicked([this]() { toggleFrame(); });
+        root_->setOnFrameClicked([this]() { toggleFrame(); });
+        root_->setOnLockClicked([this]() { setLocked(!locked_); });
         root_->setOnMinimize([this]() { minimizeOverlay(); });
+        root_->setChromeState(shown_, locked_, false);
     }
 
     RippleOverlayRoot* root() const { return root_; }
-    bool frameShown() const { return shown_; }
     bool animRunning() const { return anim_->state() == QAbstractAnimation::Running; }
 
     void showEvent(QShowEvent* event) override {
@@ -751,6 +1324,7 @@ protected:
             animR_ = r;
             shown_ = true;
             root_->setRadius(r);
+            root_->setChromeState(true, locked_, false);
         });
     }
 
@@ -771,23 +1345,55 @@ protected:
         if (onClosed_) onClosed_();
     }
 
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override {
+#ifdef Q_OS_WIN
+        if (eventType == QByteArrayLiteral("windows_generic_MSG")
+            || eventType == QByteArrayLiteral("windows_dispatcher_MSG")) {
+            auto* msg = static_cast<MSG*>(message);
+            if (msg->message == WM_NCHITTEST && result) {
+                if (!root_) {
+                    *result = HTTRANSPARENT;
+                    return true;
+                }
+                const QPoint lp = root_->mapFromGlobal(QCursor::pos());
+                if (root_->wantsMouseAt(lp)) {
+                    root_->syncHoverCursor(lp);
+                    return QMainWindow::nativeEvent(eventType, message, result);
+                }
+                *result = HTTRANSPARENT;
+                return true;
+            }
+            if (msg->message == WM_SETCURSOR && result && root_) {
+                const QPoint lp = root_->mapFromGlobal(QCursor::pos());
+                if (root_->wantsMouseAt(lp)) {
+                    root_->syncHoverCursor(lp);
+                    *result = TRUE;
+                    return true;
+                }
+            }
+        }
+#endif
+        return QMainWindow::nativeEvent(eventType, message, result);
+    }
+
 private:
     QString geoKey_;
     RippleOverlayRoot* root_ = nullptr;
     QVariantAnimation* anim_ = nullptr;
     qreal animR_ = 0.0;
     bool shown_ = true;
+    bool locked_ = false;
     bool firstShow_ = true;
     std::function<void()> onClosed_;
 };
 
 class SharedOverlayShell final : public RippleOverlayWindow {
 public:
-    SharedOverlayShell()
-        : RippleOverlayWindow(QStringLiteral("悬浮窗"),
-                              QStringLiteral("overlay_shell_geometry")) {}
+    explicit SharedOverlayShell(const QString& key)
+        : RippleOverlayWindow(QStringLiteral("悬浮窗"), key) {}
 
     void prepare(const QString& title, const QString& geoKey, int minW, int minH, int defW, int defH) {
+        resetChromeForOpen();
         setWindowTitle(title);
         setGeometryKey(geoKey);
         setMinimumSize(minW, minH);
@@ -810,7 +1416,7 @@ public:
     bool hasMountedContent() const { return root() != nullptr; }
 };
 
-enum class OverlayToolId { None, Danmu, Overtime };
+enum class OverlayToolId { None, Danmu, Overtime, Leaf };
 
 class OverlayHostService final : public QObject {
 public:
@@ -819,70 +1425,110 @@ public:
         return *host;
     }
 
-    OverlayToolId activeTool() const { return active_; }
-    bool isVisible() const { return shell_ && shell_->isVisible(); }
-    bool isToolActive(OverlayToolId id) const { return active_ == id && isVisible(); }
+    bool isToolActive(OverlayToolId id) const {
+        const Slot* s = slot(id);
+        return s && s->shell && s->shell->isVisible() && s->shell->hasMountedContent();
+    }
 
-    SharedOverlayShell* shell() {
-        ensureShell();
-        return shell_;
+    SharedOverlayShell* shell(OverlayToolId id) {
+        Slot* s = slot(id);
+        if (!s) return nullptr;
+        ensureShell(id, *s);
+        return s->shell;
     }
 
     void show(OverlayToolId tool, const QString& title, const QString& geoKey, int minW, int minH,
               int defW, int defH, RippleOverlayRoot* root, std::function<void()> onClosed) {
         if (!root) return;
 
-        std::function<void()> prevClosed = closedCb_;
-        closedCb_ = std::move(onClosed);
+        Slot* s = slot(tool);
+        if (!s) return;
+        if (s->shell && s->shell->hasMountedContent()) detachContent(*s, s->closedCb);
+        s->closedCb = std::move(onClosed);
 
-        if (active_ != OverlayToolId::None || (shell_ && shell_->hasMountedContent())) {
-            detachContent(prevClosed);
-        }
-
-        ensureShell();
-        shell_->prepare(title, geoKey, minW, minH, defW, defH);
-        shell_->setOnClosed([this]() { teardown(closedCb_); });
-        shell_->mountRoot(root, destroyer_);
-        active_ = tool;
-        shell_->show();
-        shell_->activateWindow();
-        QTimer::singleShot(0, shell_, [this]() {
-            if (shell_) shell_->afterShowContent();
+        ensureShell(tool, *s);
+        s->shell->prepare(title, geoKey, minW, minH, defW, defH);
+        s->shell->setOnClosed([this, tool]() { teardown(tool); });
+        s->shell->mountRoot(root, s->destroyer);
+        root->setOnClose([this, tool]() { teardown(tool); });
+        s->shell->show();
+        s->shell->activateWindow();
+        QPointer<SharedOverlayShell> guard(s->shell);
+        QTimer::singleShot(0, s->shell, [guard]() {
+            if (guard) guard->afterShowContent();
         });
     }
 
-    void teardown(std::function<void()> done = nullptr) {
-        std::function<void()> cb = done ? done : closedCb_;
-        closedCb_ = nullptr;
-        detachContent(cb);
+    void teardown(OverlayToolId tool, std::function<void()> done = nullptr) {
+        Slot* s = slot(tool);
+        if (!s) return;
+        std::function<void()> cb = done ? done : s->closedCb;
+        s->closedCb = nullptr;
+        detachContent(*s, cb);
     }
 
-    void teardownFast() {
-        closedCb_ = nullptr;
-        detachContent(nullptr);
+    bool command(OverlayToolId tool, const QString& action) {
+        Slot* s = slot(tool);
+        if (!s || !s->shell || !isToolActive(tool)) return false;
+        if (action == QStringLiteral("close")) {
+            teardown(tool);
+            return true;
+        }
+        return s->shell->applyChromeCommand(action);
+    }
+
+    int stateBits(OverlayToolId tool) const {
+        const Slot* s = slot(tool);
+        if (!s || !s->shell || !isToolActive(tool)) return 0;
+        return 1 | (s->shell->frameShown() ? 2 : 0) | (s->shell->locked() ? 4 : 0);
     }
 
 private:
-    explicit OverlayHostService(QObject* parent) : QObject(parent), destroyer_(this) {}
+    struct Slot {
+        explicit Slot(QObject* parent) : destroyer(parent) {}
+        SharedOverlayShell* shell = nullptr;
+        WidgetDeferredDestroy destroyer;
+        std::function<void()> closedCb;
+    };
 
-    // 固定顺序：hide → 通知 controller 释资源 → takeRoot → 分帧 deleteLater
-    void detachContent(std::function<void()> notify) {
-        if (shell_) shell_->hide();
-        active_ = OverlayToolId::None;
+    explicit OverlayHostService(QObject* parent)
+        : QObject(parent), danmu_(this), overtime_(this), leaf_(this) {}
+
+    Slot* slot(OverlayToolId id) {
+        if (id == OverlayToolId::Danmu) return &danmu_;
+        if (id == OverlayToolId::Overtime) return &overtime_;
+        if (id == OverlayToolId::Leaf) return &leaf_;
+        return nullptr;
+    }
+    const Slot* slot(OverlayToolId id) const {
+        if (id == OverlayToolId::Danmu) return &danmu_;
+        if (id == OverlayToolId::Overtime) return &overtime_;
+        if (id == OverlayToolId::Leaf) return &leaf_;
+        return nullptr;
+    }
+
+    // 活跃实例立即注销；轻量壳留在单例宿主池中供再次打开复用。
+    // 每个可见顶层窗口仍需要独立原生表面，内容与共享资源不重复常驻。
+    void detachContent(Slot& s, std::function<void()> notify) {
+        if (s.shell) s.shell->hide();
+        RippleOverlayRoot* root = s.shell ? s.shell->takeRoot() : nullptr;
+        if (root) root->setOnClose(nullptr);
         if (notify) notify();
-        if (shell_) {
-            if (auto* r = shell_->takeRoot()) destroyer_.enqueue(r);
-        }
+        if (root) s.destroyer.enqueue(root);
     }
 
-    void ensureShell() {
-        if (!shell_) shell_ = new SharedOverlayShell;
+    void ensureShell(OverlayToolId tool, Slot& s) {
+        if (s.shell) return;
+        QString key = QStringLiteral("overlay_window_geometry");
+        if (tool == OverlayToolId::Danmu) key = QStringLiteral("danmu_window_geometry");
+        else if (tool == OverlayToolId::Overtime) key = QStringLiteral("overtime_window_geometry");
+        else if (tool == OverlayToolId::Leaf) key = QStringLiteral("leaf_window_geometry");
+        s.shell = new SharedOverlayShell(key);
     }
 
-    OverlayToolId active_ = OverlayToolId::None;
-    SharedOverlayShell* shell_ = nullptr;
-    WidgetDeferredDestroy destroyer_;
-    std::function<void()> closedCb_;
+    Slot danmu_;
+    Slot overtime_;
+    Slot leaf_;
 };
 
 // 旧 memo._section：卡片 + 标题 + 若干「文字 / 控件」行。

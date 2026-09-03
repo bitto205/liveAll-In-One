@@ -18,6 +18,8 @@ static const QVector<ToolMeta>& toolCatalog() {
          QStringLiteral("透明悬浮弹幕显示窗口")},
         {QStringLiteral("overtime"), QStringLiteral("⏱"), QStringLiteral("加班机"),
          QStringLiteral("透明悬浮加班显示窗口")},
+        {QStringLiteral("leaf"), QStringLiteral("🍃"), QStringLiteral("捡叶子"),
+         QStringLiteral("送礼堆叶子，拖到垃圾桶消除")},
     };
     return catalog;
 }
@@ -57,6 +59,10 @@ public:
             return false;
         }
         openFn_ = reinterpret_cast<OpenFn>(lib_->resolve("LiveAIO_ToolsOpen"));
+        overlayFn_ = reinterpret_cast<OverlayFn>(
+            lib_->resolve("LiveAIO_ToolsOverlayCommand"));
+        overlayStateFn_ = reinterpret_cast<OverlayStateFn>(
+            lib_->resolve("LiveAIO_ToolsOverlayState"));
         themeFn_ = reinterpret_cast<ThemeFn>(lib_->resolve("LiveAIO_ToolsApplyTheme"));
         warmFn_ = reinterpret_cast<WarmFn>(lib_->resolve("LiveAIO_ToolsWarm"));
         if (!openFn_) {
@@ -79,6 +85,23 @@ public:
         return true;
     }
 
+    bool overlayCommand(const QString& toolId, const QString& action, QString* error = nullptr) {
+        if (!ensureLoaded(error)) return false;
+        if (!overlayFn_) {
+            if (error) *error = QStringLiteral("LiveAIOTools.dll 缺少悬浮窗控制导出");
+            return false;
+        }
+        const int rc = overlayFn_(toolId.toUtf8().constData(), action.toUtf8().constData());
+        if (rc != 0 && error) *error = QStringLiteral("悬浮窗操作失败（错误码 %1）").arg(rc);
+        return rc == 0;
+    }
+
+    int overlayState(const QString& toolId) {
+        QString error;
+        if (!ensureLoaded(&error) || !overlayStateFn_) return 0;
+        return overlayStateFn_(toolId.toUtf8().constData());
+    }
+
     void applyTheme(const QString& name) {
         if (themeFn_) themeFn_(name.toUtf8().constData());
     }
@@ -87,6 +110,8 @@ public:
 
 private:
     using OpenFn = int (*)(const char*);
+    using OverlayFn = int (*)(const char*, const char*);
+    using OverlayStateFn = int (*)(const char*);
     using ThemeFn = void (*)(const char*);
     using WarmFn = void (*)();
 
@@ -104,6 +129,8 @@ private:
 
     QLibrary* lib_ = nullptr;
     OpenFn openFn_ = nullptr;
+    OverlayFn overlayFn_ = nullptr;
+    OverlayStateFn overlayStateFn_ = nullptr;
     ThemeFn themeFn_ = nullptr;
     WarmFn warmFn_ = nullptr;
     QString loadError_;

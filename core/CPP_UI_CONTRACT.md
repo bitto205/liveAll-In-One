@@ -98,30 +98,32 @@ flowchart LR
 | Settings 三个面板 | **点 Tab 同步** `ensurePanel` |
 | `LiveAIOTools.dll` | Tools 页加载后 **`LiveAIO_ToolsWarm` 预连 Core + config/catalog** |
 | 工具控制窗（1） | 每 id `ToolEntry`；关窗 **不杀 overlay**；`tryReleaseTool` 判定销毁 |
-| 透明 overlay（2） | **进程单壳**；`ToolRuntime` 持 controller；关 overlay **不杀设置窗** |
+| 透明 overlay（2） | **每工具独立壳、同 Qt 实例复用**；关 overlay **不杀设置窗** |
 | 礼物 catalog / 皮肤列表 | `ensureGiftCatalogAsync` + `warmToolCatalogs`；picker hide **release thumb** |
 | 弹幕气泡 | 对象池复用；回池 `setParent(nullptr)`；unmount **drain 池** |
 
 ---
 
-## 透明 overlay 单例与生命周期（严丝合缝）
+## 透明 overlay 双窗与生命周期（严丝合缝）
 
-**单壳：** `OverlayHostService` → `SharedOverlayShell` + 每工具 `*OverlayController`（逻辑与 `root_` 指针）。
+**双窗：** `OverlayHostService` 按工具持有独立 `SharedOverlayShell` +
+每工具 `*OverlayController`。弹幕机与加班机可同时显示，但共享同一 QApplication、
+ToolsSession、CoreClient、主题与配置桥。
 
 **拉起（show）：**
 
-1. 若有旧 content：`detachContent(prevClosed)`（见下）
-2. `shell_->prepare`（标题/几何 key）→ `mountRoot` → `show`
+1. 仅清理该工具自己壳内的旧 content：`detachContent(slot, prevClosed)`
+2. 对应 `shell->prepare`（标题/几何 key）→ `mountRoot` → `show`
 3. Controller 在 `show` 前 `root_=nullptr` 并 **new 新 Root**；`closedCb_` = `[unmount → tool onClosed]`
 
 **拆解（detachContent / teardown）固定顺序：**
 
-1. `shell_->hide()`
-2. `active_ = None`
+1. 对应工具 `shell->hide()`
+2. 清除该工具自己的 `closedCb`
 3. **notify**（controller `unmount`：释缓存、清气泡池、`root_=nullptr`、ledger 断回调）
 4. `takeRoot()` → `WidgetDeferredDestroy` 分帧 `deleteLater`（禁止在 notify 之后仍访问 root）
 
-**切换工具：** `show` 新工具前对旧工具执行 `detachContent(prevClosed)`，旧工具 `refreshOpenBtn` 经 `closedCb_` 触发。
+**工具隔离：** 打开或关闭某一工具不得 detach、隐藏或修改另一工具的 shell。
 
 **关闭路径：** 壳 ✕ → `teardown(closedCb_)`；工具按钮 → `teardown()`（同一 `closedCb_`）。禁止在 `teardown` 外重复 `unmount`。
 

@@ -41,6 +41,7 @@ type Params struct {
 	Root        string
 	CoreTCP     string
 	LiveID      string
+	Route       ID
 	ForceSystem bool
 	OnFrame     func([]byte)
 	OnMessage   func(Msg)
@@ -150,7 +151,7 @@ func (m *Manager) Start(route, liveID string, forceSystem bool) error {
 		return err
 	}
 	p := Params{
-		Root: m.root, CoreTCP: m.tcp, LiveID: liveID, ForceSystem: forceSystem,
+		Root: m.root, CoreTCP: m.tcp, LiveID: liveID, Route: id, ForceSystem: forceSystem,
 		OnFrame: m.OnFrame, OnMessage: m.OnMessage, OnStatus: m.OnStatus,
 		Logf: m.logf,
 	}

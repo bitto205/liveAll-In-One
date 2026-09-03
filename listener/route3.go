@@ -7,14 +7,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"liveaio/util/connectdiag"
 )
 
-// Route3Driver: bundled proxy_shell MITM + temporary system proxy (replaces mitmproxy local).
+// Route3Driver: bundled proxy_shell MITM + temporary system proxy.
+// Manual lifecycle: starts on connect, ends only on disconnect or route mutex.
 type Route3Driver struct{}
 
 func (Route3Driver) ID() ID { return Route3 }
 
 func (d Route3Driver) Run(ctx context.Context, p Params) error {
+	logf := p.Logf
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+
 	shell := bundledShell(p.Root)
 	if _, err := os.Stat(shell); err != nil {
 		return fmt.Errorf("proxy_shell.exe missing: %w", err)
@@ -40,26 +48,29 @@ func (d Route3Driver) Run(ctx context.Context, p Params) error {
 		}
 	}()
 
-	// Wait for IPC/proxy ports.
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		if health() == nil {
+		if connectdiag.ProxyShellPortsOpen() {
 			break
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if !connectdiag.ProxyShellPortsOpen() {
+		return fmt.Errorf("proxy_shell 未就绪")
 	}
 
 	cl := &Shell{
+		PlainErrors: true,
 		OnCtrl: func(ctrl string) {
 			switch ctrl {
 			case CtrlLiveOn:
-				if p.OnStatus != nil {
-					p.OnStatus(true)
-				}
+				logf("route3 live on")
 			case CtrlLiveOff, CtrlWSDown:
-				if p.OnStatus != nil {
-					p.OnStatus(false)
-				}
+				logf("route3 live off", "ctrl", ctrl)
 			}
 		},
 		OnFrame: func(raw []byte) {
@@ -73,7 +84,13 @@ func (d Route3Driver) Run(ctx context.Context, p Params) error {
 	}
 	defer cl.Stop()
 
+	logf("route3 lifecycle on")
+	if p.OnStatus != nil {
+		p.OnStatus(true)
+	}
+
 	<-ctx.Done()
+	logf("route3 lifecycle off")
 	if p.OnStatus != nil {
 		p.OnStatus(false)
 	}

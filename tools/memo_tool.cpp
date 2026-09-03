@@ -31,6 +31,7 @@ public:
 
         closeBtn_ = new QPushButton(QStringLiteral("×"), this);
         closeBtn_->setFixedSize(24, 24);
+        liveaio::util::suppressButtonFocus(closeBtn_);
         QObject::connect(closeBtn_, &QPushButton::clicked, this, [this]() { dismiss(); });
         lay->addWidget(closeBtn_);
 
@@ -87,6 +88,7 @@ public:
         clearBtn_ = new QPushButton(QStringLiteral("清空全部"), this);
         clearBtn_->setFixedHeight(30);
         clearBtn_->setCursor(Qt::PointingHandCursor);
+        liveaio::util::suppressButtonFocus(clearBtn_);
         QObject::connect(clearBtn_, &QPushButton::clicked, this, [this]() { clearAll(); });
         auto* top = new QHBoxLayout;
         top->addStretch();

@@ -9,17 +9,18 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"liveaio/util/connectdiag"
 )
 
 const (
-	ipcPort   = 19098
-	proxyPort = 19088
-	shellName = "proxy_shell.exe"
+	ipcPort   = connectdiag.ProxyShellIPCPort
+	proxyPort = connectdiag.ProxyShellProxyPort
+	shellName = connectdiag.ProxyShellName
 
 	DefaultIPCAddr = "127.0.0.1:19098"
 	CtrlPrefix     = "__LH_CTRL__:"
@@ -54,15 +55,25 @@ func PrepareR4(root string) error {
 		return err
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	var last error
 	for time.Now().Before(deadline) {
-		last = health()
-		if last == nil {
+		if connectdiag.ProxyShellPortsOpen() {
 			return nil
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return last
+	return connectdiag.ErrProxyShellConnect(fmt.Errorf("proxy_shell 端口未就绪"))
+}
+
+func health() error {
+	if connectdiag.ProxyShellPortsOpen() {
+		return nil
+	}
+	return fmt.Errorf("proxy_shell 端口未就绪")
+}
+
+// HealthOrConnectError returns a user-facing timeout error with proxy_shell diagnostics.
+func HealthOrConnectError() error {
+	return connectdiag.ErrProxyShellConnect(health())
 }
 
 func catalogPath() string {
@@ -118,41 +129,10 @@ func ensurePatched(root string) error {
 	return nil
 }
 
-func health() error {
-	if !shellRunning() {
-		return fmt.Errorf("proxy_shell.exe not running (start companion)")
-	}
-	if !tcpOpen("127.0.0.1", ipcPort) {
-		return fmt.Errorf("IPC port %d not listening", ipcPort)
-	}
-	if !tcpOpen("127.0.0.1", proxyPort) {
-		return fmt.Errorf("proxy TCP port %d not listening", proxyPort)
-	}
-	return nil
-}
-
-func tcpOpen(host string, port int) bool {
-	c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 800*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	_ = c.Close()
-	return true
-}
-
-func shellRunning() bool {
-	cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq "+shellName, "/NH")
-	hideCmd(cmd)
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(string(out)), strings.ToLower(shellName))
-}
-
 // Shell reads length-prefixed packets from proxy_shell IPC (routes 3/4).
 type Shell struct {
 	Addr    string
+	PlainErrors bool // route 3: plain errors, no connectdiag
 	OnCtrl  func(ctrl string)
 	OnFrame func(raw []byte)
 	OnErr   func(error)
@@ -191,6 +171,13 @@ func (c *Shell) addr() string {
 	return DefaultIPCAddr
 }
 
+func (c *Shell) connectFail(cause error) error {
+	if c.PlainErrors {
+		return cause
+	}
+	return connectdiag.ErrProxyShellConnect(cause)
+}
+
 func (c *Shell) Start() error {
 	c.mu.Lock()
 	if c.stopCh != nil {
@@ -202,7 +189,7 @@ func (c *Shell) Start() error {
 
 	token, err := ReadToken()
 	if err != nil {
-		return fmt.Errorf("ipc token: %w", err)
+		return c.connectFail(fmt.Errorf("ipc token: %w", err))
 	}
 
 	var conn net.Conn
@@ -213,7 +200,7 @@ func (c *Shell) Start() error {
 			break
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("dial proxy_shell IPC: %w", err)
+			return c.connectFail(fmt.Errorf("连接 IPC %s 超时", c.addr()))
 		}
 		select {
 		case <-c.stopCh:

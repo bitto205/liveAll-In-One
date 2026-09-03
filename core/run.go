@@ -88,9 +88,15 @@ func Run(args []string) int {
 		QuitTray()
 	}()
 	if err := RunTray(TrayConfig{
-		Root:    root,
-		Tooltip: "LiveAIO",
+		Root:     root,
+		Tooltip:  "LiveAIO",
 		OnShowUI: func() { h.requestShowUI() },
+		OnOverlay: func(tool, action string) {
+			if err := OverlayCommand(root, tool, action); err != nil {
+				log.Error("overlay command", "tool", tool, "action", action, "err", err)
+			}
+		},
+		OverlayState: OverlayState,
 		OnQuit: func() {
 			h.stopCapture()
 			srv.Stop()

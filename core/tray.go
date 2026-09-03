@@ -50,10 +50,22 @@ const (
 	wmClose      = 0x0010
 	wmDestroy    = 0x0002
 
-	idShowUI = 1001
-	idQuit   = 1002
+	idShowUI         = 1001
+	idQuit           = 1002
+	idDanmuToggle    = 1101
+	idDanmuFrame     = 1102
+	idDanmuLock      = 1103
+	idOvertimeToggle = 1201
+	idOvertimeFrame  = 1202
+	idOvertimeLock   = 1203
+	idLeafToggle     = 1301
+	idLeafFrame      = 1302
+	idLeafLock       = 1303
 
 	tpmRightButton = 0x0002
+	mfGray         = 0x0001
+	mfPopup        = 0x0010
+	mfSeparator    = 0x0800
 	wsExToolwindow = 0x00000080
 	wsPopup        = 0x80000000
 	swHide         = 0
@@ -106,10 +118,12 @@ type msg struct {
 
 // Config for native tray.
 type TrayConfig struct {
-	Root     string
-	Tooltip  string
-	OnShowUI func()
-	OnQuit   func()
+	Root         string
+	Tooltip      string
+	OnShowUI     func()
+	OnOverlay    func(tool, action string)
+	OverlayState func(tool string) int
+	OnQuit       func()
 }
 
 var (
@@ -187,6 +201,24 @@ func wndProc(h windows.Handle, msgU uint32, w, l uintptr) uintptr {
 				go fn()
 			}
 			procPostQuit.Call(0)
+		case idDanmuToggle:
+			runOverlayCommand("danmu", "toggle")
+		case idDanmuFrame:
+			runOverlayCommand("danmu", "frame.toggle")
+		case idDanmuLock:
+			runOverlayCommand("danmu", "lock.toggle")
+		case idOvertimeToggle:
+			runOverlayCommand("overtime", "toggle")
+		case idOvertimeFrame:
+			runOverlayCommand("overtime", "frame.toggle")
+		case idOvertimeLock:
+			runOverlayCommand("overtime", "lock.toggle")
+		case idLeafToggle:
+			runOverlayCommand("leaf", "toggle")
+		case idLeafFrame:
+			runOverlayCommand("leaf", "frame.toggle")
+		case idLeafLock:
+			runOverlayCommand("leaf", "lock.toggle")
 		}
 		return 0
 	case wmClose:
@@ -202,12 +234,81 @@ func wndProc(h windows.Handle, msgU uint32, w, l uintptr) uintptr {
 	return r
 }
 
+func runOverlayCommand(tool, action string) {
+	cfgMu.Lock()
+	fn := cfg.OnOverlay
+	cfgMu.Unlock()
+	if fn != nil {
+		go fn(tool, action)
+	}
+}
+
+func currentOverlayState(tool string) int {
+	cfgMu.Lock()
+	fn := cfg.OverlayState
+	cfgMu.Unlock()
+	if fn == nil {
+		return 0
+	}
+	return fn(tool)
+}
+
+func appendOverlaySubmenu(parent uintptr, title, tool string, toggleID, frameID, lockID uintptr) {
+	sub, _, _ := procCreatePopup.Call()
+	if sub == 0 {
+		return
+	}
+	state := currentOverlayState(tool)
+	open := state&1 != 0
+	frameShown := state&2 != 0
+	locked := state&4 != 0
+
+	toggleText := "打开悬浮窗"
+	if open {
+		toggleText = "关闭悬浮窗"
+	}
+	frameText := "显示边框"
+	if frameShown {
+		frameText = "隐藏边框"
+	}
+	lockText := "锁定窗口"
+	if locked {
+		lockText = "解锁窗口"
+	}
+	toggle, _ := windows.UTF16PtrFromString(toggleText)
+	frame, _ := windows.UTF16PtrFromString(frameText)
+	lock, _ := windows.UTF16PtrFromString(lockText)
+	frameFlags := uintptr(0)
+	lockFlags := uintptr(0)
+	if !open {
+		frameFlags |= mfGray
+	}
+	if !open {
+		lockFlags |= mfGray
+	}
+	procAppendMenu.Call(sub, 0, toggleID, uintptr(unsafe.Pointer(toggle)))
+	if !locked {
+		procAppendMenu.Call(sub, frameFlags, frameID, uintptr(unsafe.Pointer(frame)))
+	}
+	procAppendMenu.Call(sub, lockFlags, lockID, uintptr(unsafe.Pointer(lock)))
+
+	label, _ := windows.UTF16PtrFromString(title)
+	procAppendMenu.Call(parent, mfPopup, sub, uintptr(unsafe.Pointer(label)))
+}
+
 func showMenu(h windows.Handle) {
 	menu, _, _ := procCreatePopup.Call()
 	if menu == 0 {
 		return
 	}
 	defer procDestroyMenu.Call(menu)
+	appendOverlaySubmenu(menu, "弹幕机", "danmu",
+		idDanmuToggle, idDanmuFrame, idDanmuLock)
+	appendOverlaySubmenu(menu, "加班机", "overtime",
+		idOvertimeToggle, idOvertimeFrame, idOvertimeLock)
+	appendOverlaySubmenu(menu, "捡叶子", "leaf",
+		idLeafToggle, idLeafFrame, idLeafLock)
+	procAppendMenu.Call(menu, mfSeparator, 0, 0)
 	show, _ := windows.UTF16PtrFromString("打开界面")
 	quit, _ := windows.UTF16PtrFromString("退出")
 	procAppendMenu.Call(menu, 0, idShowUI, uintptr(unsafe.Pointer(show)))
@@ -330,4 +431,3 @@ func QuitTray() {
 	}
 	procPostMessage.Call(uintptr(h), wmClose, 0, 0)
 }
-

@@ -15,8 +15,7 @@ msg_log/
 config.json
 browsers/
 
-# go.mod / go.sum 在仓库根（gopls 要求）；build/liveaio.* 仅为镜像
-# /go.sum 不再 ignore
+# go.mod / go.sum 必须在仓库根（Go 模块根目录，不能放进 main/）
 
 # 产物与 CMake 缓存
 build/cmake/
@@ -29,9 +28,12 @@ build/installers/
 !listener/proxy_shell.exe
 
 # 本地/杂项（业务已无 Python；.venv 仅防本地残留）
-upx.exe
+build/tools/upx.exe
 _upx.zip
-requirements.txt
+main/*.exe
+main/requirements.txt
+go.work
+go.work.sum
 main/__debug_bin.exe
 aqtinstall.log
 
@@ -39,3 +41,5 @@ aqtinstall.log
 scripts/
 
 build/
+build/compile_commands.json
+compile_commands.json
