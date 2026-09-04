@@ -3,8 +3,9 @@
 namespace liveaio::tools::leaf {
 
 static const QString kGeoKey = QStringLiteral("leaf_window_geometry");
-static const QString kTrashPosKey = QStringLiteral("leaf_trash_pos");
-static const QString kMaxLeavesKey = QStringLiteral("leaf_max_leaves");
+// v2：重置一次历史坐标，让垃圾桶回到右上角默认位。
+static const QString kTrashPosKey = QStringLiteral("leaf_trash_pos_v2");
+static const QString kMaxPercentKey = QStringLiteral("leaf_max_percent");
 static const QString kLeafScaleKey = QStringLiteral("leaf_scale_percent");
 static const QString kTrashScaleKey = QStringLiteral("leaf_trash_scale_percent");
 static const QString kViewportSizeKey = QStringLiteral("leaf_last_viewport_size");
@@ -22,8 +23,8 @@ static constexpr qreal kSoftHalfLenFrac = 0.34;
 static constexpr qreal kArtAngleRad = -0.7853981633974483;  // -45°
 static constexpr qreal kTrashWCm = 2.0;
 static constexpr qreal kTrashHCm = 2.67;
-static constexpr qreal kTrashHitPadCm = 0.25;
-static constexpr qreal kTrashNearPadCm = 0.85;
+static constexpr qreal kTrashHitPadCm = 0.12;
+static constexpr qreal kTrashNearPadCm = 0.45;
 static constexpr qreal kLidAnimSec = 0.12;
 static constexpr qreal kHaloAnimSec = 0.10;
 static constexpr qreal kLeafHaloOuterCm = 0.22;
@@ -33,13 +34,25 @@ static constexpr qreal kLeafHaloAmount = 0.90;
 static constexpr qreal kWorldPadCm = 0.15;
 static constexpr int kMinLeaves = 0;
 static constexpr int kMaxLeavesHard = 240;
+// 容量按理论上限的百分比配置。
+static constexpr int kCapPercentMin = 20;
+static constexpr int kCapPercentMax = 70;
+static constexpr int kCapPercentDefault = 50;
+// 出场/退场节奏：排队生成，不一次性刷屏。
+static constexpr qreal kSpawnIntervalSec = 0.20;
+static constexpr qreal kDespawnIntervalSec = 0.10;
+static constexpr qreal kFadeInSec = 0.16;
+static constexpr qreal kFadeOutSec = 0.16;
+// 待生成/待吊销队列硬顶，防止礼物刷屏把 pending 撑爆。
+static constexpr int kPendingQueueCap = 120;
 static constexpr int kTickMs = 16;
 static constexpr int kPositionIters = 8;
 static constexpr int kResizeSettleIters = 18;
 static constexpr int kDragPositionIters = 3;
 static constexpr int kMaxDragSubsteps = 8;
 static constexpr qreal kGravity = 1400.0;
-static constexpr qreal kDamping = 0.905;
+// 线性阻尼略弱，叶子滑得更远一点；角阻尼先不动。
+static constexpr qreal kDamping = 0.935;
 static constexpr qreal kAngDamping = 0.750;
 static constexpr qreal kMaxAngVel = 0.9;
 static constexpr qreal kMaxSpeed = 165.0;
@@ -86,6 +99,12 @@ static qreal leafPackSide(qreal leafScale = 1.0) {
     return 2.0 * rigidRadius(leafScale);
 }
 
+// lo>hi 时（世界比叶子还窄）退回中点，避免 std::clamp 未定义行为导致溢出。
+static qreal clampAxis(qreal v, qreal lo, qreal hi) {
+    if (lo > hi) return 0.5 * (lo + hi);
+    return std::clamp(v, lo, hi);
+}
+
 static int maxLeavesForSize(const QSize& contentSize, qreal leafScale = 1.0) {
     const qreal pad = cmToPxF(kWorldPadCm);
     const qreal w = std::max(0.0, contentSize.width() - 2.0 * pad);
@@ -100,12 +119,13 @@ static int scalePercent(const QString& key) {
     return std::clamp(configValue(key, 100).toInt(), 50, 200);
 }
 
-static int capacityLower(int theoretical) {
-    return static_cast<int>(std::floor(std::max(0, theoretical) * 0.20));
+static int clampCapPercent(int percent) {
+    return std::clamp(percent, kCapPercentMin, kCapPercentMax);
 }
 
-static int capacityUpper(int theoretical) {
-    return static_cast<int>(std::floor(std::max(0, theoretical) * 0.80));
+static int leavesForPercent(int theoretical, int percent) {
+    const qreal n = std::max(0, theoretical) * clampCapPercent(percent) / 100.0;
+    return std::clamp(static_cast<int>(std::lround(n)), kMinLeaves, kMaxLeavesHard);
 }
 
 static QSize savedViewportSize() {
@@ -116,10 +136,8 @@ static QSize savedViewportSize() {
                                      static_cast<int>(defaultSide * 1.25)).toInt()));
 }
 
-static int configuredMaxLeaves(int theoretical) {
-    const int lower = capacityLower(theoretical);
-    const int upper = std::max(lower, capacityUpper(theoretical));
-    return std::clamp(configValue(kMaxLeavesKey, upper).toInt(), lower, upper);
+static int configuredMaxPercent() {
+    return clampCapPercent(configValue(kMaxPercentKey, kCapPercentDefault).toInt());
 }
 
 static QPixmap cropOpaque(const QPixmap& src) {
@@ -140,6 +158,31 @@ static QPixmap cropOpaque(const QPixmap& src) {
     QRect r(minx, miny, maxx - minx + 1, maxy - miny + 1);
     r.adjust(-4, -4, 4, 4);
     return QPixmap::fromImage(img.copy(r.intersected(img.rect())));
+}
+
+// 关盖图头顶透明很大：去掉大部分，但保留少量原图空间，避免贴边裁死。
+static QPixmap softCropTrashPreview(const QPixmap& src) {
+    if (src.isNull()) return src;
+    const QImage img = src.toImage().convertToFormat(QImage::Format_ARGB32);
+    int minx = img.width(), miny = img.height(), maxx = -1, maxy = -1;
+    for (int y = 0; y < img.height(); ++y) {
+        const auto* line = reinterpret_cast<const QRgb*>(img.constScanLine(y));
+        for (int x = 0; x < img.width(); ++x) {
+            if (qAlpha(line[x]) < 20) continue;
+            minx = std::min(minx, x);
+            miny = std::min(miny, y);
+            maxx = std::max(maxx, x);
+            maxy = std::max(maxy, y);
+        }
+    }
+    if (maxx < minx) return src;
+    const int breath = std::max(4, static_cast<int>(std::lround(img.height() * 0.12)));
+    const int top = std::max(0, miny - breath);
+    const int left = std::max(0, minx - 4);
+    const int right = std::min(img.width() - 1, maxx + 4);
+    const int bottom = std::min(img.height() - 1, maxy + 4);
+    return QPixmap::fromImage(
+        img.copy(QRect(QPoint(left, top), QPoint(right, bottom)).intersected(img.rect())));
 }
 
 static QVector<int> boxBlurAlpha(const QVector<int>& src, int w, int h, int radius) {
@@ -223,6 +266,8 @@ struct LeafSharedAssets {
     QPixmap trashOpenPm;
     QPixmap trashHaloPm;
     QPixmap trashOpenHaloPm;
+    // 关盖图为开盖预留了头顶透明区；设置页预览用裁切后贴图，避免框内大片空白。
+    QPixmap trashPreviewPm;
 
     static LeafSharedAssets& instance() {
         static LeafSharedAssets* g = nullptr;
@@ -268,6 +313,8 @@ struct LeafSharedAssets {
         };
         scaleTrash(trashPm, QColor(210, 205, 195));
         scaleTrash(trashOpenPm, QColor(210, 205, 195));
+        trashPreviewPm = softCropTrashPreview(trashPm);
+        if (trashPreviewPm.isNull()) trashPreviewPm = trashPm;
         leafHaloPm = makeHaloPixmap(leafPm, leafVisualPx(), cmToPxF(kLeafHaloOuterCm));
         trashHaloPm = makeHaloPixmap(
             trashPm, cmToPxF(std::min(kTrashWCm, kTrashHCm)), cmToPxF(kTrashHaloOuterCm));
@@ -278,9 +325,18 @@ struct LeafSharedAssets {
 
 class LeafScalePreview final : public QWidget {
 public:
+    // 两格同尺寸：宽按 200% 设计宽；高按软裁贴图，并留适量呼吸边。
+    static constexpr qreal kPreviewFrameScale = 2.0;
+    static constexpr qreal kPreviewFill = 0.90;
+    static constexpr int kFramePad = 5;
+    static constexpr int kLabelH = 14;
+    static constexpr int kLabelGap = 3;  // 文字下沿到下边框
+    static constexpr int kGap = 8;
+    static constexpr int kOuterPad = 2;
+
     explicit LeafScalePreview(QWidget* parent = nullptr) : QWidget(parent) {
-        setFixedHeight(148);
-        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        refreshFixedSize();
     }
 
     void setScales(int leafPercent, int trashPercent) {
@@ -294,34 +350,580 @@ protected:
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
         p.setRenderHint(QPainter::SmoothPixmapTransform, true);
-        QColor panel = palette().color(QPalette::Base);
-        panel.setAlpha(95);
-        QColor line = palette().color(QPalette::Mid);
-        line.setAlpha(100);
-        p.setPen(QPen(line, 1.0));
-        p.setBrush(panel);
-        p.drawRoundedRect(rect().adjusted(0, 0, -1, -1), 9.0, 9.0);
 
         const auto& assets = LeafSharedAssets::instance();
-        const qreal pxPerCm = 25.0;
-        const qreal leafSide = kLeafSideCm * pxPerCm * leafScale_;
-        const QSizeF trashSize(kTrashWCm * pxPerCm * trashScale_,
-                               kTrashHCm * pxPerCm * trashScale_);
-        const qreal baseline = height() - 13.0;
-        const QRectF leafRect(width() * 0.28 - leafSide * 0.5,
-                              baseline - leafSide, leafSide, leafSide);
-        const QRectF trashRect(width() * 0.72 - trashSize.width() * 0.5,
-                               baseline - trashSize.height(),
-                               trashSize.width(), trashSize.height());
-        p.setPen(QPen(line, 1.0));
-        p.drawLine(QPointF(12.0, baseline), QPointF(width() - 12.0, baseline));
+        const QSizeF cell = frameInnerSize(assets);
+        const qreal cellW = cell.width();
+        const qreal cellH = cell.height();
+        const qreal boxW = cellW + 2 * kFramePad;
+        const qreal boxH = cellH + kFramePad + kLabelH;
+
+        QColor panel = QColor(theme().card);
+        panel.setAlpha(140);
+        QColor border = QColor(theme().border);
+
+        const QRectF leafBox(kOuterPad, kOuterPad, boxW, boxH);
+        const QRectF trashBox(kOuterPad + boxW + kGap, kOuterPad, boxW, boxH);
+        auto drawFrame = [&](const QRectF& r) {
+            p.setPen(QPen(border, 1.0));
+            p.setBrush(panel);
+            p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 8.0, 8.0);
+        };
+        drawFrame(leafBox);
+        drawFrame(trashBox);
+
+        const QRectF leafCell(leafBox.left() + kFramePad, leafBox.top() + kFramePad,
+                              cellW, cellH);
+        const QRectF trashCell(trashBox.left() + kFramePad, trashBox.top() + kFramePad,
+                               cellW, cellH);
+
+        // 最大比例时约占框 90%；更小则居中。
+        const qreal leafSide = cmToPxF(kLeafSideCm) * leafScale_ * kPreviewFill;
+        const QRectF leafRect(leafCell.center().x() - leafSide * 0.5,
+                              leafCell.center().y() - leafSide * 0.5,
+                              leafSide, leafSide);
+        const QSizeF trashVis = trashVisualSize(assets, trashScale_ * kPreviewFill);
+        const QRectF trashRect(trashCell.center().x() - trashVis.width() * 0.5,
+                               trashCell.center().y() - trashVis.height() * 0.5,
+                               trashVis.width(), trashVis.height());
+
         if (!assets.leafPm.isNull()) p.drawPixmap(leafRect.toRect(), assets.leafPm);
-        if (!assets.trashPm.isNull()) p.drawPixmap(trashRect.toRect(), assets.trashPm);
+        const QPixmap& trashDraw =
+            assets.trashPreviewPm.isNull() ? assets.trashPm : assets.trashPreviewPm;
+        if (!trashDraw.isNull()) p.drawPixmap(trashRect.toRect(), trashDraw);
+
+        p.setPen(QColor(theme().textMuted));
+        QFont f = p.font();
+        f.setPixelSize(10);
+        p.setFont(f);
+        // 尺寸文字贴框底排：框内高仅约 20mm，留大间距会把整框顶空。
+        const qreal labelBottom = leafBox.bottom() - kLabelGap;
+        p.drawText(QRectF(leafBox.left(), labelBottom - kLabelH, boxW, kLabelH),
+                   Qt::AlignHCenter | Qt::AlignVCenter,
+                   QStringLiteral("%1mm").arg(qRound(kLeafSideCm * 10.0 * leafScale_)));
+        p.drawText(QRectF(trashBox.left(), labelBottom - kLabelH, boxW, kLabelH),
+                   Qt::AlignHCenter | Qt::AlignVCenter,
+                   QStringLiteral("%1×%2mm")
+                       .arg(qRound(kTrashWCm * 10.0 * trashScale_))
+                       .arg(qRound(kTrashHCm * 10.0 * trashScale_)));
     }
 
 private:
+    static QSizeF trashVisualSize(const LeafSharedAssets& assets, qreal scale) {
+        const qreal w = cmToPxF(kTrashWCm) * scale;
+        const QPixmap& pm =
+            assets.trashPreviewPm.isNull() ? assets.trashPm : assets.trashPreviewPm;
+        if (pm.isNull() || pm.width() <= 0) {
+            return QSizeF(w, cmToPxF(kTrashHCm) * scale);
+        }
+        return QSizeF(w, w * qreal(pm.height()) / qreal(pm.width()));
+    }
+
+    static QSizeF frameInnerSize(const LeafSharedAssets& assets) {
+        // 框按满比例可视尺寸；绘制时再乘 kPreviewFill 留边。
+        return trashVisualSize(assets, kPreviewFrameScale);
+    }
+
+    void refreshFixedSize() {
+        const QSizeF cell = frameInnerSize(LeafSharedAssets::instance());
+        const int boxW = static_cast<int>(std::ceil(cell.width())) + 2 * kFramePad;
+        const int boxH = static_cast<int>(std::ceil(cell.height())) + kFramePad + kLabelH;
+        setFixedSize(2 * boxW + kGap + 2 * kOuterPad, boxH + 2 * kOuterPad);
+    }
+
     qreal leafScale_ = 1.0;
     qreal trashScale_ = 1.0;
+};
+
+static const QString kGiftRulesKey = QStringLiteral("leaf.settings");
+static constexpr int kMaxGiftRules = 10;
+static const QString kNullGift = QStringLiteral("Null");
+
+struct LeafGiftRule {
+    QString gift;  // empty / Null → ignored
+    QString mode = QStringLiteral("加");
+    int value = 1;
+    int randomMin = 1;
+    int randomMax = 3;
+};
+
+static QStringList leafGiftModes() {
+    return {QStringLiteral("加"), QStringLiteral("减"), QStringLiteral("随机")};
+}
+
+static QString normalizeLeafGiftName(const QString& gift) {
+    const QString t = gift.trimmed();
+    if (t.isEmpty() || t.compare(kNullGift, Qt::CaseInsensitive) == 0) return {};
+    return t;
+}
+
+static QString leafGiftDisplayName(const QString& gift) {
+    const QString t = normalizeLeafGiftName(gift);
+    return t.isEmpty() ? kNullGift : t;
+}
+
+static QString leafRuleCompactLabel(const LeafGiftRule& r) {
+    if (r.mode == QStringLiteral("随机")) {
+        return QStringLiteral("随机 %1~%2片叶子").arg(r.randomMin).arg(r.randomMax);
+    }
+    return QStringLiteral("%1 %2片叶子").arg(r.mode).arg(r.value);
+}
+
+static LeafGiftRule leafRuleFromMap(const QVariantMap& m) {
+    LeafGiftRule r;
+    r.gift = normalizeLeafGiftName(m.value(QStringLiteral("gift")).toString());
+    const QString mode = m.value(QStringLiteral("mode"), QStringLiteral("加")).toString();
+    if (mode == QStringLiteral("add") || mode == QStringLiteral("+")) r.mode = QStringLiteral("加");
+    else if (mode == QStringLiteral("sub") || mode == QStringLiteral("-")
+             || mode == QStringLiteral("减")) r.mode = QStringLiteral("减");
+    else if (mode == QStringLiteral("random") || mode == QStringLiteral("随机"))
+        r.mode = QStringLiteral("随机");
+    else r.mode = QStringLiteral("加");
+    r.value = std::max(0, m.value(QStringLiteral("value"), 1).toInt());
+    r.randomMin = std::max(0, m.value(QStringLiteral("min"),
+                                      m.value(QStringLiteral("random_min"), 1)).toInt());
+    r.randomMax = std::max(0, m.value(QStringLiteral("max"),
+                                      m.value(QStringLiteral("random_max"),
+                                              std::max(r.randomMin, 3))).toInt());
+    if (r.randomMax < r.randomMin) std::swap(r.randomMin, r.randomMax);
+    return r;
+}
+
+static QVariantMap leafRuleToMap(const LeafGiftRule& r) {
+    QString mode = QStringLiteral("add");
+    if (r.mode == QStringLiteral("减")) mode = QStringLiteral("sub");
+    else if (r.mode == QStringLiteral("随机")) mode = QStringLiteral("random");
+    return {
+        {QStringLiteral("gift"), r.gift},
+        {QStringLiteral("mode"), mode},
+        {QStringLiteral("value"), r.value},
+        {QStringLiteral("min"), r.randomMin},
+        {QStringLiteral("max"), r.randomMax},
+    };
+}
+
+static QVector<LeafGiftRule> loadLeafGiftRules() {
+    QVector<LeafGiftRule> out;
+    const QVariantMap root = configValue(kGiftRulesKey).toMap();
+    const QVariantList rules = root.value(QStringLiteral("rules")).toList();
+    for (const QVariant& item : rules) {
+        out.append(leafRuleFromMap(item.toMap()));
+        if (out.size() >= kMaxGiftRules) break;
+    }
+    return out;
+}
+
+static void saveLeafGiftRules(const QVector<LeafGiftRule>& rules) {
+    QVariantList list;
+    for (const LeafGiftRule& r : rules) list.append(leafRuleToMap(r));
+    writeConfigValue(kGiftRulesKey, QVariantMap{{QStringLiteral("rules"), list}});
+}
+
+static QJsonObject leafSettingsPacket(const QVector<LeafGiftRule>& rules) {
+    QJsonArray arr;
+    for (const LeafGiftRule& r : rules) {
+        arr.append(QJsonObject::fromVariantMap(leafRuleToMap(r)));
+    }
+    return QJsonObject{
+        {QStringLiteral("op"), QStringLiteral("tool.leaf.set")},
+        {QStringLiteral("settings"), QJsonObject{{QStringLiteral("rules"), arr}}},
+    };
+}
+
+static void pushLeafGiftRulesToCore(const QVector<LeafGiftRule>& rules) {
+    if (g_sendPacket) g_sendPacket(leafSettingsPacket(rules));
+}
+
+class LeafGiftRuleCard final : public QFrame {
+public:
+    explicit LeafGiftRuleCard(const LeafGiftRule& rule, QWidget* parent = nullptr)
+        : QFrame(parent), rule_(rule) {
+        setObjectName(QStringLiteral("LeafRuleRow"));
+        setFixedHeight(76);
+        build();
+        loadRule(rule_);
+        liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
+        refreshTheme();
+    }
+
+    void setCallbacks(std::function<void()> onChanged,
+                      std::function<void(LeafGiftRuleCard*)> onPick,
+                      std::function<void(LeafGiftRuleCard*)> onRemove,
+                      std::function<QSet<QString>()> blocked) {
+        onChanged_ = std::move(onChanged);
+        onPick_ = std::move(onPick);
+        onRemove_ = std::move(onRemove);
+        blockedFn_ = std::move(blocked);
+    }
+
+    QPushButton* pickAnchor() const { return pickBtn_; }
+    QString currentGift() const { return rule_.gift; }
+
+    void applyGift(const QString& name) {
+        if (blockedFn_ && blockedFn_().contains(name)) return;
+        rule_.gift = normalizeLeafGiftName(name);
+        showIcon(rule_.gift, false);
+        emitChange();
+    }
+
+    void refreshTheme() {
+        // 固定宽按钮用更小左右 padding，避免「选择礼物」被挤扁。
+        const auto& C = theme();
+        pickBtn_->setStyleSheet(QStringLiteral(
+            "QPushButton { background: %1; color: %2; border: 1.5px solid %2;"
+            " border-radius: 8px; font-size: 13px; font-weight: 600;"
+            " padding: 0 8px; min-height: 34px; }"
+            "QPushButton:hover { background: %3; }"
+        ).arg(C.card, C.activeLine, C.hover));
+        removeBtn_->setStyleSheet(QStringLiteral(
+            "QPushButton { background: %1; color: %2; border: 1.5px solid %3;"
+            " border-radius: 8px; font-size: 13px; font-weight: 600;"
+            " padding: 0 10px; min-height: 34px; }"
+            "QPushButton:hover { background: %4; color: %5; }"
+        ).arg(C.card, C.textMuted, C.border, C.hover, C.text));
+        if (mode_) {
+            mode_->setCompact(false);
+            mode_->setFixedSize(88, 34);
+            mode_->refreshTheme();
+        }
+        if (normalizeLeafGiftName(rule_.gift).isEmpty()) showIcon({}, false);
+    }
+
+    LeafGiftRule toRule() const {
+        LeafGiftRule r = rule_;
+        r.mode = mode_->currentText();
+        r.value = valueSpin_->value();
+        r.randomMin = minSpin_->value();
+        r.randomMax = maxSpin_->value();
+        if (r.randomMax < r.randomMin) std::swap(r.randomMin, r.randomMax);
+        return r;
+    }
+
+    void releaseIcon() {
+        ++iconGen_;
+        liveaio::resources::clearGiftIconOnLabel(iconLbl_);
+        if (normalizeLeafGiftName(rule_.gift).isEmpty()) {
+            iconLbl_->setText(kNullGift);
+        } else {
+            iconLbl_->setText(QStringLiteral("·"));
+        }
+    }
+
+    void reloadIconDeferred(int delayMs) {
+        showIcon(rule_.gift, true, delayMs);
+    }
+
+private:
+    void build() {
+        auto* root = new QHBoxLayout(this);
+        // 边距略大于描边，避免圆角父级/本卡裁掉子按钮下边框。
+        root->setContentsMargins(12, 12, 12, 12);
+        root->setSpacing(8);
+        root->setAlignment(Qt::AlignTop);
+
+        pickBtn_ = new QPushButton(QStringLiteral("选择礼物"), this);
+        pickBtn_->setFixedSize(96, 34);
+        pickBtn_->setCursor(Qt::PointingHandCursor);
+        QObject::connect(pickBtn_, &QPushButton::clicked, this, [this]() {
+            if (onPick_) onPick_(this);
+        });
+        root->addWidget(pickBtn_, 0, Qt::AlignTop);
+
+        iconLbl_ = new QLabel(this);
+        iconLbl_->setFixedSize(52, 52);
+        iconLbl_->setAlignment(Qt::AlignCenter);
+        iconLbl_->setScaledContents(false);
+        root->addWidget(iconLbl_, 0, Qt::AlignTop);
+
+        mode_ = new ThemedComboBox(this);
+        mode_->setCompact(false);
+        mode_->addItems(leafGiftModes());
+        mode_->setFixedSize(88, 34);
+        mode_->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        mode_->setOnChange([this](const QString&) {
+            syncMode();
+            emitChange();
+        });
+        root->addWidget(mode_, 0, Qt::AlignTop);
+
+        valueHost_ = new QWidget(this);
+        auto* valueLay = new QHBoxLayout(valueHost_);
+        valueLay->setContentsMargins(0, 0, 0, 0);
+        valueLay->setSpacing(6);
+        valueLay->setAlignment(Qt::AlignTop);
+        valueSpin_ = new liveaio::util::ThemedSpinBox(valueHost_);
+        valueSpin_->setRange(0, 999);
+        valueSpin_->setFixedSize(78, 34);
+        QObject::connect(valueSpin_, qOverload<int>(&QSpinBox::valueChanged),
+                         this, [this](int) { emitChange(); });
+        valueLay->addWidget(valueSpin_, 0, Qt::AlignTop);
+        valueUnit_ = new QLabel(QStringLiteral("片叶子"), valueHost_);
+        valueUnit_->setFixedHeight(34);
+        valueUnit_->setMinimumWidth(48);
+        valueUnit_->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
+        valueLay->addWidget(valueUnit_, 0, Qt::AlignTop);
+        root->addWidget(valueHost_, 0, Qt::AlignTop);
+
+        randomHost_ = new QWidget(this);
+        auto* randomLay = new QHBoxLayout(randomHost_);
+        randomLay->setContentsMargins(0, 0, 0, 0);
+        randomLay->setSpacing(6);
+        randomLay->setAlignment(Qt::AlignTop);
+        minSpin_ = new liveaio::util::ThemedSpinBox(randomHost_);
+        maxSpin_ = new liveaio::util::ThemedSpinBox(randomHost_);
+        minSpin_->setRange(0, 999);
+        maxSpin_->setRange(0, 999);
+        minSpin_->setFixedSize(72, 34);
+        maxSpin_->setFixedSize(72, 34);
+        QObject::connect(minSpin_, qOverload<int>(&QSpinBox::valueChanged),
+                         this, [this](int) { emitChange(); });
+        QObject::connect(maxSpin_, qOverload<int>(&QSpinBox::valueChanged),
+                         this, [this](int) { emitChange(); });
+        auto* tilde = new QLabel(QStringLiteral("~"), randomHost_);
+        tilde->setFixedHeight(34);
+        tilde->setAlignment(Qt::AlignCenter);
+        auto* randUnit = new QLabel(QStringLiteral("片叶子"), randomHost_);
+        randUnit->setFixedHeight(34);
+        randUnit->setMinimumWidth(48);
+        randUnit->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
+        randomLay->addWidget(minSpin_, 0, Qt::AlignTop);
+        randomLay->addWidget(tilde, 0, Qt::AlignTop);
+        randomLay->addWidget(maxSpin_, 0, Qt::AlignTop);
+        randomLay->addWidget(randUnit, 0, Qt::AlignTop);
+        root->addWidget(randomHost_, 0, Qt::AlignTop);
+
+        root->addStretch(1);
+        removeBtn_ = new QPushButton(QStringLiteral("删除"), this);
+        removeBtn_->setFixedSize(72, 34);
+        removeBtn_->setCursor(Qt::PointingHandCursor);
+        QObject::connect(removeBtn_, &QPushButton::clicked, this, [this]() {
+            if (onRemove_) onRemove_(this);
+        });
+        root->addWidget(removeBtn_, 0, Qt::AlignTop);
+    }
+
+    void loadRule(const LeafGiftRule& rule) {
+        loading_ = true;
+        rule_ = rule;
+        mode_->setCurrentText(rule.mode);
+        valueSpin_->setValue(rule.value);
+        minSpin_->setValue(rule.randomMin);
+        maxSpin_->setValue(rule.randomMax);
+        loading_ = false;
+        syncMode();
+        if (normalizeLeafGiftName(rule.gift).isEmpty()) {
+            showIcon({}, false);
+        } else {
+            iconLbl_->setText(QStringLiteral("·"));
+        }
+    }
+
+    void showIcon(const QString& gift, bool deferred, int delayMs = 0) {
+        const QString name = normalizeLeafGiftName(gift);
+        ++iconGen_;
+        const QString root = g_appRoot;
+        if (name.isEmpty()) {
+            liveaio::resources::clearGiftIconOnLabel(iconLbl_);
+            iconLbl_->setText(kNullGift);
+            iconLbl_->setStyleSheet(QStringLiteral(
+                "color: %1; background: transparent; font-size: 11px;").arg(theme().textMuted));
+            return;
+        }
+        iconLbl_->setText(QStringLiteral("·"));
+        iconLbl_->setStyleSheet(QStringLiteral("background: transparent; border: none;"));
+        // 设置页用缩略静图，避免动图播放器抬内存；与选择器同源解码。
+        auto load = [this, name, root]() {
+            liveaio::resources::setGiftIconOnLabel(iconLbl_, root, name, 48, true);
+        };
+        if (!deferred) {
+            load();
+            return;
+        }
+        const quint64 gen = iconGen_;
+        QPointer<LeafGiftRuleCard> guard(this);
+        QTimer::singleShot(std::max(0, delayMs), this, [guard, gen, load]() {
+            if (!guard || gen != guard->iconGen_) return;
+            load();
+        });
+    }
+
+    void syncMode() {
+        const bool isRand = mode_->currentText() == QStringLiteral("随机");
+        valueHost_->setVisible(!isRand);
+        randomHost_->setVisible(isRand);
+    }
+
+    void emitChange() {
+        if (loading_) return;
+        rule_ = toRule();
+        if (onChanged_) onChanged_();
+    }
+
+    LeafGiftRule rule_;
+    bool loading_ = false;
+    quint64 iconGen_ = 0;
+    QPushButton* pickBtn_ = nullptr;
+    QLabel* iconLbl_ = nullptr;
+    ThemedComboBox* mode_ = nullptr;
+    QWidget* valueHost_ = nullptr;
+    QWidget* randomHost_ = nullptr;
+    QSpinBox* valueSpin_ = nullptr;
+    QSpinBox* minSpin_ = nullptr;
+    QSpinBox* maxSpin_ = nullptr;
+    QLabel* valueUnit_ = nullptr;
+    QPushButton* removeBtn_ = nullptr;
+    std::function<void()> onChanged_;
+    std::function<void(LeafGiftRuleCard*)> onPick_;
+    std::function<void(LeafGiftRuleCard*)> onRemove_;
+    std::function<QSet<QString>()> blockedFn_;
+};
+
+class LeafOverlayRuleCard final : public QFrame {
+public:
+    explicit LeafOverlayRuleCard(QWidget* parent = nullptr) : QFrame(parent) {
+        // 半透明悬浮窗上 QSS 背景经常不画，必须自绘 + StyledBackground。
+        setAttribute(Qt::WA_StyledBackground, true);
+        setAutoFillBackground(false);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(QPen(QColor(255, 255, 255, 52), 1.0));
+        p.setBrush(QColor(96, 98, 106, 150));
+        p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6.0, 6.0);
+    }
+};
+
+class LeafRulesStrip final : public QWidget {
+public:
+    explicit LeafRulesStrip(QWidget* parent = nullptr) : QWidget(parent) {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_TranslucentBackground);
+        auto* lay = new QVBoxLayout(this);
+        // 宽度缩约 1/4；字号/行高保持可读，不跟着压扁。
+        lay->setContentsMargins(6, 6, 6, 6);
+        lay->setSpacing(5);
+        lay_ = lay;
+        setRules({});
+    }
+
+    void setRules(const QVector<LeafGiftRule>& rules) {
+        releaseHeavyResources();
+        while (QLayoutItem* item = lay_->takeAt(0)) {
+            if (QWidget* w = item->widget()) {
+                w->hide();
+                w->setParent(nullptr);
+                w->deleteLater();
+            }
+            delete item;
+        }
+        iconRows_.clear();
+        ++loadGen_;
+        int shown = 0;
+        for (const LeafGiftRule& r : rules) {
+            if (normalizeLeafGiftName(r.gift).isEmpty()) continue;
+            auto* card = new LeafOverlayRuleCard(this);
+            auto* hl = new QHBoxLayout(card);
+            hl->setContentsMargins(8, 5, 8, 5);
+            hl->setSpacing(6);
+            auto* icon = new QLabel(card);
+            icon->setFixedSize(22, 22);
+            icon->setAlignment(Qt::AlignCenter);
+            icon->setAttribute(Qt::WA_TranslucentBackground);
+            icon->setStyleSheet(QStringLiteral("background: transparent; border: none;"));
+            icon->setText(QStringLiteral("·"));
+            auto* col = new QVBoxLayout;
+            col->setContentsMargins(0, 0, 0, 0);
+            col->setSpacing(1);
+            auto* name = new QLabel(leafGiftDisplayName(r.gift), card);
+            name->setAttribute(Qt::WA_TranslucentBackground);
+            name->setStyleSheet(QStringLiteral(
+                "background: transparent; border: none;"
+                " color: rgba(255,255,255,235); font-size: 11px; font-weight: 600;"));
+            auto* detail = new QLabel(leafRuleCompactLabel(r), card);
+            detail->setAttribute(Qt::WA_TranslucentBackground);
+            detail->setStyleSheet(QStringLiteral(
+                "background: transparent; border: none;"
+                " color: rgba(210,210,215,200); font-size: 10px;"));
+            col->addWidget(name);
+            col->addWidget(detail);
+            hl->addWidget(icon, 0, Qt::AlignVCenter);
+            hl->addLayout(col, 1);
+            card->setMinimumHeight(32);
+            lay_->addWidget(card, 0, Qt::AlignTop);
+            iconRows_.append({icon, r.gift});
+            ++shown;
+        }
+        if (shown == 0) {
+            auto* tip = new LeafOverlayRuleCard(this);
+            auto* tipLay = new QVBoxLayout(tip);
+            tipLay->setContentsMargins(8, 6, 8, 6);
+            auto* tipLbl = new QLabel(QStringLiteral("未配置有效礼物规则"), tip);
+            tipLbl->setAttribute(Qt::WA_TranslucentBackground);
+            tipLbl->setStyleSheet(QStringLiteral(
+                "background: transparent; border: none;"
+                " color: rgba(255,255,255,200); font-size: 10px;"));
+            tipLay->addWidget(tipLbl);
+            tip->setMinimumHeight(28);
+            lay_->addWidget(tip, 0, Qt::AlignTop);
+        }
+        lay_->addStretch(1);
+        updateGeometry();
+        scheduleDeferredIconLoads();
+    }
+
+    void scheduleDeferredIconLoads() {
+        const quint64 gen = loadGen_;
+        for (int i = 0; i < iconRows_.size(); ++i) {
+            QPointer<QLabel> icon = iconRows_[i].icon;
+            const QString gift = iconRows_[i].gift;
+            QTimer::singleShot(40 * i, this, [this, gen, icon, gift]() {
+                if (gen != loadGen_ || !icon) return;
+                liveaio::resources::setGiftIconOnLabel(icon, g_appRoot, gift, 20, true);
+            });
+        }
+    }
+
+    void releaseHeavyResources() {
+        ++loadGen_;
+        for (const IconRow& row : iconRows_) {
+            if (row.icon) liveaio::resources::clearGiftIconOnLabel(row.icon);
+        }
+    }
+
+    QSize sizeHint() const override {
+        if (!lay_) return QSize(160, 40);
+        const QMargins m = lay_->contentsMargins();
+        int h = m.top() + m.bottom();
+        int rows = 0;
+        for (int i = 0; i < lay_->count(); ++i) {
+            QLayoutItem* item = lay_->itemAt(i);
+            if (!item || item->spacerItem() || !item->widget()) continue;
+            h += std::max(item->widget()->minimumHeight(),
+                          item->widget()->sizeHint().height());
+            ++rows;
+        }
+        if (rows > 1) h += lay_->spacing() * (rows - 1);
+        return QSize(width() > 0 ? width() : 160, std::max(40, h));
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        // 规则条本身透明，只靠卡片自绘底色。
+    }
+
+private:
+    struct IconRow {
+        QPointer<QLabel> icon;
+        QString gift;
+    };
+
+    QVBoxLayout* lay_ = nullptr;
+    QVector<IconRow> iconRows_;
+    quint64 loadGen_ = 0;
 };
 
 static QPointF closestPointOnSegment(const QPointF& a, const QPointF& b, const QPointF& p) {
@@ -332,7 +934,8 @@ static QPointF closestPointOnSegment(const QPointF& a, const QPointF& b, const Q
     return a + ab * t;
 }
 
-enum class LeafState { Idle, Dragging, Removing };
+// Free：池内空槽，可复用。Spawning/Removing 不参与物理。
+enum class LeafState { Free, Spawning, Idle, Dragging, Removing };
 
 struct LeafBody {
     QPointF pos;
@@ -341,17 +944,34 @@ struct LeafBody {
     qreal angVel = 0.0;
     qreal alpha = 1.0;
     qreal removeT = 0.0;
-    LeafState state = LeafState::Idle;
+    qreal spawnT = 0.0;
+    qreal fadeFrom = 1.0;
+    QPointF birthVel;
+    qreal birthAngVel = 0.0;
+    LeafState state = LeafState::Free;
     quint64 id = 0;
 };
+
+static bool isPhysical(const LeafState s) {
+    return s == LeafState::Idle || s == LeafState::Dragging;
+}
+
+static bool isAlive(const LeafState s) {
+    return s != LeafState::Free && s != LeafState::Removing;
+}
+
+static void resetLeafBody(LeafBody* L) {
+    *L = LeafBody{};
+    L->state = LeafState::Free;
+    L->alpha = 0.0;
+}
 
 class LeafCanvas final : public QWidget {
 public:
     explicit LeafCanvas(QWidget* parent = nullptr) : QWidget(parent) {
         leafScale_ = scalePercent(kLeafScaleKey) / 100.0;
         trashScale_ = scalePercent(kTrashScaleKey) / 100.0;
-        const int savedTheory = maxLeavesForSize(savedViewportSize(), leafScale_);
-        preferredMaxLeaves_ = configuredMaxLeaves(savedTheory);
+        preferredPercent_ = configuredMaxPercent();
         setAttribute(Qt::WA_TranslucentBackground);
         setMouseTracking(true);
         setFocusPolicy(Qt::NoFocus);
@@ -366,38 +986,55 @@ public:
     int aliveCount() const {
         int n = 0;
         for (const LeafBody& L : leaves_) {
-            if (L.state != LeafState::Removing) ++n;
+            if (isAlive(L.state)) ++n;
         }
         return n;
     }
 
     int maxLeaves() const { return maxLeaves_; }
     int theoreticalCapacity() const { return theoreticalCapacity_; }
-    int capacityMinimum() const { return capacityLower(theoreticalCapacity_); }
-    int capacityMaximum() const {
-        return std::max(capacityMinimum(), capacityUpper(theoreticalCapacity_));
-    }
-    int pendingCount() const { return pendingSpawns_; }
+    int maxPercent() const { return preferredPercent_; }
+    int pendingCount() const { return pendingSpawns_ + pendingRemovals_; }
     int leafScalePercent() const { return qRound(leafScale_ * 100.0); }
     int trashScalePercent() const { return qRound(trashScale_ * 100.0); }
 
-    void applySettings(int maxLeaves, int leafPercent, int trashPercent) {
+    void applySettings(int maxPercent, int leafPercent, int trashPercent) {
         leafPercent = std::clamp(leafPercent, 50, 200);
         trashPercent = std::clamp(trashPercent, 50, 200);
         leafScale_ = leafPercent / 100.0;
         trashScale_ = trashPercent / 100.0;
-        preferredMaxLeaves_ = std::max(0, maxLeaves);
+        preferredPercent_ = clampCapPercent(maxPercent);
         writeConfigValue(kLeafScaleKey, leafPercent);
         writeConfigValue(kTrashScaleKey, trashPercent);
-        writeConfigValue(kMaxLeavesKey, preferredMaxLeaves_);
+        writeConfigValue(kMaxPercentKey, preferredPercent_);
         notifyGeometryChanged();
     }
 
     void enqueueSpawn(int count = 1) {
-        pendingSpawns_ += std::max(1, count);
+        int left = std::max(1, count);
+        const int cancel = std::min(left, pendingRemovals_);
+        pendingRemovals_ -= cancel;
+        left -= cancel;
+        pendingSpawns_ = std::min(kPendingQueueCap, pendingSpawns_ + left);
         flushSpawns();
         emitStats();
         update();
+    }
+
+    void enqueueRemove(int count = 1) {
+        int left = std::max(1, count);
+        const int cancel = std::min(left, pendingSpawns_);
+        pendingSpawns_ -= cancel;
+        left -= cancel;
+        pendingRemovals_ = std::min(kPendingQueueCap, pendingRemovals_ + left);
+        flushRemovals();
+        emitStats();
+        update();
+    }
+
+    void applyLeafDelta(int delta) {
+        if (delta > 0) enqueueSpawn(delta);
+        else if (delta < 0) enqueueRemove(-delta);
     }
 
     void beginResizePause() {
@@ -425,13 +1062,28 @@ public:
         if (trashNearRect().contains(pos)) return true;
         for (int i = leaves_.size() - 1; i >= 0; --i) {
             const LeafBody& L = leaves_[i];
-            if (L.state == LeafState::Removing) continue;
+            if (!isPhysical(L.state)) continue;
             if (hitSoft(L, pos)) return true;
         }
         return false;
     }
 
     void setStatsCallback(std::function<void()> cb) { statsCb_ = std::move(cb); }
+
+    // 关窗/卸挂时清队列与实例，停表，避免残留定时器与幽灵叶子。
+    void shutdown() {
+        if (tick_) tick_->stop();
+        pendingSpawns_ = 0;
+        pendingRemovals_ = 0;
+        spawnCooldown_ = 0.0;
+        removeCooldown_ = 0.0;
+        dragId_ = 0;
+        dragTargetValid_ = false;
+        draggingTrash_ = false;
+        for (LeafBody& L : leaves_) resetLeafBody(&L);
+        leaves_.clear();
+        statsCb_ = {};
+    }
 
     void notifyGeometryChanged() {
         ensureTrashPosition();
@@ -457,7 +1109,7 @@ protected:
         const qreal side = leafVisualPx(leafScale_);
 
         for (const LeafBody& L : leaves_) {
-            if (L.state == LeafState::Dragging) continue;
+            if (L.state == LeafState::Free || L.state == LeafState::Dragging) continue;
             drawLeaf(p, L, side, assets.leafPm, assets.leafHaloPm, 0.0);
         }
 
@@ -482,7 +1134,7 @@ protected:
         }
         for (int i = leaves_.size() - 1; i >= 0; --i) {
             LeafBody& L = leaves_[i];
-            if (L.state == LeafState::Removing) continue;
+            if (!isPhysical(L.state)) continue;
             if (!hitSoft(L, pos)) continue;
             L.state = LeafState::Dragging;
             L.vel = {};
@@ -533,10 +1185,8 @@ protected:
         for (LeafBody& L : leaves_) {
             if (L.id != dragId_) continue;
             if (trashHitRect().contains(L.pos)) {
-                L.state = LeafState::Removing;
-                L.vel = {};
-                L.angVel = 0.0;
-                L.removeT = 0.0;
+                // 垃圾桶吊销：立即退出物理，随后只播淡出。
+                beginRemoval(L);
             } else {
                 L.state = LeafState::Idle;
                 L.vel = dragVelocity_ * 0.35;
@@ -568,10 +1218,13 @@ private:
         p.save();
         p.translate(L.pos);
         p.rotate(L.angle * 180.0 / kPi);
-        const qreal removeEase = L.removeT * (2.0 - L.removeT);
-        const qreal scale = (L.state == LeafState::Removing)
-            ? std::max(0.18, 1.0 - removeEase * 0.82)
-            : 1.0;
+        // 淡入淡出为主，仅配一点轻微缩放，避免"啪"地跳出跳没。
+        qreal scale = 1.0;
+        if (L.state == LeafState::Removing) {
+            scale = 1.0 - L.removeT * (2.0 - L.removeT) * 0.12;
+        } else if (L.state == LeafState::Spawning) {
+            scale = 0.92 + L.spawnT * 0.08;
+        }
         const qreal drawSide = side * scale;
         const QRectF dst(-drawSide * 0.5, -drawSide * 0.5, drawSide, drawSide);
         if (halo > 0.01) {
@@ -631,13 +1284,13 @@ private:
         }
         QPointF c = trashPosReady_
             ? trashCenterPx_
-            : QPointF(w.center().x(), w.bottom() - sz.height() * 0.5);
+            : QPointF(w.right() - sz.width() * 0.5, w.top() + sz.height() * 0.5);
         const qreal hx = sz.width() * 0.5;
         const qreal hy = sz.height() * 0.5;
         if (w.width() < sz.width()) c.setX(w.center().x());
-        else c.setX(std::clamp(c.x(), w.left() + hx, w.right() - hx));
+        else c.setX(clampAxis(c.x(), w.left() + hx, w.right() - hx));
         if (w.height() < sz.height()) c.setY(w.center().y());
-        else c.setY(std::clamp(c.y(), w.top() + hy, w.bottom() - hy));
+        else c.setY(clampAxis(c.y(), w.top() + hy, w.bottom() - hy));
         return c;
     }
 
@@ -649,9 +1302,9 @@ private:
         const qreal hy = sz.height() * 0.5;
         QPointF c = cIn;
         if (w.width() < sz.width()) c.setX(w.center().x());
-        else c.setX(std::clamp(c.x(), w.left() + hx, w.right() - hx));
+        else c.setX(clampAxis(c.x(), w.left() + hx, w.right() - hx));
         if (w.height() < sz.height()) c.setY(w.center().y());
-        else c.setY(std::clamp(c.y(), w.top() + hy, w.bottom() - hy));
+        else c.setY(clampAxis(c.y(), w.top() + hy, w.bottom() - hy));
         trashCenterPx_ = c;
         trashPosReady_ = true;
     }
@@ -730,7 +1383,9 @@ private:
             trashCenterPx_ = QPointF(w.left() + legacyTrashNorm_.x() * w.width(),
                                      w.top() + legacyTrashNorm_.y() * w.height());
         } else {
-            trashCenterPx_ = QPointF(w.center().x(), w.bottom() - sz.height() * 0.5);
+            // 首次：右上角。
+            trashCenterPx_ = QPointF(w.right() - sz.width() * 0.5,
+                                     w.top() + sz.height() * 0.5);
         }
         trashPosReady_ = true;
         setTrashCenter(trashCenterPx_);
@@ -847,9 +1502,7 @@ private:
 
     void updateWorld() {
         theoreticalCapacity_ = maxLeavesForSize(size(), leafScale_);
-        const int lower = capacityLower(theoreticalCapacity_);
-        const int upper = std::max(lower, capacityUpper(theoreticalCapacity_));
-        maxLeaves_ = std::clamp(preferredMaxLeaves_, lower, upper);
+        maxLeaves_ = leavesForPercent(theoreticalCapacity_, preferredPercent_);
         writeConfigValue(kViewportSizeKey, QVariantMap{
             {QStringLiteral("w"), width()},
             {QStringLiteral("h"), height()},
@@ -858,29 +1511,80 @@ private:
 
     void clampToWorld(LeafBody& L) const {
         const QRectF w = worldRect();
+        if (w.width() <= 1.0 || w.height() <= 1.0) {
+            L.pos = w.center();
+            return;
+        }
         qreal ex = 0.0, ey = 0.0;
         rigidExtents(L, &ex, &ey);
-        L.pos.setX(std::clamp(L.pos.x(), w.left() + ex, w.right() - ex));
-        L.pos.setY(std::clamp(L.pos.y(), w.top() + ey, w.bottom() - ey));
+        // 世界比刚体还窄时，ex/ey 可能超过半宽，必须用安全 clamp。
+        L.pos.setX(clampAxis(L.pos.x(), w.left() + ex, w.right() - ex));
+        L.pos.setY(clampAxis(L.pos.y(), w.top() + ey, w.bottom() - ey));
     }
 
+    // 每次只放一片，靠 spawnCooldown_ 拉开 kSpawnIntervalSec 的间隔。
     void flushSpawns() {
         if (resizePaused_) return;
-        bool spawned = false;
-        while (pendingSpawns_ > 0 && aliveCount() < maxLeaves_) {
-            if (!trySpawnOne()) break;
-            --pendingSpawns_;
-            spawned = true;
+        if (pendingSpawns_ <= 0 || spawnCooldown_ > 0.0) return;
+        if (aliveCount() >= maxLeaves_) return;
+        if (!trySpawnOne()) return;
+        --pendingSpawns_;
+        spawnCooldown_ = kSpawnIntervalSec;
+        emitStats();
+        update();
+    }
+
+    // 吊销同理：每 kDespawnIntervalSec 收一片，优先收生命最长（id 最小）的。
+    void flushRemovals() {
+        if (resizePaused_) return;
+        if (pendingRemovals_ <= 0 || removeCooldown_ > 0.0) return;
+        if (!removeOldest()) {
+            pendingRemovals_ = 0;
+            return;
         }
-        if (spawned) {
-            emitStats();
-            update();
+        --pendingRemovals_;
+        removeCooldown_ = kDespawnIntervalSec;
+        emitStats();
+        update();
+    }
+
+    void beginRemoval(LeafBody& L) {
+        if (L.state == LeafState::Removing) return;
+        L.state = LeafState::Removing;
+        L.vel = {};
+        L.angVel = 0.0;
+        L.removeT = 0.0;
+        L.fadeFrom = L.alpha;
+    }
+
+    bool removeOldest() {
+        int victim = -1;
+        quint64 oldest = ~quint64(0);
+        for (int i = 0; i < leaves_.size(); ++i) {
+            const LeafState s = leaves_[i].state;
+            if (s == LeafState::Free || s == LeafState::Removing
+                || s == LeafState::Dragging) continue;
+            if (leaves_[i].id < oldest) {
+                oldest = leaves_[i].id;
+                victim = i;
+            }
         }
+        if (victim < 0) return false;
+        beginRemoval(leaves_[victim]);
+        return true;
     }
 
     bool rigidOverlap(const LeafBody& A, const LeafBody& B) const {
         // 刷新时留 1px 余量，第一帧也不会生成成相交状态。
         return polygonContact(A, B, 1.0, nullptr, nullptr);
+    }
+
+    int acquireLeafSlot() {
+        for (int i = 0; i < leaves_.size(); ++i) {
+            if (leaves_[i].state == LeafState::Free) return i;
+        }
+        leaves_.append(LeafBody{});
+        return leaves_.size() - 1;
     }
 
     bool trySpawnOne() {
@@ -897,19 +1601,28 @@ private:
                 w.top() + margin + QRandomGenerator::global()->generateDouble()
                                        * spawnHeight);
             cand.angle = (QRandomGenerator::global()->generateDouble() - 0.5) * 1.6;
+            clampToWorld(cand);
             bool overlaps = false;
             for (const LeafBody& o : leaves_) {
-                if (o.state == LeafState::Removing) continue;
+                if (o.state == LeafState::Free || o.state == LeafState::Removing) continue;
                 if (rigidOverlap(cand, o)) {
                     overlaps = true;
                     break;
                 }
             }
             if (overlaps) continue;
-            cand.vel = QPointF((QRandomGenerator::global()->generateDouble() - 0.5) * 40.0, 20.0);
-            cand.angVel = (QRandomGenerator::global()->generateDouble() - 0.5) * 2.4;
+            // 淡入期间静止，动画结束时才接管这份初速度。
+            cand.birthVel =
+                QPointF((QRandomGenerator::global()->generateDouble() - 0.5) * 40.0, 20.0);
+            cand.birthAngVel = (QRandomGenerator::global()->generateDouble() - 0.5) * 2.4;
+            cand.state = LeafState::Spawning;
+            cand.spawnT = 0.0;
+            cand.alpha = 0.0;
+            cand.vel = {};
+            cand.angVel = 0.0;
             cand.id = ++nextId_;
-            leaves_.append(cand);
+            LeafBody& slot = leaves_[acquireLeafSlot()];
+            slot = cand;
             return true;
         }
         // 顶部刷新区暂时没有空位：保留 pending，等叶子落下后再重试。
@@ -918,18 +1631,7 @@ private:
 
     void cullOverflowImmediate() {
         while (aliveCount() > maxLeaves_) {
-            int victim = -1;
-            quint64 oldest = ~quint64(0);
-            for (int i = 0; i < leaves_.size(); ++i) {
-                if (leaves_[i].state == LeafState::Removing) continue;
-                if (leaves_[i].state == LeafState::Dragging) continue;
-                if (leaves_[i].id < oldest) {
-                    oldest = leaves_[i].id;
-                    victim = i;
-                }
-            }
-            if (victim < 0) break;
-            leaves_.removeAt(victim);
+            if (!removeOldest()) break;
         }
     }
 
@@ -947,10 +1649,10 @@ private:
         for (int it = 0; it < iters; ++it) {
             for (int i = 0; i < leaves_.size(); ++i) {
                 LeafBody& A = leaves_[i];
-                if (A.state == LeafState::Removing) continue;
+                if (!isPhysical(A.state)) continue;
                 for (int j = i + 1; j < leaves_.size(); ++j) {
                     LeafBody& B = leaves_[j];
-                    if (B.state == LeafState::Removing) continue;
+                    if (!isPhysical(B.state)) continue;
                     const bool aDrag = A.state == LeafState::Dragging;
                     const bool bDrag = B.state == LeafState::Dragging;
                     if (draggedContactsOnly && !aDrag && !bDrag) continue;
@@ -976,7 +1678,7 @@ private:
                 }
             }
             for (LeafBody& L : leaves_) {
-                if (L.state != LeafState::Removing) clampToWorld(L);
+                if (isPhysical(L.state)) clampToWorld(L);
             }
         }
     }
@@ -984,10 +1686,10 @@ private:
     void solveVelocities() {
         for (int i = 0; i < leaves_.size(); ++i) {
             LeafBody& A = leaves_[i];
-            if (A.state == LeafState::Removing) continue;
+            if (!isPhysical(A.state)) continue;
             for (int j = i + 1; j < leaves_.size(); ++j) {
                 LeafBody& B = leaves_[j];
-                if (B.state == LeafState::Removing) continue;
+                if (!isPhysical(B.state)) continue;
                 QPointF n;
                 qreal overlap = 0.0;
                 if (!contactData(A, B, &n, &overlap)) continue;
@@ -1024,7 +1726,7 @@ private:
     void solveBoundaryVelocities() {
         const QRectF w = worldRect();
         for (LeafBody& L : leaves_) {
-            if (L.state == LeafState::Removing || L.state == LeafState::Dragging) continue;
+            if (L.state != LeafState::Idle) continue;
             qreal ex = 0.0, ey = 0.0;
             rigidExtents(L, &ex, &ey);
             if (L.pos.x() <= w.left() + ex + 0.5 && L.vel.x() < 0.0) {
@@ -1034,6 +1736,10 @@ private:
             if (L.pos.x() >= w.right() - ex - 0.5 && L.vel.x() > 0.0) {
                 L.vel.setX(-L.vel.x() * kRestitution);
                 L.vel.setY(L.vel.y() * kFloorFriction);
+            }
+            if (L.pos.y() <= w.top() + ey + 0.5 && L.vel.y() < 0.0) {
+                L.vel.setY(-L.vel.y() * kRestitution);
+                L.vel.setX(L.vel.x() * kFloorFriction);
             }
             if (L.pos.y() >= w.bottom() - ey - 0.5 && L.vel.y() > 0.0) {
                 L.vel.setY(-L.vel.y() * kRestitution);
@@ -1048,7 +1754,7 @@ private:
     qreal maxOverlapWith(const LeafBody& dragged) const {
         qreal worst = 0.0;
         for (const LeafBody& other : leaves_) {
-            if (&other == &dragged || other.state == LeafState::Removing) continue;
+            if (&other == &dragged || !isPhysical(other.state)) continue;
             QPointF n;
             qreal overlap = 0.0;
             if (contactData(dragged, other, &n, &overlap)) worst = std::max(worst, overlap);
@@ -1089,7 +1795,7 @@ private:
 
     void squeezeIntoBounds() {
         for (LeafBody& L : leaves_) {
-            if (L.state == LeafState::Removing) continue;
+            if (L.state == LeafState::Free || L.state == LeafState::Removing) continue;
             clampToWorld(L);
         }
         solvePositions(kResizeSettleIters,
@@ -1101,20 +1807,37 @@ private:
     void onTick() {
         if (resizePaused_) return;
         const qreal dt = kTickMs / 1000.0;
-        bool dirty = pendingSpawns_ > 0;
+        bool dirty = pendingSpawns_ > 0 || pendingRemovals_ > 0;
         bool statsDirty = false;
+        spawnCooldown_ = std::max(0.0, spawnCooldown_ - dt);
+        removeCooldown_ = std::max(0.0, removeCooldown_ - dt);
+        // 已满时丢掉多余待生成，避免队列无限堆积。
+        if (aliveCount() >= maxLeaves_ && pendingSpawns_ > 0) {
+            pendingSpawns_ = 0;
+            statsDirty = true;
+        }
         flushSpawns();
+        flushRemovals();
         advanceDragged(dt);
 
         for (LeafBody& L : leaves_) {
+            if (L.state == LeafState::Free) continue;
+            if (L.state == LeafState::Spawning) {
+                L.spawnT = std::min(1.0, L.spawnT + dt / kFadeInSec);
+                L.alpha = L.spawnT;
+                if (L.spawnT >= 1.0) {
+                    L.state = LeafState::Idle;
+                    L.alpha = 1.0;
+                    L.vel = L.birthVel;
+                    L.angVel = L.birthAngVel;
+                    clampToWorld(L);
+                }
+                dirty = true;
+                continue;
+            }
             if (L.state == LeafState::Removing) {
-                L.removeT = std::min(1.0, L.removeT + dt / 0.34);
-                const QRectF trash = trashDrawRect();
-                const QPointF mouth(trash.center().x(), trash.top() + trash.height() * 0.18);
-                const qreal follow = 1.0 - std::exp(-12.0 * dt);
-                L.pos += (mouth - L.pos) * follow;
-                L.angle += ((L.id & 1) ? 5.2 : -5.2) * dt;
-                L.alpha = 1.0 - L.removeT * L.removeT;
+                L.removeT = std::min(1.0, L.removeT + dt / kFadeOutSec);
+                L.alpha = L.fadeFrom * (1.0 - L.removeT);
                 dirty = true;
                 continue;
             }
@@ -1154,12 +1877,16 @@ private:
             dirty = true;
         }
 
-        for (int i = leaves_.size() - 1; i >= 0; --i) {
-            if (leaves_[i].state == LeafState::Removing && leaves_[i].removeT >= 1.0) {
-                leaves_.removeAt(i);
+        for (LeafBody& L : leaves_) {
+            if (L.state == LeafState::Removing && L.removeT >= 1.0) {
+                resetLeafBody(&L);
                 dirty = true;
                 statsDirty = true;
             }
+        }
+        // 收掉尾部空槽，池不会只涨不缩。
+        while (!leaves_.isEmpty() && leaves_.last().state == LeafState::Free) {
+            leaves_.removeLast();
         }
 
         if (dirty) {
@@ -1171,9 +1898,12 @@ private:
     QTimer* tick_ = nullptr;
     QVector<LeafBody> leaves_;
     int pendingSpawns_ = 0;
+    int pendingRemovals_ = 0;
+    qreal spawnCooldown_ = 0.0;
+    qreal removeCooldown_ = 0.0;
     int maxLeaves_ = kMinLeaves;
     int theoreticalCapacity_ = 0;
-    int preferredMaxLeaves_ = 0;
+    int preferredPercent_ = kCapPercentDefault;
     qreal leafScale_ = 1.0;
     qreal trashScale_ = 1.0;
     quint64 nextId_ = 1;
@@ -1201,10 +1931,25 @@ public:
     explicit LeafRoot(QMainWindow* win) : RippleOverlayRoot(win) {
         content()->setAttribute(Qt::WA_TransparentForMouseEvents, false);
         canvas_ = new LeafCanvas(content());
+        rulesStrip_ = new LeafRulesStrip(content());
+        rulesStrip_->raise();
         canvas_->commitViewport(content()->rect());
+        setGiftRules(loadLeafGiftRules());
     }
 
     LeafCanvas* canvas() const { return canvas_; }
+
+    void setGiftRules(const QVector<LeafGiftRule>& rules) {
+        if (rulesStrip_) {
+            rulesStrip_->setRules(rules);
+            layoutRulesStrip();
+        }
+    }
+
+    void releaseHeavyResources() {
+        if (canvas_) canvas_->shutdown();
+        if (rulesStrip_) rulesStrip_->releaseHeavyResources();
+    }
 
 protected:
     bool wantsSyncResizeLayout() const override { return false; }
@@ -1220,16 +1965,33 @@ protected:
 
     void onContentGeometryChanged() override {
         if (canvas_ && !resizing()) canvas_->commitViewport(content()->rect());
+        layoutRulesStrip();
     }
 
     void onContentGeometryWhileResizing() override {}
 
     void onResizeResume() override {
         if (canvas_) canvas_->endResizePause();
+        layoutRulesStrip();
     }
 
 private:
+    void layoutRulesStrip() {
+        if (!rulesStrip_ || !content()) return;
+        // 相对原先宽约缩 1/4。
+        const int w = std::min(210, std::max(135, static_cast<int>(content()->width() * 0.375)));
+        rulesStrip_->setFixedWidth(w);
+        // 高度按卡片内容估，避免 adjustSize 在半透明父窗上算出 0。
+        const int h = std::max(40, rulesStrip_->sizeHint().height());
+        const int maxH = std::max(40, content()->height() - 12);
+        rulesStrip_->setFixedHeight(std::min(h, maxH));
+        rulesStrip_->move(6, 6);
+        rulesStrip_->raise();
+        rulesStrip_->show();
+    }
+
     LeafCanvas* canvas_ = nullptr;
+    LeafRulesStrip* rulesStrip_ = nullptr;
 };
 
 class LeafOverlayController final : public QObject {
@@ -1242,21 +2004,43 @@ public:
 
     LeafCanvas* canvas() const { return root_ ? root_->canvas() : nullptr; }
 
+    void setGiftRules(const QVector<LeafGiftRule>& rules) {
+        if (root_) root_->setGiftRules(rules);
+    }
+
     void show(std::function<void()> onClosed) {
         auto& host = OverlayHostService::instance();
         root_ = nullptr;
         auto* shell = host.shell(OverlayToolId::Leaf);
         root_ = new LeafRoot(shell);
-        const int def = cmToPx(12.0);
+        const QVector<LeafGiftRule> rules = loadLeafGiftRules();
+        root_->setGiftRules(rules);
+        // 最小高度：顶栏 + 10 张规则卡完整渲染空间 + 少许游玩边距。
+        constexpr int kOverlayCardH = 32;
+        constexpr int kOverlayCardGap = 4;
+        constexpr int kOverlayStripPad = 12;
+        const int rulesBlockH = kOverlayStripPad
+            + kMaxGiftRules * kOverlayCardH
+            + (kMaxGiftRules - 1) * kOverlayCardGap;
+        const int minW = std::max(cmToPx(11.0), 320);
+        const int minH = RippleOverlayRoot::kTopbarH + rulesBlockH + cmToPx(2.5);
+        const int defW = std::max(minW, cmToPx(14.0));
+        const int defH = std::max(minH, static_cast<int>(defW * 1.15));
         host.show(OverlayToolId::Leaf, QStringLiteral("捡叶子"), kGeoKey,
-                  cmToPx(6.0), cmToPx(7.0), def, static_cast<int>(def * 1.25), root_,
+                  minW, minH, defW, defH, root_,
                   [this, onClosed]() {
-                      root_ = nullptr;
+                      unmount();
                       if (onClosed) onClosed();
                   });
     }
 
 private:
+    void unmount() {
+        if (root_) root_->releaseHeavyResources();
+        // 只卸本窗图标，不清全局礼物缓存，避免设置页/选择器随后加载失败。
+        root_ = nullptr;
+    }
+
     LeafRoot* root_ = nullptr;
 };
 
@@ -1286,6 +2070,7 @@ public:
             host.teardown(OverlayToolId::Leaf);
             return;
         }
+        pushLeafGiftRulesToCore(loadLeafGiftRules());
         controller()->show([this, onClosed]() {
             if (onClosed) onClosed();
             if (tryRelease_) tryRelease_();
@@ -1297,8 +2082,23 @@ public:
         if (auto* c = controller()->canvas()) c->enqueueSpawn(count);
     }
 
-    void applySettings(int maxLeaves, int leafPercent, int trashPercent) {
-        if (auto* c = canvas()) c->applySettings(maxLeaves, leafPercent, trashPercent);
+    void applySettings(int maxPercent, int leafPercent, int trashPercent) {
+        if (auto* c = canvas()) c->applySettings(maxPercent, leafPercent, trashPercent);
+    }
+
+    void applyGiftRules(const QVector<LeafGiftRule>& rules) {
+        if (overlayCtrl_) overlayCtrl_->setGiftRules(rules);
+    }
+
+    void applyLeafDelta(int delta) {
+        if (!isOverlayActive()) return;
+        if (auto* c = canvas()) c->applyLeafDelta(delta);
+    }
+
+    void onCorePacket(const QJsonObject& packet) override {
+        if (packet.value(QStringLiteral("op")).toString() != QStringLiteral("leaf.spawn")) return;
+        if (!isOverlayActive()) return;
+        applyLeafDelta(packet.value(QStringLiteral("count")).toInt());
     }
 
 private:
@@ -1306,17 +2106,28 @@ private:
     std::function<void()> tryRelease_;
 };
 
-class LeafToolWindow final : public ToolWindowBase {
+class LeafToolWindow final : public TabbedToolWindow {
 public:
-    static constexpr int kWidth = 500;
-    static constexpr int kHeight = 720;
+    static constexpr int kWidth = 720;
+    static constexpr int kHeight = 700;
 
     explicit LeafToolWindow(CoreClient* core, LeafToolRuntime* runtime)
-        : ToolWindowBase(core), runtime_(runtime) {
+        : TabbedToolWindow(core, {QStringLiteral("设置"), QStringLiteral("礼物规则")}),
+          runtime_(runtime) {
         setWindowTitle(QStringLiteral("捡叶子"));
         setFixedSize(kWidth, kHeight);
-        build();
+        giftRules_ = loadLeafGiftRules();
+        mainTab_ = buildMainTab();
+        addTabPage(mainTab_);
+        addTabPlaceholder();
+        setTabFactory(1, [this]() {
+            QWidget* page = buildGiftTab();
+            refreshTheme();
+            return page;
+        });
+        switchTab(0);
         refreshTheme();
+        pushGiftRulesToCore();
         liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
         statsTimer_ = new QTimer(this);
         statsTimer_->setInterval(200);
@@ -1327,11 +2138,17 @@ public:
     QString toolId() const override { return QStringLiteral("leaf"); }
     void onCorePacket(const QJsonObject&) override {}
 
+    void onPanelClosing() override {
+        liveaio::util::hideSessionGiftPicker();
+        releaseGiftTabIcons();
+    }
+
     void refreshTheme() override {
         applyChromeStyle();
         refreshOpenBtn();
         styleSpawnBtn();
         if (simWidget_) simWidget_->refreshTheme();
+        if (addRuleBtn_) styleAddRuleBtn();
         if (hint_) {
             hint_->setStyleSheet(QStringLiteral("color: %1; background: transparent;")
                                      .arg(theme().textMuted));
@@ -1344,35 +2161,58 @@ public:
             simDesc_->setStyleSheet(QStringLiteral("color: %1; background: transparent; font-size: 12px;")
                                         .arg(theme().textMuted));
         }
+        if (rulesHint_) {
+            rulesHint_->setStyleSheet(QStringLiteral("color: %1; background: transparent; font-size: 12px;")
+                                          .arg(theme().textMuted));
+        }
+        for (LeafGiftRuleCard* card : ruleCards_) {
+            if (card) card->refreshTheme();
+        }
     }
 
     void applyChromeStyle() override { setStyleSheet(liveaio::util::toolQss()); }
 
 private:
-    void build() {
-        auto* root = new QWidget(this);
-        root->setObjectName(QStringLiteral("ToolRoot"));
-        setCentralWidget(root);
-        auto* lay = new QVBoxLayout(root);
-        lay->setContentsMargins(28, 24, 28, 24);
-        lay->setSpacing(16);
+    QLabel* formLabel(const QString& text, QWidget* parent, int width = 108) {
+        return liveaio::util::formLabel(text, parent, width);
+    }
 
-        auto* title = new QLabel(QStringLiteral("捡叶子"), root);
+    QWidget* buildMainTab() {
+        auto* page = new QWidget;
+        page->setObjectName(QStringLiteral("ToolRoot"));
+        auto* lay = new QVBoxLayout(page);
+        lay->setContentsMargins(20, 12, 20, 12);
+        lay->setSpacing(10);
+
+        auto* title = new QLabel(QStringLiteral("捡叶子"), page);
         title->setObjectName(QStringLiteral("ToolPageTitle"));
-        lay->addWidget(title);
+        {
+            QFont f = title->font();
+            f.setPixelSize(20);
+            f.setWeight(QFont::DemiBold);
+            title->setFont(f);
+        }
+        lay->addWidget(title, 0, Qt::AlignTop);
 
         hint_ = new QLabel(
             QStringLiteral("打开悬浮窗后可用「模拟送礼」或「投放测试」生成叶子，拖到垃圾桶消除。"),
-            root);
+            page);
         hint_->setWordWrap(true);
         hint_->setObjectName(QStringLiteral("ToolTip"));
-        lay->addWidget(hint_);
+        hint_->setContentsMargins(0, 0, 0, 0);
+        {
+            QFont f = hint_->font();
+            f.setPixelSize(12);
+            hint_->setFont(f);
+        }
+        hint_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+        lay->addWidget(hint_, 0, Qt::AlignTop);
 
-        auto* card = new QFrame(root);
+        auto* card = new QFrame(page);
         card->setObjectName(QStringLiteral("Card"));
         auto* cardLay = new QVBoxLayout(card);
-        cardLay->setContentsMargins(20, 16, 20, 16);
-        cardLay->setSpacing(12);
+        cardLay->setContentsMargins(16, 12, 16, 12);
+        cardLay->setSpacing(8);
 
         stats_ = new QLabel(QStringLiteral("场上 0 / 上限 — · 队列 0"), card);
         cardLay->addWidget(stats_);
@@ -1398,24 +2238,45 @@ private:
         cardLay->addLayout(row);
         lay->addWidget(card);
 
-        auto* settingsCard = new QFrame(root);
+        auto* settingsCard = new QFrame(page);
         settingsCard->setObjectName(QStringLiteral("Card"));
         auto* settingsLay = new QVBoxLayout(settingsCard);
-        settingsLay->setContentsMargins(20, 16, 20, 16);
-        settingsLay->setSpacing(10);
+        settingsLay->setContentsMargins(16, 10, 16, 12);
+        settingsLay->setSpacing(6);
         auto* settingsTitle = new QLabel(QStringLiteral("容量与尺寸"), settingsCard);
         settingsTitle->setObjectName(QStringLiteral("CardTitle"));
-        settingsLay->addWidget(settingsTitle);
+        {
+            QFont f = settingsTitle->font();
+            f.setPixelSize(13);
+            f.setWeight(QFont::DemiBold);
+            settingsTitle->setFont(f);
+        }
+        settingsTitle->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+        settingsLay->addWidget(settingsTitle, 0, Qt::AlignTop);
 
+        // 预览在左、尺寸控件在右；预览固定尺寸，不拉伸。
+        auto* sizeRow = new QHBoxLayout;
+        sizeRow->setSpacing(12);
+        sizeRow->setContentsMargins(0, 0, 0, 0);
+        sizeRow->setAlignment(Qt::AlignTop);
         preview_ = new LeafScalePreview(settingsCard);
-        settingsLay->addWidget(preview_);
+        sizeRow->addWidget(preview_, 0, Qt::AlignTop);
 
-        auto* settingsGrid = new QGridLayout;
-        settingsGrid->setHorizontalSpacing(12);
+        auto* controls = new QWidget(settingsCard);
+        controls->setMinimumWidth(200);
+        auto* settingsGrid = new QGridLayout(controls);
+        settingsGrid->setContentsMargins(0, 0, 0, 0);
+        settingsGrid->setHorizontalSpacing(8);
         settingsGrid->setVerticalSpacing(8);
-        maxLeavesSpin_ = new QSpinBox(settingsCard);
-        leafScaleSpin_ = new QSpinBox(settingsCard);
-        trashScaleSpin_ = new QSpinBox(settingsCard);
+        settingsGrid->setColumnStretch(1, 1);
+        maxLeavesSpin_ = new liveaio::util::ThemedSpinBox(controls);
+        leafScaleSpin_ = new liveaio::util::ThemedSpinBox(controls);
+        trashScaleSpin_ = new liveaio::util::ThemedSpinBox(controls);
+        for (QSpinBox* spin : {maxLeavesSpin_, leafScaleSpin_, trashScaleSpin_}) {
+            spin->setFixedHeight(34);
+            spin->setMinimumWidth(100);
+            spin->setAlignment(Qt::AlignCenter);
+        }
         leafScaleSpin_->setRange(50, 200);
         trashScaleSpin_->setRange(50, 200);
         leafScaleSpin_->setSingleStep(5);
@@ -1424,21 +2285,20 @@ private:
         trashScaleSpin_->setSuffix(QStringLiteral("%"));
         leafScaleSpin_->setValue(scalePercent(kLeafScaleKey));
         trashScaleSpin_->setValue(scalePercent(kTrashScaleKey));
-        const int initialTheory = maxLeavesForSize(
-            savedViewportSize(), leafScaleSpin_->value() / 100.0);
-        maxLeavesSpin_->setRange(capacityLower(initialTheory),
-                                 std::max(capacityLower(initialTheory),
-                                          capacityUpper(initialTheory)));
-        maxLeavesSpin_->setValue(configuredMaxLeaves(initialTheory));
+        // 容量按理论上限的百分比给，20%~70%。
+        maxLeavesSpin_->setRange(kCapPercentMin, kCapPercentMax);
+        maxLeavesSpin_->setSingleStep(5);
+        maxLeavesSpin_->setSuffix(QStringLiteral("%"));
+        maxLeavesSpin_->setValue(configuredMaxPercent());
         preview_->setScales(leafScaleSpin_->value(), trashScaleSpin_->value());
-        settingsGrid->addWidget(new QLabel(QStringLiteral("最多同时出现"), settingsCard), 0, 0);
-        settingsGrid->addWidget(maxLeavesSpin_, 0, 1);
-        settingsGrid->addWidget(new QLabel(QStringLiteral("叶子尺寸"), settingsCard), 1, 0);
-        settingsGrid->addWidget(leafScaleSpin_, 1, 1);
-        settingsGrid->addWidget(new QLabel(QStringLiteral("垃圾桶尺寸"), settingsCard), 2, 0);
-        settingsGrid->addWidget(trashScaleSpin_, 2, 1);
-        settingsGrid->setColumnStretch(0, 1);
-        settingsLay->addLayout(settingsGrid);
+        settingsGrid->addWidget(formLabel(QStringLiteral("最多同时出现"), controls, 96), 0, 0);
+        settingsGrid->addWidget(maxLeavesSpin_, 0, 1, Qt::AlignLeft);
+        settingsGrid->addWidget(formLabel(QStringLiteral("叶子尺寸"), controls, 96), 1, 0);
+        settingsGrid->addWidget(leafScaleSpin_, 1, 1, Qt::AlignLeft);
+        settingsGrid->addWidget(formLabel(QStringLiteral("垃圾桶尺寸"), controls, 96), 2, 0);
+        settingsGrid->addWidget(trashScaleSpin_, 2, 1, Qt::AlignLeft);
+        sizeRow->addWidget(controls, 0, Qt::AlignTop);
+        settingsLay->addLayout(sizeRow);
         lay->addWidget(settingsCard);
 
         QObject::connect(maxLeavesSpin_, &QSpinBox::valueChanged,
@@ -1448,35 +2308,194 @@ private:
         QObject::connect(trashScaleSpin_, &QSpinBox::valueChanged,
                          this, [this](int) { applySettingsFromControls(); });
 
-        auto* simCard = new QFrame(root);
+        auto* simCard = new QFrame(page);
         simCard->setObjectName(QStringLiteral("Card"));
         auto* simLay = new QVBoxLayout(simCard);
-        simLay->setContentsMargins(20, 16, 20, 16);
-        simLay->setSpacing(10);
+        simLay->setContentsMargins(16, 10, 16, 12);
+        simLay->setSpacing(6);
         auto* simTitle = new QLabel(QStringLiteral("模拟送礼"), simCard);
         simTitle->setObjectName(QStringLiteral("CardTitle"));
-        simLay->addWidget(simTitle);
-        simWidget_ = new ot::SimGiftWidget(simCard);
+        {
+            QFont f = simTitle->font();
+            f.setPixelSize(13);
+            f.setWeight(QFont::DemiBold);
+            simTitle->setFont(f);
+        }
+        simTitle->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
+        simLay->addWidget(simTitle, 0, Qt::AlignTop);
+        simWidget_ = new liveaio::util::SimGiftWidget(simCard);
         simWidget_->setClosedTip(QStringLiteral("请先打开捡叶子悬浮窗"));
         simWidget_->setOnPush([this](const QString& gift, int count) { pushSimGift(gift, count); });
         simLay->addWidget(simWidget_);
         simDesc_ = new QLabel(
-            QStringLiteral("向已打开的捡叶子悬浮窗推送模拟礼物，数量对应投放叶子片数"),
+            QStringLiteral("按「礼物规则」页匹配后增减叶子；未配置对应礼物则无效果。"),
             simCard);
         simDesc_->setWordWrap(true);
         simDesc_->setObjectName(QStringLiteral("ToolTip"));
         simLay->addWidget(simDesc_);
         lay->addWidget(simCard);
+        // 只让底部吸收窗口剩余高度，避免标题、卡片被布局强行拉高。
+        lay->addStretch(1);
+        auto* scroll = liveaio::util::scrollPage(page);
+        scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        return scroll;
+    }
 
-        lay->addStretch();
-        refreshOpenBtn();
-        refreshStats();
+    QWidget* buildGiftTab() {
+        auto* page = new QWidget;
+        page->setObjectName(QStringLiteral("ToolRoot"));
+        auto* outer = new QVBoxLayout(page);
+        outer->setContentsMargins(20, 16, 20, 16);
+        outer->setSpacing(10);
+
+        auto* giftCard = new QFrame(page);
+        giftCard->setObjectName(QStringLiteral("Card"));
+        auto* giftLay = new QVBoxLayout(giftCard);
+        giftLay->setContentsMargins(16, 14, 16, 14);
+        giftLay->setSpacing(8);
+        auto* giftTitle = new QLabel(QStringLiteral("礼物加叶子"), giftCard);
+        giftTitle->setObjectName(QStringLiteral("CardTitle"));
+        giftLay->addWidget(giftTitle);
+        rulesHint_ = new QLabel(
+            QStringLiteral("单列规则最多 10 条；礼物为 Null 的条目会被忽略。"), giftCard);
+        rulesHint_->setWordWrap(true);
+        giftLay->addWidget(rulesHint_);
+
+        auto* scroll = new QScrollArea(giftCard);
+        scroll->setWidgetResizable(true);
+        scroll->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setStyleSheet(QStringLiteral(
+            "QScrollArea { border: none; background: transparent; }"));
+        rulesHost_ = new QWidget(scroll);
+        rulesHost_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+        rulesLay_ = new QVBoxLayout(rulesHost_);
+        rulesLay_->setContentsMargins(0, 0, 0, 0);
+        rulesLay_->setSpacing(8);
+        rulesLay_->setAlignment(Qt::AlignTop);
+        scroll->setWidget(rulesHost_);
+        giftLay->addWidget(scroll, 1);
+
+        addRuleBtn_ = new QPushButton(QStringLiteral("添加规则"), giftCard);
+        addRuleBtn_->setCursor(Qt::PointingHandCursor);
+        addRuleBtn_->setFixedHeight(34);
+        QObject::connect(addRuleBtn_, &QPushButton::clicked, this, [this]() { addGiftRule(); });
+        giftLay->addWidget(addRuleBtn_, 0, Qt::AlignLeft);
+        outer->addWidget(giftCard, 1);
+        rebuildGiftRuleCards();
+        return page;
+    }
+
+    QSet<QString> assignedGifts(const LeafGiftRuleCard* except = nullptr) const {
+        QSet<QString> out;
+        for (LeafGiftRuleCard* card : ruleCards_) {
+            if (!card || card == except) continue;
+            const QString g = normalizeLeafGiftName(card->currentGift());
+            if (!g.isEmpty()) out.insert(g);
+        }
+        return out;
+    }
+
+    void rebuildGiftRuleCards() {
+        if (!rulesLay_) return;
+        while (QLayoutItem* item = rulesLay_->takeAt(0)) {
+            if (QWidget* w = item->widget()) w->deleteLater();
+            delete item;
+        }
+        ruleCards_.clear();
+        if (giftRules_.isEmpty()) giftRules_.append(LeafGiftRule{});
+        for (int i = 0; i < giftRules_.size(); ++i) {
+            appendGiftRuleCard(giftRules_.at(i), 40 * i);
+        }
+        updateAddRuleBtn();
+    }
+
+    void appendGiftRuleCard(const LeafGiftRule& rule, int iconDelayMs = 0) {
+        if (!rulesLay_) return;
+        // 尾部弹性占位可能不止一个，全部清掉，新卡片才会紧跟上一条。
+        while (rulesLay_->count() > 0) {
+            QLayoutItem* last = rulesLay_->itemAt(rulesLay_->count() - 1);
+            if (!last || !last->spacerItem()) break;
+            delete rulesLay_->takeAt(rulesLay_->count() - 1);
+        }
+        auto* card = new LeafGiftRuleCard(rule, rulesHost_);
+        card->setCallbacks(
+            [this]() { persistGiftRulesFromCards(); },
+            [this](LeafGiftRuleCard* target) {
+                auto* picker = liveaio::util::sessionGiftPicker();
+                if (!picker) return;
+                picker->setOnPicked([this, target](const QString& name) {
+                    if (target) target->applyGift(name);
+                });
+                picker->openAt(target->pickAnchor(), assignedGifts(target), false);
+            },
+            [this](LeafGiftRuleCard* target) { removeGiftRuleCard(target); },
+            [this, card]() { return assignedGifts(card); });
+        rulesLay_->addWidget(card, 0, Qt::AlignTop);
+        ruleCards_.append(card);
+        card->reloadIconDeferred(iconDelayMs);
+        rulesLay_->addStretch(1);
+    }
+
+    void addGiftRule() {
+        if (ruleCards_.size() >= kMaxGiftRules) return;
+        appendGiftRuleCard(LeafGiftRule{}, 0);
+        persistGiftRulesFromCards();
+        updateAddRuleBtn();
+    }
+
+    void removeGiftRuleCard(LeafGiftRuleCard* card) {
+        if (!card) return;
+        ruleCards_.removeAll(card);
+        card->deleteLater();
+        if (ruleCards_.isEmpty()) appendGiftRuleCard(LeafGiftRule{}, 0);
+        persistGiftRulesFromCards();
+        updateAddRuleBtn();
+    }
+
+    void releaseGiftTabIcons() {
+        for (LeafGiftRuleCard* card : ruleCards_) {
+            if (card) card->releaseIcon();
+        }
+    }
+
+    void persistGiftRulesFromCards() {
+        giftRules_.clear();
+        for (LeafGiftRuleCard* card : ruleCards_) {
+            if (card) giftRules_.append(card->toRule());
+        }
+        if (giftRules_.size() > kMaxGiftRules) giftRules_.resize(kMaxGiftRules);
+        saveLeafGiftRules(giftRules_);
+        pushGiftRulesToCore();
+        if (runtime_) runtime_->applyGiftRules(giftRules_);
+    }
+
+    void pushGiftRulesToCore() {
+        pushLeafGiftRulesToCore(giftRules_);
+    }
+
+    void updateAddRuleBtn() {
+        if (!addRuleBtn_) return;
+        addRuleBtn_->setEnabled(ruleCards_.size() < kMaxGiftRules);
+        styleAddRuleBtn();
+    }
+
+    void styleAddRuleBtn() {
+        if (!addRuleBtn_) return;
+        addRuleBtn_->setStyleSheet(liveaio::util::qssOutlined(34));
+        if (!addRuleBtn_->isEnabled()) {
+            const auto& C = theme();
+            addRuleBtn_->setStyleSheet(QStringLiteral(
+                "QPushButton { background: %1; color: %2; border: 1.5px solid %2;"
+                " border-radius: 8px; font-size: 13px; font-weight: 600; padding: 0 14px; }"
+            ).arg(C.card, C.border));
+        }
     }
 
     void pushSimGift(const QString& gift, int count) {
         if (!runtime_ || !runtime_->isOverlayActive()) return;
         const int n = std::max(1, count);
-        runtime_->spawnTest(n);
+        pushGiftRulesToCore();
         sendCore(QJsonObject{
             {QStringLiteral("op"), QStringLiteral("tool.leaf.sim_gift")},
             {QStringLiteral("gift"), gift},
@@ -1488,12 +2507,14 @@ private:
 
     void toggleOverlay() {
         if (!runtime_) return;
+        pushGiftRulesToCore();
         QPointer<LeafToolWindow> guard(this);
         runtime_->toggleOverlay([guard]() {
             if (!guard) return;
             guard->refreshOpenBtn();
             guard->refreshStats();
         });
+        if (runtime_->isOverlayActive()) runtime_->applyGiftRules(giftRules_);
         refreshOpenBtn();
         refreshStats();
     }
@@ -1534,47 +2555,32 @@ private:
         return savedViewportSize();
     }
 
-    int syncCapacityRange() {
-        if (!maxLeavesSpin_ || !leafScaleSpin_) return 0;
-        const int theoretical = maxLeavesForSize(
-            capacityReferenceSize(), leafScaleSpin_->value() / 100.0);
-        const int lower = capacityLower(theoretical);
-        const int upper = std::max(lower, capacityUpper(theoretical));
-        const int value = std::clamp(maxLeavesSpin_->value(), lower, upper);
-        QSignalBlocker blocker(maxLeavesSpin_);
-        maxLeavesSpin_->setRange(lower, upper);
-        maxLeavesSpin_->setValue(value);
-        return value;
+    int currentMaxPercent() const {
+        return maxLeavesSpin_ ? clampCapPercent(maxLeavesSpin_->value())
+                              : kCapPercentDefault;
     }
 
     void applySettingsFromControls() {
         if (!maxLeavesSpin_ || !leafScaleSpin_ || !trashScaleSpin_) return;
-        const int maxLeaves = syncCapacityRange();
+        const int maxPercent = currentMaxPercent();
         const int leafPercent = leafScaleSpin_->value();
         const int trashPercent = trashScaleSpin_->value();
-        writeConfigValue(kMaxLeavesKey, maxLeaves);
+        writeConfigValue(kMaxPercentKey, maxPercent);
         writeConfigValue(kLeafScaleKey, leafPercent);
         writeConfigValue(kTrashScaleKey, trashPercent);
         if (preview_) preview_->setScales(leafPercent, trashPercent);
-        if (runtime_) runtime_->applySettings(maxLeaves, leafPercent, trashPercent);
+        if (runtime_) runtime_->applySettings(maxPercent, leafPercent, trashPercent);
         refreshStats();
     }
 
     void refreshStats() {
-        if (maxLeavesSpin_ && leafScaleSpin_) {
-            const int before = maxLeavesSpin_->value();
-            const int after = syncCapacityRange();
-            if (after != before) {
-                writeConfigValue(kMaxLeavesKey, after);
-                if (runtime_) {
-                    runtime_->applySettings(after, leafScaleSpin_->value(),
-                                            trashScaleSpin_->value());
-                }
-            }
-        }
         int alive = 0;
-        int maxN = kMinLeaves;
         int pending = 0;
+        // 悬浮窗没开时按上次视口尺寸估算上限，面板不会显示成 0。
+        int maxN = leavesForPercent(
+            maxLeavesForSize(capacityReferenceSize(),
+                             leafScaleSpin_ ? leafScaleSpin_->value() / 100.0 : 1.0),
+            currentMaxPercent());
         if (runtime_ && runtime_->isOverlayActive()) {
             if (auto* c = runtime_->controller()->canvas()) {
                 alive = c->aliveCount();
@@ -1598,17 +2604,24 @@ private:
     }
 
     LeafToolRuntime* runtime_ = nullptr;
+    QWidget* mainTab_ = nullptr;
     QLabel* hint_ = nullptr;
     QLabel* stats_ = nullptr;
     QLabel* simDesc_ = nullptr;
-    ot::SimGiftWidget* simWidget_ = nullptr;
+    QLabel* rulesHint_ = nullptr;
+    liveaio::util::SimGiftWidget* simWidget_ = nullptr;
     LeafScalePreview* preview_ = nullptr;
+    QWidget* rulesHost_ = nullptr;
+    QVBoxLayout* rulesLay_ = nullptr;
     QPushButton* spawnBtn_ = nullptr;
     QPushButton* openBtn_ = nullptr;
+    QPushButton* addRuleBtn_ = nullptr;
     QSpinBox* maxLeavesSpin_ = nullptr;
     QSpinBox* leafScaleSpin_ = nullptr;
     QSpinBox* trashScaleSpin_ = nullptr;
     QTimer* statsTimer_ = nullptr;
+    QVector<LeafGiftRule> giftRules_;
+    QVector<LeafGiftRuleCard*> ruleCards_;
 };
 
 static ToolRuntimeBase* createLeafRuntime(QObject* parent, std::function<void()> tryRelease) {

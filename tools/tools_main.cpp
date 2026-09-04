@@ -42,6 +42,7 @@
 #include "tools_common.cpp"
 #include "../resources/cpp/gift.cpp"
 #include "../resources/cpp/skin.cpp"
+#include "../util/gift_widgets.cpp"
 
 namespace liveaio::tools {
 using ToolSkin = liveaio::resources::ToolSkin;
@@ -119,7 +120,7 @@ public:
 
     void warm() { ensureCore(); }
 
-    ot::GiftPickerPopup* giftPicker() { return ot::sessionGiftPicker(); }
+    ot::GiftPickerPopup* giftPicker() { return liveaio::util::sessionGiftPicker(); }
 
     bool overlayCommand(const QString& id, const QString& action) {
         ensureCore();
@@ -188,10 +189,11 @@ private:
             g_appRoot = qEnvironmentVariable("LIVEAIO_ROOT");
             if (g_appRoot.isEmpty()) g_appRoot = QDir::currentPath();
         }
+        liveaio::util::setToolAppRoot(g_appRoot);
         prepareAppAlphaFormat();
         core_ = new CoreClient(this);
         installConfigBridge();
-        ot::setGiftPickerParent(this);
+        liveaio::util::setGiftPickerParent(this);
         core_->setPacketCallback([this](const QJsonObject& packet) { dispatchPacket(packet); });
         core_->setStatusCallback([this](bool connected) { dispatchStatus(connected); });
         core_->connectToCore();
@@ -235,7 +237,8 @@ private:
     void dispatchPacket(const QJsonObject& packet) {
         const QString op = packet.value(QStringLiteral("op")).toString();
         if (op != QStringLiteral("memo.item") && op != QStringLiteral("danmu.show")
-            && op != QStringLiteral("tick") && op != QStringLiteral("ledger")) {
+            && op != QStringLiteral("tick") && op != QStringLiteral("ledger")
+            && op != QStringLiteral("leaf.spawn")) {
             return;
         }
         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
@@ -293,5 +296,5 @@ extern "C" LIVEAIO_TOOLS_API void LiveAIO_ToolsApplyTheme(const char* theme_name
     liveaio::util::applyThemeName(name);
     // 只刷工具窗自身样式，禁止 qApp->setStyleSheet(toolQss) 盖掉主窗 shellQss。
     liveaio::tools::ToolsSession::instance().refreshOpenPanelsTheme();
-    if (auto* picker = liveaio::tools::ot::sessionGiftPicker()) picker->refreshTheme();
+    if (auto* picker = liveaio::util::sessionGiftPicker()) picker->refreshTheme();
 }

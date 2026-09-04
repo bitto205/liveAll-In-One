@@ -18,6 +18,7 @@ type hub struct {
 	connected bool
 	forceMode bool
 	overtime  *Engine
+	leaf      *LeafEngine
 	danmu     *Danmu
 	memo      *Memo
 	config    *ConfigStore
@@ -78,6 +79,14 @@ func startHub(ctx context.Context, root, tcp string, log *slog.Logger, shutdown 
 			h.send(Envelope{"op": OpLedger, "entries": entries})
 		},
 	)
+	h.leaf = NewLeaf(func(gift string, leaves int, user string) {
+		h.send(Envelope{
+			"op":    OpLeafSpawn,
+			"gift":  gift,
+			"count": leaves,
+			"user":  user,
+		})
+	})
 	h.danmu = NewDanmu()
 	h.memo = NewMemo()
 	h.overtime.StartTicker()
@@ -330,6 +339,25 @@ func (h *hub) handle(c *Conn, env Envelope) {
 		}
 		h.overtime.HandleGift(user, user, gift, count)
 
+	case OpToolLeafSet:
+		s := NormalizeLeafSettings(env["settings"])
+		h.leaf.SetSettings(s)
+
+	case OpToolLeafSim:
+		gift, _ := env["gift"].(string)
+		count := 1
+		switch v := env["count"].(type) {
+		case float64:
+			count = int(v)
+		case int:
+			count = v
+		}
+		user, _ := env["user"].(string)
+		if user == "" {
+			user = "sim"
+		}
+		h.leaf.HandleGift(user, user, gift, count)
+
 	case OpToolDanmuSet:
 		s := NormalizeDanmuSettings(env["settings"])
 		h.danmu.Set(s)
@@ -435,6 +463,7 @@ func (h *hub) afterMessage(m listener.Msg) {
 		}
 		diamonds = Diamonds(gift)
 		h.overtime.HandleGift(user, uid, gift, count)
+		h.leaf.HandleGift(user, uid, gift, count)
 	}
 	if show := h.danmu.Accept(m, diamonds); show != nil {
 		h.send(Envelope(show))

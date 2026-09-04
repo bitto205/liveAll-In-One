@@ -57,16 +57,6 @@ static int clampInt(const QVariant& raw, int lo, int hi) {
     return std::clamp(n, lo, hi);
 }
 
-static QString sanitizeDigits(const QString& text, int maxVal, int width = 3) {
-    QString digits;
-    for (const QChar& c : text) {
-        if (c.isDigit()) digits.append(c);
-        if (digits.size() >= width) break;
-    }
-    if (digits.isEmpty()) return QStringLiteral("0");
-    return QString::number(clampInt(digits, 0, maxVal));
-}
-
 static QVector<Rule> defaultRules() {
     QVector<Rule> out;
     for (const QString& gift : defaultGifts()) {
@@ -310,61 +300,19 @@ static constexpr int kPagePad = kSide + kScrollGutter / 2;
 static constexpr int kToolWinW = kPanelW + 2 * kPagePad;
 static constexpr int kToolWinH = 720;
 
-static constexpr int kPickerCols = 4;
-static constexpr int kPickerRows = 4;
-static constexpr int kPickerCell = 64;
-static constexpr int kPickerGutter = 16;
-static constexpr int kPickerW =
-    10 + kPickerCell * kPickerCols + 6 * (kPickerCols - 1) + 10 + kPickerGutter;
-static constexpr int kPickerH = 10 + 34 + 8 + kPickerRows * (kPickerCell + 18) + 10;
+using IntField = liveaio::util::IntField;
+using GiftPickerPopup = liveaio::util::GiftPickerPopup;
+using SimGiftWidget = liveaio::util::SimGiftWidget;
 
-static constexpr int kSimPickW = 90;
-static constexpr int kSimBtnH = 32;
-static constexpr int kSimBtnGap = 12;
+inline void setGiftPickerParent(QObject* parent) {
+    liveaio::util::setGiftPickerParent(parent);
+}
+inline GiftPickerPopup* sessionGiftPicker() { return liveaio::util::sessionGiftPicker(); }
+inline void hideSessionGiftPicker() { liveaio::util::hideSessionGiftPicker(); }
 
 // ═══════════════════════════════════════════
 // 基础控件
 // ═══════════════════════════════════════════
-
-// 非负整数输入；失焦 clamp 并回调。
-class IntField final : public QLineEdit {
-public:
-    IntField(int maxVal, int charW, int height = kCtrlH, int minWidth = -1,
-             QWidget* parent = nullptr)
-        : QLineEdit(parent), max_(maxVal) {
-        const QFontMetrics fm(QFont(QStringLiteral("Microsoft YaHei"), 11));
-        int w = fm.horizontalAdvance(QString(charW, QLatin1Char('8'))) + 16;
-        if (minWidth > 0) w = std::max(w, minWidth);
-        else if (charW >= 3) w = std::max(w, kValW);
-        else w = std::max(w, 36);
-        setFixedSize(w, height);
-        setAlignment(Qt::AlignCenter);
-        setText(QStringLiteral("0"));
-        QObject::connect(this, &QLineEdit::textChanged, this, [this](const QString& text) {
-            QString cleaned;
-            for (const QChar& c : text) {
-                if (c.isDigit()) cleaned.append(c);
-            }
-            if (cleaned != text) {
-                const QSignalBlocker blocker(this);
-                setText(cleaned.isEmpty() ? QStringLiteral("0") : cleaned);
-            }
-        });
-        QObject::connect(this, &QLineEdit::editingFinished, this, [this]() {
-            const QSignalBlocker blocker(this);
-            setText(sanitizeDigits(text(), max_));
-            if (onCommit_) onCommit_();
-        });
-    }
-
-    void setOnCommit(std::function<void()> cb) { onCommit_ = std::move(cb); }
-    int value() const { return sanitizeDigits(text(), max_).toInt(); }
-    void setValue(int n) { setText(sanitizeDigits(QString::number(n), max_)); }
-
-private:
-    int max_;
-    std::function<void()> onCommit_;
-};
 
 // 分区：居中加粗标题 + 无底色内容区。
 class SectionBlock final : public QFrame {
@@ -391,250 +339,6 @@ public:
 
     QVBoxLayout* content = nullptr;
 };
-
-// 礼物选择栏：名单（gift_info 全量键）打开时预加载，搜索走全量；
-// 网格单元格滚动分批挂载，缩略图延后加载。
-class GiftPickerPopup final : public QFrame {
-public:
-    static constexpr int kPickerBatch = kPickerCols * kPickerRows;
-
-    explicit GiftPickerPopup(QWidget* parent = nullptr)
-        : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint) {
-        setFixedSize(kPickerW, kPickerH);
-
-        auto* lay = new QVBoxLayout(this);
-        lay->setContentsMargins(8, 8, 8, 8);
-        lay->setSpacing(8);
-
-        auto* sr = new QHBoxLayout;
-        sr->setSpacing(6);
-        search_ = new QLineEdit(this);
-        search_->setPlaceholderText(QStringLiteral("搜索礼物"));
-        search_->setFixedHeight(30);
-        QObject::connect(search_, &QLineEdit::textChanged, this, [this]() { refreshGrid(); });
-        auto* sbtn = new QPushButton(QStringLiteral("搜索"), this);
-        sbtn->setFixedSize(52, 30);
-        sbtn->setCursor(Qt::PointingHandCursor);
-        liveaio::util::suppressButtonFocus(sbtn);
-        QObject::connect(sbtn, &QPushButton::clicked, this, [this]() { refreshGrid(); });
-        sr->addWidget(search_, 1);
-        sr->addWidget(sbtn);
-        lay->addLayout(sr);
-
-        scroll_ = new QScrollArea(this);
-        scroll_->setWidgetResizable(true);
-        scroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        scroll_->setFixedHeight(kPickerRows * (kPickerCell + 18));
-        scroll_->setStyleSheet(
-            QStringLiteral("QScrollArea { border: none; background: transparent; }"));
-        gridHost_ = new QWidget(scroll_);
-        grid_ = new QGridLayout(gridHost_);
-        grid_->setContentsMargins(0, 0, 2, 0);
-        grid_->setHorizontalSpacing(6);
-        grid_->setVerticalSpacing(6);
-        scroll_->setWidget(gridHost_);
-        lay->addWidget(scroll_);
-
-        QObject::connect(scroll_->verticalScrollBar(), &QScrollBar::valueChanged, this,
-                         [this](int) { loadMoreIfNeeded(); });
-
-        refreshTheme();
-        liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
-    }
-
-    void setOnPicked(std::function<void(const QString&)> cb) { onPicked_ = std::move(cb); }
-
-    // showAll=true：模拟区，展示全部礼物；否则隐藏 blocked 中已占用的礼物。
-    void openAt(QWidget* anchor, const QSet<QString>& blocked, bool showAll) {
-        ensureGiftNames();
-        showAll_ = showAll;
-        blocked_ = showAll ? QSet<QString>() : blocked;
-        move(anchor->mapToGlobal(QPoint(anchor->width() + 6, 0)));
-        search_->clear();
-        refreshGrid();
-        show();
-        search_->setFocus();
-    }
-
-    void refreshTheme() {
-        const auto& C = theme();
-        setStyleSheet(QStringLiteral(
-            "QFrame { background: %1; border: 1px solid %2; border-radius: 4px; }"
-            "QLineEdit { background: %1; color: %3; border: 1px solid %4;"
-            " border-radius: 6px; padding: 0 8px; font-size: 12px; }"
-            "QPushButton { background: transparent; color: %3; border: 1px solid %4;"
-            " border-radius: 4px; font-size: 12px; }"
-            "QPushButton:hover { border-color: %2; }"
-            "QLabel { background: transparent; border: none; color: %3; }"
-        ).arg(C.card, C.activeLine, C.text, C.border) + liveaio::util::popupChromeQss());
-    }
-
-protected:
-    void hideEvent(QHideEvent* event) override {
-        QFrame::hideEvent(event);
-        clearGrid();
-        liveaio::resources::releaseGiftThumbCache();
-    }
-
-private:
-    static bool fuzzyMatch(const QString& name, const QString& query) {
-        const QString q = query.trimmed().toLower();
-        if (q.isEmpty()) return true;
-        const QString n = name.toLower();
-        if (n.contains(q)) return true;
-        int i = 0;
-        for (const QChar& c : n) {
-            if (i < q.size() && c == q.at(i)) ++i;
-        }
-        return i == q.size();
-    }
-
-    void clearGrid() {
-        while (grid_->count() > 0) {
-            QLayoutItem* item = grid_->takeAt(0);
-            if (QWidget* w = item->widget()) w->deleteLater();
-            delete item;
-        }
-        filteredNames_.clear();
-        builtCount_ = 0;
-    }
-
-    void refreshGrid() {
-        ensureGiftNames();
-        const QString q = search_ ? search_->text() : QString();
-        clearGrid();
-        for (const QString& n : allNames_) {
-            if (!blocked_.contains(n) && fuzzyMatch(n, q)) filteredNames_ << n;
-        }
-        if (filteredNames_.isEmpty()) {
-            auto* hint = new QLabel(
-                showAll_ || !q.trimmed().isEmpty() ? QStringLiteral("无匹配礼物")
-                                                   : QStringLiteral("暂无其它礼物可选"));
-            hint->setAlignment(Qt::AlignCenter);
-            QFont f(QStringLiteral("Microsoft YaHei"));
-            f.setPixelSize(11);
-            hint->setFont(f);
-            hint->setStyleSheet(QStringLiteral("color: %1; background: transparent;")
-                                    .arg(theme().textMuted));
-            grid_->addWidget(hint, 0, 0, 1, kPickerCols);
-            return;
-        }
-        appendCells(std::min(kPickerBatch, static_cast<int>(filteredNames_.size())));
-        scroll_->verticalScrollBar()->setValue(0);
-    }
-
-    void appendCells(int count) {
-        const int end = std::min(builtCount_ + count, static_cast<int>(filteredNames_.size()));
-        for (int i = builtCount_; i < end; ++i) {
-            grid_->addWidget(makeCell(filteredNames_.at(i)), i / kPickerCols, i % kPickerCols);
-        }
-        builtCount_ = end;
-        gridHost_->adjustSize();
-    }
-
-    void loadMoreIfNeeded() {
-        if (builtCount_ >= filteredNames_.size()) return;
-        const int contentBottom = scroll_->verticalScrollBar()->value()
-                                  + scroll_->viewport()->height();
-        if (gridHost_->height() - contentBottom > kPickerCell + 24) return;
-        if (chunkLoading_) return;
-        const int remain = filteredNames_.size() - builtCount_;
-        if (remain <= 0) return;
-        chunkLoading_ = true;
-        if (!chunkBuilder_) {
-            chunkBuilder_ = new liveaio::util::ChunkBuilder(this, kPickerCols, 24);
-        }
-        chunkBuilder_->start(std::min(kPickerBatch, remain), [this](int) { appendCells(1); },
-                             [this]() { chunkLoading_ = false; });
-    }
-
-    QPushButton* makeCell(const QString& name) {
-        const auto& C = theme();
-        auto* btn = new QPushButton;
-        btn->setFixedSize(kPickerCell, kPickerCell + 16);
-        btn->setCursor(Qt::PointingHandCursor);
-        // 无障碍名 = 礼物名，方便 UI Automation / 测试脚本按名点击。
-        btn->setAccessibleName(name);
-        btn->setStyleSheet(QStringLiteral(
-            "QPushButton { background: transparent; border: 1px solid transparent;"
-            " border-radius: 4px; padding: 0; }"
-            "QPushButton:hover { background: transparent; border-color: %1; }"
-        ).arg(C.activeLine));
-
-        auto* lay = new QVBoxLayout(btn);
-        lay->setContentsMargins(2, 2, 2, 2);
-        lay->setSpacing(0);
-
-        auto* icon = new QLabel(btn);
-        icon->setFixedSize(kPickerCell - 4, kPickerCell - 4);
-        icon->setAlignment(Qt::AlignCenter);
-        icon->setStyleSheet(QStringLiteral("background: transparent; border: none;"));
-
-        auto* nameLbl = new QLabel(name, btn);
-        nameLbl->setFixedSize(kPickerCell - 4, 14);
-        nameLbl->setAlignment(Qt::AlignCenter);
-        QFont f(QStringLiteral("Microsoft YaHei"));
-        f.setPixelSize(10);
-        nameLbl->setFont(f);
-        nameLbl->setStyleSheet(QStringLiteral("background: transparent; border: none;"));
-
-        lay->addWidget(icon, 0, Qt::AlignHCenter);
-        lay->addWidget(nameLbl, 0, Qt::AlignHCenter);
-        QObject::connect(btn, &QPushButton::clicked, this, [this, name]() {
-            if (onPicked_) onPicked_(name);
-            hide();
-        });
-        // 名字同步挂上；缩略图延后一帧加载，避免搜索/滚动手感像「名单也在懒加载」。
-        QTimer::singleShot(0, icon, [icon, name]() {
-            if (!icon) return;
-            const QPixmap px = liveaio::resources::loadGiftPixmapThumb(
-                g_appRoot, name, kPickerCell - 8);
-            if (!px.isNull()) icon->setPixmap(px);
-        });
-        return btn;
-    }
-
-    void ensureGiftNames() {
-        // 搜索依赖全量名单；此处同步确保 catalog 已读完，绝不按页懒加载名字。
-        if (!allNames_.isEmpty()) return;
-        allNames_ = liveaio::resources::giftNamesCached(g_appRoot);
-    }
-
-    QStringList allNames_;
-    QStringList filteredNames_;
-    QSet<QString> blocked_;
-    bool showAll_ = false;
-    int builtCount_ = 0;
-    QLineEdit* search_ = nullptr;
-    QScrollArea* scroll_ = nullptr;
-    QWidget* gridHost_ = nullptr;
-    QGridLayout* grid_ = nullptr;
-    liveaio::util::ChunkBuilder* chunkBuilder_ = nullptr;
-    bool chunkLoading_ = false;
-    std::function<void(const QString&)> onPicked_;
-};
-
-static GiftPickerPopup* g_sessionGiftPicker = nullptr;
-static QObject* g_giftPickerParent = nullptr;
-
-void setGiftPickerParent(QObject* parent) { g_giftPickerParent = parent; }
-
-GiftPickerPopup* sessionGiftPicker() {
-    if (!g_sessionGiftPicker && g_giftPickerParent) {
-        // ToolsSession 是 QObject 不是 QWidget；Popup 用顶层窗，生命周期跟着 session。
-        g_sessionGiftPicker = new GiftPickerPopup(nullptr);
-        QObject::connect(g_giftPickerParent, &QObject::destroyed, g_sessionGiftPicker,
-                         &QObject::deleteLater);
-        QObject::connect(g_giftPickerParent, &QObject::destroyed, []() {
-            g_sessionGiftPicker = nullptr;
-        });
-    }
-    return g_sessionGiftPicker;
-}
-
-void hideSessionGiftPicker() {
-    if (g_sessionGiftPicker) g_sessionGiftPicker->hide();
-}
 
 // 单个礼物规则（对应悬浮窗上的一格）。
 class GiftRuleModule final : public QFrame {
@@ -838,121 +542,6 @@ private:
     std::function<void(GiftRuleModule*)> pickerCb_;
     std::function<QSet<QString>()> blockedFn_;
     std::function<void(int)> onChanged_;
-};
-
-// 设置页：模拟推送礼物（礼物选择 + 数量 + 推送）。
-class SimGiftWidget final : public QFrame {
-public:
-    explicit SimGiftWidget(QWidget* parent = nullptr) : QFrame(parent) {
-        setObjectName(QStringLiteral("OvertimeSimGift"));
-        setAttribute(Qt::WA_TranslucentBackground);
-        gift_ = QStringLiteral("小心心");
-        build();
-        showIcon(gift_);
-        liveaio::util::onThemeChange(this, [this](const QString&) { refreshTheme(); });
-    }
-
-    void setOnPush(std::function<void(const QString&, int)> cb) { onPush_ = std::move(cb); }
-
-    void setClosedTip(const QString& tip) { closedTip_ = tip; }
-
-    void setPushEnabled(bool enabled) {
-        pushBtn_->setEnabled(enabled);
-        pushBtn_->setToolTip(enabled ? QString() : closedTip_);
-    }
-
-    void refreshTheme() {
-        const auto& C = theme();
-        pickBtn_->setStyleSheet(QStringLiteral(
-            "QPushButton#OvertimeSimPickBtn { background: transparent; color: %1;"
-            " border: 1.5px solid %1; border-radius: 6px; font-size: 12px; font-weight: 600;"
-            " padding: 0 10px; min-height: %2px; max-height: %2px; }"
-            "QPushButton#OvertimeSimPickBtn:hover { background: transparent; color: %3; }"
-        ).arg(C.activeLine, QString::number(kSimBtnH), C.text));
-        iconLbl_->setStyleSheet(QStringLiteral(
-            "QLabel#OvertimeSimGiftIcon { background: transparent; border: none; }"));
-        pushBtn_->setStyleSheet(QStringLiteral(
-            "QPushButton { background: %1; color: #fff; border: none; border-radius: 6px;"
-            " font-size: 13px; font-weight: 600; }"
-            "QPushButton:hover { background: %2; color: %3; }"
-            "QPushButton:disabled { background: %4; color: %5; }"
-        ).arg(C.activeLine, C.hover, C.text, C.border, C.textMuted));
-        sessionGiftPicker()->refreshTheme();
-    }
-
-private:
-    void build() {
-        setFixedHeight(kGiftIcon);
-        auto* root = new QHBoxLayout(this);
-        root->setContentsMargins(0, 0, 0, 0);
-        root->setSpacing(10);
-
-        auto* leftWrap = new QWidget(this);
-        leftWrap->setObjectName(QStringLiteral("OvertimeSimLeft"));
-        leftWrap->setAttribute(Qt::WA_TranslucentBackground);
-        leftWrap->setFixedSize(kSimPickW + kSimBtnGap + kGiftIcon, kGiftIcon);
-        auto* left = new QHBoxLayout(leftWrap);
-        left->setContentsMargins(0, 0, 0, 0);
-        left->setSpacing(kSimBtnGap);
-
-        pickBtn_ = new QPushButton(QStringLiteral("选择礼物"), leftWrap);
-        pickBtn_->setObjectName(QStringLiteral("OvertimeSimPickBtn"));
-        pickBtn_->setFlat(true);
-        pickBtn_->setFixedSize(kSimPickW, kSimBtnH);
-        pickBtn_->setCursor(Qt::PointingHandCursor);
-        QObject::connect(pickBtn_, &QPushButton::clicked, this, [this]() {
-            auto* picker = sessionGiftPicker();
-            picker->setOnPicked([this](const QString& name) {
-                gift_ = name;
-                showIcon(name);
-            });
-            picker->openAt(pickBtn_, {}, true);
-        });
-        left->addWidget(pickBtn_, 0, Qt::AlignVCenter);
-
-        iconLbl_ = new QLabel(leftWrap);
-        iconLbl_->setObjectName(QStringLiteral("OvertimeSimGiftIcon"));
-        iconLbl_->setFixedSize(kGiftIcon, kGiftIcon);
-        iconLbl_->setAlignment(Qt::AlignCenter);
-        iconLbl_->setAttribute(Qt::WA_TranslucentBackground);
-        left->addWidget(iconLbl_, 0, Qt::AlignVCenter);
-        root->addWidget(leftWrap);
-
-        auto* qtyRow = new QHBoxLayout;
-        qtyRow->setSpacing(6);
-        auto* qtyLbl = new QLabel(QStringLiteral("数量"), this);
-        qtyLbl->setFixedHeight(kGiftIcon);
-        qtyLbl->setAlignment(Qt::AlignCenter);
-        count_ = new IntField(9999, 4, 28, 52, this);
-        count_->setValue(1);
-        qtyRow->addWidget(qtyLbl);
-        qtyRow->addWidget(count_);
-        root->addLayout(qtyRow);
-        root->addStretch();
-
-        pushBtn_ = new QPushButton(QStringLiteral("推送"), this);
-        pushBtn_->setFixedSize(72, 34);
-        pushBtn_->setCursor(Qt::PointingHandCursor);
-        QObject::connect(pushBtn_, &QPushButton::clicked, this, [this]() {
-            const int count = count_->value();
-            if (count <= 0) return;
-            if (onPush_) onPush_(gift_, count);
-        });
-        root->addWidget(pushBtn_);
-        refreshTheme();
-    }
-
-    void showIcon(const QString& name) {
-        liveaio::resources::setGiftIconOnLabel(iconLbl_, g_appRoot, name, kGiftIcon - 6, false);
-    }
-
-    QString gift_;
-    QString closedTip_ = QStringLiteral("请先打开加班机悬浮窗");
-    QPushButton* pickBtn_ = nullptr;
-    QLabel* iconLbl_ = nullptr;
-    IntField* count_ = nullptr;
-    QPushButton* pushBtn_ = nullptr;
-    std::function<void(const QString&, int)> onPush_;
 };
 
 // 加班机设置面板：剩余时间 / 礼物设置 / 自定义信息三块。
@@ -1562,11 +1151,36 @@ public:
         applyFont();
     }
 
-    // 标题/倒计时：按盒子填满，与礼物皮肤 max_px 解耦。
-    void fitToBoxFill(const QString& sample, int w, int h) {
-        px_ = skin_.fitRoleFill(kSurface, role_, sample, std::max(1, w), std::max(1, h));
+    // 标题/倒计时：同样受各自角色 max_px×scale 约束，避免无上限撑大。
+    void fitToBoxFill(const QString& sample, int w, int h, qreal scale) {
+        px_ = skin_.fitRole(kSurface, role_, sample, std::max(1, w), std::max(1, h), scale);
         applyFont();
     }
+
+    // 字号按各自皮肤角色的设计值×缩放，并受该角色自己的 max_px 封顶；
+    // 只因横向放不下才回缩——不再用共用盒高把标题/倒计时/礼物绑死。
+    void fitToDesign(const QString& sample, int maxW, qreal scale) {
+        const auto st = skin_.roleStyle(kSurface, role_);
+        const QString probe = sample.isEmpty()
+            ? (st.fitRef.isEmpty() ? QStringLiteral("国") : st.fitRef)
+            : sample;
+        const qreal s = std::max(0.5, scale);
+        int px = std::max(st.minPx, static_cast<int>(std::lround(st.pixelSize * s)));
+        if (st.maxPx > 0) {
+            px = std::min(px, std::max(st.minPx,
+                                       static_cast<int>(std::lround(st.maxPx * s))));
+        }
+        while (px > st.minPx
+               && QFontMetrics(st.font(px)).horizontalAdvance(probe) > std::max(1, maxW)) {
+            --px;
+        }
+        px_ = px;
+        applyFont();
+    }
+
+    // 当前字号下的字形紧框尺寸，供外层按实际墨迹定盒子。
+    int inkHeight() const { return std::max(1, inkRect().height()); }
+    int inkWidth() const { return std::max(1, inkRect().width()); }
 
     void setPixelSizeDirect(int px) {
         px_ = std::max(6, px);
@@ -1578,17 +1192,56 @@ protected:
         const auto style = skin_.roleStyle(kSurface, role_);
         QPainter p(this);
         p.setRenderHint(QPainter::TextAntialiasing, true);
-        p.setFont(style.font(px_));
+        const QFont f = style.font(px_);
+        p.setFont(f);
+        const QColor shadow = skin_.color(QStringLiteral("text_shadow"), QColor(0, 0, 0, 160));
+        const QColor fill = skin_.color(QStringLiteral("text_fill"), QColor(255, 255, 255));
         int flags = static_cast<int>(alignment());
-        if (wordWrap()) flags |= Qt::TextWordWrap;
-        p.setPen(skin_.color(QStringLiteral("text_shadow"), QColor(0, 0, 0, 160)));
-        p.drawText(rect().translated(1, 1), flags, text());
-        p.setPen(skin_.color(QStringLiteral("text_fill"), QColor(255, 255, 255)));
-        p.drawText(rect(), flags, text());
+        if (wordWrap() || text().isEmpty()) {
+            if (wordWrap()) flags |= Qt::TextWordWrap;
+            p.setPen(shadow);
+            p.drawText(rect().translated(1, 1), flags, text());
+            p.setPen(fill);
+            p.drawText(rect(), flags, text());
+            return;
+        }
+
+        // 字号是按字形紧框拟合的，若仍交给行盒排版，上下会被标签裁掉。
+        // 单行文字直接按紧框定位，画多大就占多大。
+        const QFontMetricsF fm(f);
+        const QRectF ink = fm.tightBoundingRect(text());
+        const QRectF box(0, 0, std::max(1, width() - 1), std::max(1, height() - 1));
+        qreal x = box.left() - ink.left();
+        if (flags & Qt::AlignHCenter) {
+            x = box.center().x() - ink.width() / 2.0 - ink.left();
+        } else if (flags & Qt::AlignRight) {
+            x = box.right() - ink.right();
+        }
+        qreal baseline = box.center().y() + ink.height() / 2.0 - ink.bottom();
+        if (flags & Qt::AlignTop) {
+            baseline = box.top() - ink.top();
+        } else if (flags & Qt::AlignBottom) {
+            baseline = box.bottom() - ink.bottom();
+        }
+        const qreal minBase = box.top() - ink.top();
+        const qreal maxBase = box.bottom() - ink.bottom();
+        if (minBase <= maxBase) baseline = std::clamp(baseline, minBase, maxBase);
+        else baseline = minBase;
+
+        p.setPen(shadow);
+        p.drawText(QPointF(x + 1.0, baseline + 1.0), text());
+        p.setPen(fill);
+        p.drawText(QPointF(x, baseline), text());
     }
 
 private:
     static const QString kSurface;
+
+    QRect inkRect() const {
+        const QFontMetrics fm(skin_.roleStyle(kSurface, role_).font(px_));
+        const QString sample = text().isEmpty() ? QStringLiteral("国") : text();
+        return fm.tightBoundingRect(sample);
+    }
 
     void applyFont() {
         QFont f = skin_.roleStyle(kSurface, role_).font(px_);
@@ -1748,30 +1401,42 @@ public:
 
     void refreshSkin() { lbl_->refreshSkin(); }
 
-    void applyScale(qreal scale, bool heavy) {
+    // 组件优先：字号按皮肤设计值×缩放定，盒子再包住这行字，不再用框反过来压字号。
+    // 用固定探针拟合，秒数跳动不会让盒子忽大忽小。
+    void applyScale(qreal scale, bool heavy, int maxW) {
         const qreal s = std::max(0.5, scale);
         scale_ = s;
         lastHeavy_ = heavy;
-        const int w = static_cast<int>(std::lround(refTimerW() * s));
-        const int h = static_cast<int>(std::lround(refTimerH() * s));
-        setFixedSize(w, h);
         const int edge = std::max(2, static_cast<int>(std::lround(kTimerEdgePad * s)));
-        const int top = std::max(1, static_cast<int>(std::lround(1 * s)));
-        lay_->setContentsMargins(edge, top, edge, edge);
-        const int innerW = std::max(1, w - edge * 2);
-        const int innerH = std::max(1, h - top - edge);
+        const int innerW = std::max(1, maxW - edge * 2);
+        lbl_->fitToDesign(kProbe, innerW, s);
+        const int slack = std::max(2, static_cast<int>(std::lround(2 * s)));
+        const int innerH = probeInkHeight() + slack;
+        lay_->setContentsMargins(edge, edge, edge, edge);
         lbl_->setFixedSize(innerW, innerH);
-        lbl_->fitToBoxFill(lbl_->text(), innerW, innerH);
+        setFixedSize(innerW + edge * 2, innerH + edge * 2);
     }
 
 private:
     static constexpr int kTimerEdgePad = 2;
+    // 最长常见形态，作为字号与盒高的稳定基准。
+    static const QString kProbe;
+
+    int probeInkHeight() const {
+        const QString keep = lbl_->text();
+        lbl_->setText(kProbe);
+        const int h = lbl_->inkHeight();
+        lbl_->setText(keep);
+        return h;
+    }
 
     SkinTextLabel* lbl_ = nullptr;
     QVBoxLayout* lay_ = nullptr;
     qreal scale_ = 1.0;
     bool lastHeavy_ = true;
 };
+
+const QString TimerBox::kProbe = QStringLiteral("00:00:00");
 
 // 标题（置底）+ 0.1cm + 倒计时（置顶）。
 class TitleTimerSection final : public QWidget {
@@ -1809,15 +1474,13 @@ public:
         const qreal s = std::max(0.5, scale);
         const int sectionGap = std::max(1, static_cast<int>(std::lround(refTitleTimerGap() * s)));
         lay_->setSpacing(sectionGap);
-        const int titleBoxH = std::max(1, static_cast<int>(std::lround(refTitleRowH() * s)));
-        // 拟合高度略高于布局参考行，字可以更大；行高再按实际字号撑开。
-        const int titleFitH = std::max(titleBoxH, static_cast<int>(std::lround(26 * s)));
-        titleLbl_->fitToBoxFill(titleLbl_->text(), blockW - pad, titleFitH);
-        const int titleRowH = QFontMetrics(titleLbl_->font()).height()
-                              + std::max(1, static_cast<int>(std::lround(2 * s)));
-        titleWrap_->setFixedHeight(std::max(titleRowH, titleBoxH));
+        // 标题同样是组件优先：字号按皮肤设计值×缩放，行高再包住这行字。
+        const int titlePad = std::max(2, static_cast<int>(std::lround(2 * s)));
+        titleLbl_->fitToDesign(titleLbl_->text(), std::max(1, blockW - pad), s);
+        const int titleRowH = titleLbl_->inkHeight() + titlePad;
+        titleWrap_->setFixedHeight(titleRowH);
         titleLbl_->setFixedWidth(std::max(1, blockW - pad));
-        timerBox_->applyScale(s, heavy);
+        timerBox_->applyScale(s, heavy, blockW - pad);
         setFixedHeight(titleRowH + sectionGap + timerBox_->height());
     }
 
@@ -1925,7 +1588,11 @@ public:
         customLbl_->setFixedHeight(customH);
         customLbl_->fitToBox(customLbl_->text(), bw - pad, customH - pad, s);
         resultRow_->applyScale(s, heavy);
-        setFixedSize(bw, static_cast<int>(std::lround(refBlockH() * s)));
+
+        // 块高由各行实际高度相加得出，不再用参考表反过来卡住内容。
+        const int gap = rootLay_->spacing();
+        setFixedSize(bw, titleTimer_->height() + gap + gridH + gap + customH
+                             + gap + resultRow_->height());
     }
 
 protected:
@@ -1962,7 +1629,8 @@ public:
 
     OvertimeBlock* block() const { return block_; }
 
-    // 大组件按 0.5cm 边距居中，并等比缩放到内容区。
+    // 大组件按 0.5cm 边距居中。字号只跟宽度走（各角色自己的 pixel_size/max_px），
+    // 不再因高度不够二次缩小整块——那会把标题/倒计时/礼物再次绑死。
     void layoutBlock(bool heavy = true) {
         const int cw = content()->width();
         const int ch = content()->height();
@@ -1970,12 +1638,13 @@ public:
         const int m = windowMarginPx();
         const int availW = std::max(1, cw - 2 * m);
         const int availH = std::max(1, ch - 2 * m);
-        const qreal s = std::max(0.5, std::min(qreal(availW) / refBlockW(),
-                                               qreal(availH) / refBlockH()));
-        const int bw = static_cast<int>(std::lround(refBlockW() * s));
-        const int bh = static_cast<int>(std::lround(refBlockH() * s));
-        block_->setGeometry(m + (availW - bw) / 2, m + (availH - bh) / 2, bw, bh);
+        const qreal s = std::max(0.5, qreal(availW) / refBlockW());
         block_->applyScale(s, heavy);
+        const int bw = block_->width();
+        const int bh = block_->height();
+        // 过高时垂直贴顶并略微上移居中余量，不回缩字号。
+        const int y = m + std::max(0, (availH - bh) / 2);
+        block_->move(m + (availW - bw) / 2, y);
     }
 
 protected:

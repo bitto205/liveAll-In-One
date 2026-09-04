@@ -92,6 +92,9 @@ LiveAIO.exe (C++ LoadLibrary)
 {"op":"tool.overtime.set","settings":{}}
 {"op":"tool.overtime.cmd","cmd":"reset"}
 {"op":"tool.overtime.sim_gift","gift":"小心心","count":1}
+{"op":"tool.leaf.set","settings":{"rules":[{"gift":"小心心","mode":"add","value":1,"min":0,"max":0}]}}
+{"op":"tool.leaf.sim_gift","gift":"小心心","count":1}
+{"op":"leaf.spawn","gift":"小心心","count":1,"user":"LiveAIO"}
 {"op":"tool.danmu.set","settings":{}}
 {"op":"tool.memo.set","settings":{}}
 ```

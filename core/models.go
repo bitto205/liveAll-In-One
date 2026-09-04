@@ -1,6 +1,9 @@
 package core
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Envelope is one JSONL object.
 type Envelope map[string]any
@@ -80,11 +83,13 @@ func DefaultCapabilities() Capabilities {
 		ConfigOwner:     "go_core",
 		ListenerOwner:   "listener_boundary",
 		SupportsRoutes:  []string{"1", "2", "3", "4"},
-		ToolEvents:      []string{OpTick, OpLedger, OpDanmuShow, OpMemoItem},
+		ToolEvents:      []string{OpTick, OpLedger, OpDanmuShow, OpMemoItem, OpLeafSpawn},
 		ToolCommands: []string{
 			OpToolOvertimeSet,
 			OpToolOvertimeCmd,
 			OpToolOvertimeSim,
+			OpToolLeafSet,
+			OpToolLeafSim,
 			OpToolDanmuSet,
 			OpToolMemoSet,
 			OpUICommand,
@@ -92,6 +97,64 @@ func DefaultCapabilities() Capabilities {
 			OpConfigGet,
 		},
 	}
+}
+
+func NormalizeLeafSettings(raw any) LeafSettings {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		if mm, ok := raw.(map[string]interface{}); ok {
+			m = map[string]any(mm)
+		}
+	}
+	if !ok || m == nil {
+		return LeafSettings{}
+	}
+	out := LeafSettings{}
+	rules, _ := m["rules"].([]any)
+	if rules == nil {
+		if rr, ok := m["rules"].([]interface{}); ok {
+			rules = append(rules, rr...)
+		}
+	}
+	for _, item := range rules {
+		ruleMap, ok := item.(map[string]any)
+		if !ok {
+			if mm, ok := item.(map[string]interface{}); ok {
+				ruleMap = map[string]any(mm)
+			}
+		}
+		if ruleMap == nil {
+			continue
+		}
+		out.Rules = append(out.Rules, normalizeLeafRule(ruleMap))
+		if len(out.Rules) >= 10 {
+			break
+		}
+	}
+	return out
+}
+
+func normalizeLeafRule(m map[string]any) LeafRule {
+	mode := normalizeMode(mapString(m, "mode", "add"))
+	rule := LeafRule{
+		Gift:  strings.TrimSpace(mapString(m, "gift", "")),
+		Mode:  mode,
+		Value: intValue(m["value"], 1),
+	}
+	if rule.Value < 0 {
+		rule.Value = 0
+	}
+	if rule.Mode == "random" {
+		rule.MinVal = intValue(m["min"], intValue(m["random_min"], 1))
+		rule.MaxVal = intValue(m["max"], intValue(m["random_max"], rule.MinVal))
+		if rule.MinVal < 0 {
+			rule.MinVal = 0
+		}
+		if rule.MaxVal < 0 {
+			rule.MaxVal = 0
+		}
+	}
+	return rule
 }
 
 func NormalizeOvertimeSettings(raw any) OvertimeSettings {

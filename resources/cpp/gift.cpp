@@ -43,12 +43,18 @@ inline GiftCatalogState& giftCatalogState() {
 
 inline void ensureGiftCatalog(const QString& appRoot) {
     GiftCatalogState& state = giftCatalogState();
-    if (state.loaded) return;
-    state.loaded = true;
+    if (state.loaded && !state.gifts.isEmpty()) return;
     QFile info(giftInfoPath(appRoot));
     if (info.open(QIODevice::ReadOnly)) {
-        state.gifts = QJsonDocument::fromJson(info.readAll()).object();
+        const QJsonObject obj = QJsonDocument::fromJson(info.readAll()).object();
+        if (!obj.isEmpty()) {
+            state.gifts = obj;
+            state.loaded = true;
+            return;
+        }
     }
+    // 路径未就绪时不锁死 loaded，允许下次用正确 appRoot 再读。
+    if (!state.loaded) state.loaded = false;
 }
 
 inline int giftIdFromCatalog(const QString& appRoot, const QString& giftName) {
@@ -100,26 +106,41 @@ inline bool giftIconIsAnimated(const QString& path) {
 // 礼物名列表（gift_info.json 键，按名称排序），首次调用时同步读盘。
 inline const QStringList& giftNamesCached(const QString& appRoot) {
     static QStringList names;
-    static bool loaded = false;
-    if (loaded) return names;
-    loaded = true;
+    static QString loadedRoot;
     ensureGiftCatalog(appRoot);
+    if (loadedRoot == appRoot && !names.isEmpty()) return names;
     names = giftCatalogState().gifts.keys();
     names.sort();
+    loadedRoot = appRoot;
     return names;
+}
+
+inline bool giftHasIconFile(const QString& appRoot, const QString& giftName) {
+    return !resolveGiftIconPath(appRoot, giftName).isEmpty();
+}
+
+// 选择器：仅列出磁盘上能解析到图标的礼物（gift_info≈1248，icon 文件≈410）。
+inline QStringList giftNamesWithIconsCached(const QString& appRoot) {
+    QStringList out;
+    for (const QString& n : giftNamesCached(appRoot)) {
+        if (giftHasIconFile(appRoot, n)) out.append(n);
+    }
+    return out;
 }
 
 // 异步读 gift_info.json（工作线程读盘，回主线程写 catalog 状态）。
 inline void ensureGiftCatalogAsync(const QString& appRoot, QObject* context,
                                    std::function<void()> onReady) {
-    if (giftCatalogState().loaded) {
+    if (giftCatalogState().loaded && !giftCatalogState().gifts.isEmpty()) {
         if (onReady) onReady();
         return;
     }
     liveaio::util::readJsonAsync(giftInfoPath(appRoot), context, [onReady](QJsonObject obj) {
         GiftCatalogState& st = giftCatalogState();
-        st.loaded = true;
-        st.gifts = obj;
+        if (!obj.isEmpty()) {
+            st.gifts = obj;
+            st.loaded = true;
+        }
         if (onReady) onReady();
     });
 }
@@ -223,7 +244,7 @@ inline QPixmap loadGiftPixmapHigh(const QString& appRoot, const QString& giftNam
     return out;
 }
 
-// 礼物选择列表：解码时直接缩到目标尺寸。
+// 礼物选择列表：解码时直接缩到目标尺寸；失败则整图再缩放（动图/部分格式 setScaledSize 会空图）。
 inline QPixmap loadGiftPixmapThumb(const QString& appRoot, const QString& giftName, int side) {
     if (giftName.isEmpty() || side <= 0) return {};
     const QString key = giftName + QLatin1Char('@') + QString::number(side);
@@ -234,14 +255,34 @@ inline QPixmap loadGiftPixmapThumb(const QString& appRoot, const QString& giftNa
     QPixmap out;
     const QString path = resolveGiftIconPath(appRoot, giftName);
     if (!path.isEmpty()) {
-        QImageReader reader(path);
-        reader.setAutoTransform(true);
-        reader.setScaledSize(QSize(side, side));
-        const QImage img = reader.read();
-        if (!img.isNull()) out = QPixmap::fromImage(img);
+        {
+            QImageReader reader(path);
+            reader.setAutoTransform(true);
+            reader.setScaledSize(QSize(side, side));
+            const QImage img = reader.read();
+            if (!img.isNull()) out = QPixmap::fromImage(img);
+        }
+        if (out.isNull()) {
+            QImageReader reader(path);
+            reader.setAutoTransform(true);
+            const QImage img = reader.read();
+            if (!img.isNull()) {
+                out = QPixmap::fromImage(img).scaled(side, side, Qt::KeepAspectRatio,
+                                                     Qt::SmoothTransformation);
+            }
+        }
+        if (out.isNull()) {
+            QPixmap raw(path);
+            if (!raw.isNull()) {
+                out = raw.scaled(side, side, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            }
+        }
     }
-    cache.insert(key, out);
-    trimGiftCache(cache, kMaxGiftThumb);
+    // 空图不入缓存，避免 appRoot 未就绪时一次失败后永久空白。
+    if (!out.isNull()) {
+        cache.insert(key, out);
+        trimGiftCache(cache, kMaxGiftThumb);
+    }
     return out;
 }
 

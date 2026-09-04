@@ -3,7 +3,7 @@ package core
 // Protocol constants. Go is the single source of truth for UI/core IPC.
 
 const (
-	ProtocolVersion = "0.1.0"
+	ProtocolVersion = "0.0.3alpha"
 	Version         = ProtocolVersion
 )
 
@@ -32,10 +32,13 @@ const (
 	OpLedger        = "ledger"
 	OpDanmuShow     = "danmu.show"
 	OpMemoItem      = "memo.item"
+	OpLeafSpawn     = "leaf.spawn"
 
 	OpToolOvertimeSet = "tool.overtime.set"
 	OpToolOvertimeCmd = "tool.overtime.cmd"
 	OpToolOvertimeSim = "tool.overtime.sim_gift"
+	OpToolLeafSet     = "tool.leaf.set"
+	OpToolLeafSim     = "tool.leaf.sim_gift"
 	OpToolDanmuSet    = "tool.danmu.set"
 	OpToolMemoSet     = "tool.memo.set"
 )

@@ -77,6 +77,7 @@ flowchart LR
 | 工具 | 只收 | 只发 |
 |------|------|------|
 | Overtime | `tick`, `ledger`, `status`（可选） | `tool.overtime.set`, `tool.overtime.cmd`, `tool.overtime.sim_gift` |
+| Leaf | `leaf.spawn`, `status`（可选） | `tool.leaf.set`, `tool.leaf.sim_gift` |
 | Danmu | `danmu.show`, `status`（可选） | `tool.danmu.set` |
 | Memo | `memo.item`, `status`（可选） | `tool.memo.set` |
 

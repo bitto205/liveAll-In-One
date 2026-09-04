@@ -333,25 +333,26 @@ public:
         auto* ph = new QWidget(stack_);
         ph->setObjectName(QStringLiteral("TabPlaceholder"));
         stack_->addWidget(ph);
-        tabPlaceholders_.append(ph);
-        tabBuilt_.append(false);
+        const int index = stack_->indexOf(ph);
+        if (tabPlaceholders_.size() <= index) tabPlaceholders_.resize(index + 1);
+        if (tabBuilt_.size() <= index) tabBuilt_.resize(index + 1);
+        tabPlaceholders_[index] = ph;
+        tabBuilt_[index] = false;
     }
 
     void replaceTabPlaceholder(int index, QWidget* page) {
-        if (index < 0 || index >= tabPlaceholders_.size()) {
-            addTabPage(page);
+        if (!page) return;
+        if (index >= 0 && index < tabPlaceholders_.size() && tabPlaceholders_[index]) {
+            QWidget* ph = tabPlaceholders_[index];
+            const int idx = stack_->indexOf(ph);
+            stack_->removeWidget(ph);
+            ph->deleteLater();
+            tabPlaceholders_[index] = nullptr;
+            if (idx >= 0) stack_->insertWidget(idx, page);
+            else stack_->addWidget(page);
             return;
         }
-        QWidget* ph = tabPlaceholders_.value(index);
-        if (!ph) {
-            addTabPage(page);
-            return;
-        }
-        const int idx = stack_->indexOf(ph);
-        stack_->removeWidget(ph);
-        ph->deleteLater();
-        tabPlaceholders_[index] = nullptr;
-        stack_->insertWidget(idx, page);
+        addTabPage(page);
     }
 
 protected:
@@ -359,14 +360,16 @@ protected:
 
     void ensureTab(int index) {
         if (index < 0 || index >= tabFactories_.size() || !tabFactories_[index]) return;
-        if (tabBuilt_.value(index)) return;
+        if (tabBuilt_.size() <= index) tabBuilt_.resize(index + 1);
+        if (tabBuilt_[index]) return;
         tabBuilt_[index] = true;
-        if (tabFactories_[index]) replaceTabPlaceholder(index, tabFactories_[index]());
+        replaceTabPlaceholder(index, tabFactories_[index]());
     }
 
     void setTabFactory(int index, std::function<QWidget*()> factory) {
         if (index >= tabFactories_.size()) tabFactories_.resize(index + 1);
         tabFactories_[index] = std::move(factory);
+        if (tabBuilt_.size() <= index) tabBuilt_.resize(index + 1);
     }
 
     QStackedWidget* stack_ = nullptr;

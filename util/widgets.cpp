@@ -9,9 +9,11 @@
 #include <QEasingCurve>
 #include <QEvent>
 #include <QFile>
+#include <QFontMetrics>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -22,7 +24,9 @@
 #include <QRectF>
 #include <QScrollArea>
 #include <QShowEvent>
+#include <QSignalBlocker>
 #include <QSizePolicy>
+#include <QSpinBox>
 #include <QStyle>
 #include <QSurfaceFormat>
 #include <QTimer>
@@ -37,6 +41,7 @@
 #include <QtConcurrent>
 #include <QtGlobal>
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 
@@ -212,50 +217,62 @@ inline void configSet(const QString& key, const QVariant& value) {
 // ─────────────────────────────────────────────
 // QSS 片段：对应旧 theme.py 的 qss_* 辅助
 // ─────────────────────────────────────────────
+// 统一控件高度口径。Qt QSS 的 height/min-height 指「内容盒」，不含描边与竖向内边距；
+// 直接写 34px，1.5px 描边的按钮实际就是 37px：既比 1px 描边的输入框高，
+// 又会把固定高度外壳（如下拉框）的下边框顶出去裁掉。
+// 所以统一用本函数把「外形高」换算成内容高，组件要多高就是多高。
+inline constexpr int kControlH = 34;
+
+inline QString qssBoxHeight(int outerH, qreal borderPx, int vPaddingPx = 0) {
+    const int chrome = static_cast<int>(borderPx * 2.0 + 0.5) + vPaddingPx * 2;
+    const QString content = QString::number(std::max(0, outerH - chrome));
+    return QStringLiteral("height: %1px; min-height: %1px; max-height: %1px;").arg(content);
+}
+
 inline QString qssOutlined(int h = 36) {
     const ThemePalette& C = theme();
     return QStringLiteral(
         "QPushButton { background: %1; color: %2; border: 1.5px solid %2;"
         " border-radius: 8px; font-size: 13px; font-weight: 600;"
-        " min-height: %3px; padding: 0 16px; }"
+        " %3 padding: 0 16px; }"
         "QPushButton:hover { background: %4; border: 1.5px solid %2; }"
-    ).arg(C.card, C.activeLine, QString::number(h), C.hover);
+    ).arg(C.card, C.activeLine, qssBoxHeight(h, 1.5), C.hover);
 }
 
-// 与 qssLineEdit 同高同边框：并排输入框+按钮时用这个，避免 1.5px/min-height 把按钮撑高。
+// 与 qssLineEdit 同高同边框：并排输入框+按钮时用这个。
 inline QString qssOutlinedBesideEdit(int h = 36) {
     const ThemePalette& C = theme();
     return QStringLiteral(
         "QPushButton { background: %1; color: %2; border: 1px solid %2;"
         " border-radius: 6px; font-size: 13px; font-weight: 600;"
-        " height: %3px; max-height: %3px; min-height: %3px; padding: 0 14px; }"
+        " %3 padding: 0 14px; }"
         "QPushButton:hover { background: %4; border: 1px solid %2; }"
-    ).arg(C.card, C.activeLine, QString::number(h), C.hover);
+    ).arg(C.card, C.activeLine, qssBoxHeight(h, 1.0), C.hover);
 }
 
 inline QString qssDisabled(int h = 36) {
     const ThemePalette& C = theme();
     return QStringLiteral(
         "QPushButton { background: %1; color: %2; border: none; border-radius: 8px;"
-        " font-size: 13px; min-height: %3px; padding: 0 16px; }"
-    ).arg(C.border, C.textMuted, QString::number(h));
+        " font-size: 13px; %3 padding: 0 16px; }"
+    ).arg(C.border, C.textMuted, qssBoxHeight(h, 0.0));
 }
 
 inline QString qssSuccess(int h = 36) {
     const ThemePalette& C = theme();
     return QStringLiteral(
         "QPushButton { background: %1; color: #ffffff; border: none; border-radius: 8px;"
-        " font-size: 13px; font-weight: 600; min-height: %2px; padding: 0 16px; }"
-    ).arg(C.activeLine, QString::number(h));
+        " font-size: 13px; font-weight: 600; %2 padding: 0 16px; }"
+    ).arg(C.activeLine, qssBoxHeight(h, 0.0));
 }
 
 inline QString qssDanger(int h = 36) {
     const ThemePalette& C = theme();
     return QStringLiteral(
         "QPushButton { background: %1; color: #ffffff; border: none; border-radius: 8px;"
-        " font-size: 13px; font-weight: 600; min-height: %2px; padding: 0 16px; }"
+        " font-size: 13px; font-weight: 600; %2 padding: 0 16px; }"
         "QPushButton:hover { background: %3; }"
-    ).arg(C.closeHover, QString::number(h), C.active);
+    ).arg(C.closeHover, qssBoxHeight(h, 0.0), C.active);
 }
 
 inline QString qssBack() {
@@ -286,10 +303,9 @@ inline QString qssLineEdit() {
     const ThemePalette& C = theme();
     return QStringLiteral(
         "QLineEdit { background: %1; color: %2; border: 1px solid %3; border-radius: 6px;"
-        " padding: 0 10px; font-size: 13px;"
-        " height: 36px; max-height: 36px; min-height: 36px; }"
+        " padding: 0 10px; font-size: 13px; %5 }"
         "QLineEdit:focus { border-color: %4; }"
-    ).arg(C.card, C.text, C.border, C.activeLine);
+    ).arg(C.card, C.text, C.border, C.activeLine, qssBoxHeight(36, 1.0));
 }
 
 // 原生 QToolTip 在透明/无边框窗上易渲染成黑块，各窗 QSS 应统一带上。
@@ -384,29 +400,64 @@ inline QString shellQss() {
         + qssTooltip() + qssNativeButtonGuard();
 }
 
-// 旧 _danmu_spin_qss：自绘上下箭头的紧凑 QSpinBox。
+// 紧凑 QSpinBox：右侧窄条仅边框；箭头由 ThemedSpinBox 自绘置顶（QSS 三角在 Win 上常被 LineEdit 盖住）。
 inline QString spinBoxQss() {
     const ThemePalette& C = theme();
     return QStringLiteral(
         "QSpinBox { background: %1; color: %2; border: 1px solid %3; border-radius: 5px;"
-        " font-size: 12px; padding: 2px 4px; padding-right: 18px; min-height: 28px; }"
-        "QSpinBox QLineEdit { background: %1; color: %2; border: none; padding: 0 2px;"
-        " selection-background-color: %4; }"
-        "QSpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right;"
-        " background: %5; border: none; margin: 0; padding: 0; width: 16px; height: 14px;"
-        " border-top-right-radius: 4px; }"
-        "QSpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right;"
-        " background: %5; border: none; margin: 0; padding: 0; width: 16px; height: 14px;"
+        " font-size: 12px; padding: 0 16px 0 4px; %5 }"
+        "QSpinBox QLineEdit { background: transparent; color: %2; border: none; padding: 0 2px;"
+        " selection-background-color: %4; margin-right: 14px; }"
+        "QSpinBox::up-button, QSpinBox::down-button {"
+        " subcontrol-origin: border; width: 14px; background: transparent;"
+        " border: none; border-left: 1px solid %3; margin: 0; padding: 0; }"
+        "QSpinBox::up-button { subcontrol-position: top right;"
+        " border-top-right-radius: 4px; border-bottom: 1px solid %3; }"
+        "QSpinBox::down-button { subcontrol-position: bottom right;"
         " border-bottom-right-radius: 4px; }"
-        "QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: %6; }"
-        "QSpinBox::up-arrow { image: none; width: 0; height: 0;"
-        " border-left: 3px solid transparent; border-right: 3px solid transparent;"
-        " border-bottom: 4px solid %7; margin-bottom: 1px; }"
-        "QSpinBox::down-arrow { image: none; width: 0; height: 0;"
-        " border-left: 3px solid transparent; border-right: 3px solid transparent;"
-        " border-top: 4px solid %7; margin-top: 1px; }"
-    ).arg(C.card, C.text, C.border, C.activeLine, C.hover, C.active, C.textMuted);
+        "QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: transparent; }"
+        "QSpinBox::up-arrow, QSpinBox::down-arrow { width: 0; height: 0; image: none; border: none; }"
+    ).arg(C.card, C.text, C.border, C.activeLine, qssBoxHeight(kControlH, 1.0));
 }
+
+// 自绘上下三角并画在最上层，避免被内部 QLineEdit 空白盖住。
+class ThemedSpinBox final : public QSpinBox {
+public:
+    explicit ThemedSpinBox(QWidget* parent = nullptr) : QSpinBox(parent) {
+        setButtonSymbols(QAbstractSpinBox::UpDownArrows);
+        setAlignment(Qt::AlignCenter);
+    }
+
+protected:
+    void paintEvent(QPaintEvent* event) override {
+        QSpinBox::paintEvent(event);
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        const int bw = 14;
+        const QRect up(width() - bw, 1, bw - 1, height() / 2 - 1);
+        const QRect down(width() - bw, height() / 2, bw - 1, height() / 2 - 2);
+        const QColor arrow = QColor(theme().textMuted);
+        auto drawTri = [&](const QRect& r, bool upDir) {
+            if (r.width() < 5 || r.height() < 5) return;
+            const qreal cx = r.center().x();
+            const qreal cy = r.center().y();
+            QPainterPath path;
+            if (upDir) {
+                path.moveTo(cx, cy - 2.2);
+                path.lineTo(cx + 3.2, cy + 1.6);
+                path.lineTo(cx - 3.2, cy + 1.6);
+            } else {
+                path.moveTo(cx, cy + 2.2);
+                path.lineTo(cx + 3.2, cy - 1.6);
+                path.lineTo(cx - 3.2, cy - 1.6);
+            }
+            path.closeSubpath();
+            p.fillPath(path, arrow);
+        };
+        drawTri(up, true);
+        drawTri(down, false);
+    }
+};
 
 // 工具窗 QSS：旧 memo/danmu/overtime 设置窗共用的一套。
 inline QString toolQss() {
@@ -417,16 +468,23 @@ inline QString toolQss() {
         " font-size: 13px; }"
         "#ToolRoot { background: %2; }"
         "#TopBar { background: %3; border-bottom: 1px solid %4; }"
-        "#TabBtn { background: transparent; border: none; border-bottom: 2px solid transparent;"
-        " padding: 0 16px; color: %5; font-size: 13px; }"
-        "#TabBtn:hover { background: %6; }"
-        "#TabBtn[active=\"true\"] { color: %1; font-weight: 600;"
-        " border-bottom: 2px solid %7; }"
-        "#Card { background: %8; border-radius: 10px; border: 1px solid %4; }"
+        "#Card { background: %8; border-radius: 10px; border: 1px solid %4; padding: 1px; }"
+        "#LeafRuleRow { background: %8; border: 1px solid %4; border-radius: 8px; padding: 2px; }"
         "#SectionTitle { font-size: 13px; font-weight: 600; color: %5; background: transparent; }"
+        "#CardTitle { font-size: 13px; font-weight: 600; color: %5; background: transparent; }"
         "#ToolPageTitle { font-size: 20px; font-weight: 600; color: %1; background: transparent; }"
         "#ToolTip { font-size: 12px; color: %5; background: transparent; }"
         "QLabel { background: transparent; }"
+        "QPushButton { background: %8; color: %1; border: 1.5px solid %7; border-radius: 8px;"
+        " font-size: 13px; font-weight: 600; min-height: 31px; padding: 0 12px; }"
+        "QPushButton:hover { background: %6; }"
+        "QPushButton:disabled { color: %5; border-color: %4; }"
+        "#TabBtn { background: transparent; border: none; border-bottom: 2px solid transparent;"
+        " border-radius: 0; padding: 0 16px; color: %5; font-size: 13px;"
+        " font-weight: 400; min-height: 0; }"
+        "#TabBtn:hover { background: %6; border: none; border-bottom: 2px solid transparent; }"
+        "#TabBtn[active=\"true\"] { color: %1; font-weight: 600;"
+        " border: none; border-bottom: 2px solid %7; }"
         "QLineEdit { background: %8; color: %1; border: 1px solid %4; border-radius: 6px;"
         " padding: 0 10px; font-size: 13px; }"
         "QLineEdit:focus { border-color: %7; }"
@@ -509,15 +567,35 @@ inline StepCard stepCard(int num, const QString& titleText) {
 // ─────────────────────────────────────────────
 class DropPopup final : public QFrame {
 public:
-    DropPopup() : QFrame(nullptr, Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint) {
+    // 置顶：悬浮窗（捡叶子/加班机等）是 StaysOnTop 窗口，
+    // 普通 Popup 会被它压住，看起来就是下拉被挡掉一块。
+    DropPopup() : QFrame(nullptr, Qt::Popup | Qt::FramelessWindowHint
+                                      | Qt::NoDropShadowWindowHint
+                                      | Qt::WindowStaysOnTopHint) {
         setAttribute(Qt::WA_TranslucentBackground);
-        lay_ = new QVBoxLayout(this);
-        lay_->setContentsMargins(4, 4, 4, 4);
-        lay_->setSpacing(2);
+        auto* outer = new QVBoxLayout(this);
+        outer->setContentsMargins(kPad, kPad, kPad, kPad);
+        outer->setSpacing(0);
+
+        scroll_ = new QScrollArea(this);
+        scroll_->setWidgetResizable(true);
+        scroll_->setFrameShape(QFrame::NoFrame);
+        scroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        scroll_->viewport()->setAutoFillBackground(false);
+        outer->addWidget(scroll_);
+
+        host_ = new QWidget(scroll_);
+        host_->setAttribute(Qt::WA_TranslucentBackground);
+        lay_ = new QVBoxLayout(host_);
+        lay_->setContentsMargins(0, 0, 0, 0);
+        lay_->setSpacing(kItemGap);
+        scroll_->setWidget(host_);
     }
 
+    // maxHeight：可用空间上限，超出则内部滚动，绝不越过屏幕边界。
     void setItems(const QStringList& items, const QString& current,
-                  const std::function<void(const QString&)>& onSelect, int width) {
+                  const std::function<void(const QString&)>& onSelect, int width,
+                  int maxHeight) {
         while (QLayoutItem* item = lay_->takeAt(0)) {
             if (QWidget* w = item->widget()) w->deleteLater();
             delete item;
@@ -529,26 +607,35 @@ public:
             if (t != current) ordered << t;
         }
         for (const QString& text : ordered) {
-            auto* btn = new QPushButton(text, this);
+            auto* btn = new QPushButton(text, host_);
             btn->setFlat(true);
             btn->setCursor(Qt::PointingHandCursor);
             suppressButtonFocus(btn);
             const bool isCurrent = (text == current);
             btn->setStyleSheet(QStringLiteral(
                 "QPushButton { background: transparent; color: %1; border: none;"
-                " border-radius: 5px; text-align: left; padding: 0 10px; height: 34px;"
+                " border-radius: 5px; text-align: left; padding: 0 10px;"
                 " font-weight: %2; }"
                 "QPushButton:hover { background: %3; }"
             ).arg(C.text, isCurrent ? QStringLiteral("600") : QStringLiteral("400"), C.hover));
+            btn->setFixedHeight(kItemH);
             QObject::connect(btn, &QPushButton::clicked, this, [this, text, onSelect]() {
                 hide();
                 if (onSelect) onSelect(text);
             });
             lay_->addWidget(btn);
         }
-        adjustSize();
-        setFixedWidth(width);
-        setStyleSheet(popupChromeQss());
+        const int count = std::max(1, static_cast<int>(ordered.size()));
+        const int content = count * kItemH + (count - 1) * kItemGap;
+        const int room = std::max(kItemH, maxHeight - 2 * kPad);
+        setFixedSize(width, std::min(content, room) + 2 * kPad);
+        setStyleSheet(popupChromeQss() + QStringLiteral(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:vertical { background: transparent; width: 4px; }"
+            "QScrollBar::handle:vertical { background: %1; border-radius: 2px;"
+            " min-height: 20px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        ).arg(C.border));
     }
 
 protected:
@@ -573,7 +660,12 @@ protected:
 private:
     static constexpr int kRadius = 8;
     static constexpr int kBorder = 2;
+    static constexpr int kPad = 4;
+    static constexpr int kItemGap = 2;
+    static constexpr int kItemH = 34;  // 与普通按钮同高
     QVBoxLayout* lay_ = nullptr;
+    QScrollArea* scroll_ = nullptr;
+    QWidget* host_ = nullptr;
 };
 
 class ThemedComboBox final : public QWidget {
@@ -587,6 +679,7 @@ public:
         auto* lay = new QHBoxLayout(this);
         lay->setContentsMargins(0, 0, 0, 0);
         lay->addWidget(btn_);
+        setFixedHeight(34);  // 默认与普通按钮同高，调用方可再覆盖
 
         refreshTheme();
         onThemeChange(this, [this](const QString&) { refreshTheme(); });
@@ -633,9 +726,11 @@ public:
     void setFixedSize(int w, int h) {
         btn_->setFixedSize(w, h);
         QWidget::setFixedSize(w, h);
+        btn_->setMaximumHeight(h);
+        btn_->setMinimumHeight(h);
     }
 
-    // 旧 overtime._SettingsCombo：细边框、11px、内边距收紧。
+    // 工具窗厚描边：对齐选择礼物等 1.5px / 13px 按钮。
     void setCompact(bool compact) {
         compact_ = compact;
         refreshTheme();
@@ -643,23 +738,29 @@ public:
 
     void refreshTheme() {
         const ThemePalette& C = theme();
+        // min-height 必须显式清零：工具窗 QSS 的 QPushButton{min-height:34px}
+        // 会级联到这里，加上 1.5px 描边后按钮比外壳高 3px，下边框被裁掉。
         if (compact_) {
             btn_->setStyleSheet(QStringLiteral(
                 "QPushButton { background: %1; color: %2; border: 1px solid %3;"
-                " border-radius: 4px; text-align: left; padding: 0 6px; font-size: 11px; }"
+                " border-radius: 4px; text-align: left; padding: 0 6px; font-size: 11px;"
+                " min-height: 0px; }"
                 "QPushButton:hover { border-color: %3; background: %4; }"
             ).arg(C.card, C.text, C.activeLine, C.hover));
             return;
         }
         btn_->setStyleSheet(QStringLiteral(
-            "QPushButton { background: %1; color: %2; border: 2px solid %3;"
-            " border-radius: 6px; text-align: left; padding: 0 10px; font-size: 13px; }"
+            "QPushButton { background: %1; color: %2; border: 1.5px solid %3;"
+            " border-radius: 8px; text-align: left; padding: 0 8px;"
+            " font-size: 13px; font-weight: 600; min-height: 0px; }"
             "QPushButton:hover { border-color: %3; background: %4; }"
         ).arg(C.card, C.text, C.activeLine, C.hover));
     }
 
 private:
     static constexpr int kOvershoot = 2;
+    static constexpr int kGap = 2;
+    static constexpr int kMinPopupH = 120;
 
     void setCurrent(const QString& text, bool emitChange) {
         const QString old = current_;
@@ -676,9 +777,34 @@ private:
         if (!lazyLoaded_ && lazyLoader_) {
             addItems(lazyLoader_());
         }
+        QScreen* screen = QGuiApplication::screenAt(mapToGlobal(rect().center()));
+        if (!screen) screen = QGuiApplication::primaryScreen();
+        const QRect avail = screen ? screen->availableGeometry() : QRect();
+
+        const QPoint topLeft = mapToGlobal(QPoint(0, 0));
+        const int belowY = topLeft.y() + height() + kGap;
+        const int spaceBelow = avail.isValid() ? avail.bottom() + 1 - belowY : 0;
+        const int spaceAbove = avail.isValid() ? topLeft.y() - kGap - avail.top() : 0;
+        const int maxHeight =
+            avail.isValid() ? std::max(kMinPopupH, std::max(spaceBelow, spaceAbove)) : 400;
+
         popup_->setItems(items_, current_, [this](const QString& t) { setCurrent(t, true); },
-                         width() + kOvershoot * 2);
-        popup_->move(mapToGlobal(QPoint(-kOvershoot, -kOvershoot)));
+                         width() + kOvershoot * 2, maxHeight);
+
+        // 默认贴着控件下方展开，不覆盖控件；下方放不下才整体翻到上方。
+        const int popupH = popup_->height();
+        int x = topLeft.x() - kOvershoot;
+        int y = belowY;
+        if (avail.isValid()) {
+            if (popupH > spaceBelow && popupH <= spaceAbove) {
+                y = topLeft.y() - kGap - popupH;
+            }
+            y = std::clamp(y, avail.top(),
+                           std::max(avail.top(), avail.bottom() + 1 - popupH));
+            x = std::clamp(x, avail.left(),
+                           std::max(avail.left(), avail.right() + 1 - popup_->width()));
+        }
+        popup_->move(x, y);
         popup_->show();
     }
 
@@ -1450,6 +1576,76 @@ inline void readJsonAsync(const QString& path, QObject* context,
                                                                          : QJsonObject{};
     }));
 }
+
+// 非负整数输入：失焦 clamp。加班机 / 捡叶子等工具共用。
+inline QString sanitizeDigits(const QString& text, int maxVal, int width = 3) {
+    QString digits;
+    for (const QChar& c : text) {
+        if (c.isDigit()) digits.append(c);
+    }
+    if (digits.isEmpty()) digits = QStringLiteral("0");
+    bool ok = false;
+    int n = digits.toInt(&ok);
+    if (!ok) n = 0;
+    n = std::clamp(n, 0, maxVal);
+    Q_UNUSED(width);
+    return QString::number(n);
+}
+
+class IntField final : public QLineEdit {
+public:
+    IntField(int maxVal, int charW, int height = 24, int minWidth = -1,
+             QWidget* parent = nullptr)
+        : QLineEdit(parent), max_(maxVal) {
+        const QFontMetrics fm(QFont(QStringLiteral("Microsoft YaHei"), 11));
+        int w = fm.horizontalAdvance(QString(charW, QLatin1Char('8'))) + 16;
+        if (minWidth > 0) w = std::max(w, minWidth);
+        else if (charW >= 3) w = std::max(w, 42);
+        else w = std::max(w, 36);
+        setFixedSize(w, height);
+        setAlignment(Qt::AlignCenter);
+        setText(QStringLiteral("0"));
+        QObject::connect(this, &QLineEdit::textChanged, this, [this](const QString& text) {
+            QString cleaned;
+            for (const QChar& c : text) {
+                if (c.isDigit()) cleaned.append(c);
+            }
+            if (cleaned != text) {
+                const QSignalBlocker blocker(this);
+                setText(cleaned.isEmpty() ? QStringLiteral("0") : cleaned);
+            }
+        });
+        QObject::connect(this, &QLineEdit::editingFinished, this, [this]() {
+            const QSignalBlocker blocker(this);
+            setText(sanitizeDigits(text(), max_));
+            if (onCommit_) onCommit_();
+        });
+    }
+
+    void setOnCommit(std::function<void()> cb) { onCommit_ = std::move(cb); }
+    int value() const { return sanitizeDigits(text(), max_).toInt(); }
+    void setValue(int n) { setText(sanitizeDigits(QString::number(n), max_)); }
+
+private:
+    int max_;
+    std::function<void()> onCommit_;
+};
+
+inline QLabel* formLabel(const QString& text, QWidget* parent = nullptr, int width = 108) {
+    auto* lb = new QLabel(text, parent);
+    lb->setFixedWidth(width);
+    lb->setAlignment(Qt::AlignVCenter | Qt::AlignLeft);
+    lb->setStyleSheet(QStringLiteral("background: transparent;"));
+    return lb;
+}
+
+// tools / pages 可写入的应用根路径，供礼物控件解析资源。
+inline QString& toolAppRoot() {
+    static QString root;
+    return root;
+}
+
+inline void setToolAppRoot(const QString& root) { toolAppRoot() = root; }
 
 }  // namespace liveaio::util
 

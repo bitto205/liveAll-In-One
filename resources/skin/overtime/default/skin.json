@@ -19,10 +19,10 @@
           "max_px": 32
         },
         "timer": {
-          "pixel_size": 56,
+          "pixel_size": 76,
           "align": "center",
           "bold": true,
-          "max_px": 96
+          "max_px": 140
         },
         "gift_name": {
           "pixel_size": 13,

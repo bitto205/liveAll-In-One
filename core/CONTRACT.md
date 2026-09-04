@@ -51,6 +51,7 @@ LiveAIO.exe                 C++ 薄宿主：LoadLibrary 各模块
 | `frame.push` | 线路 2/3/4（或同进程回调等价） | `payload_b64` → Go 解析 → `message` + 工具事件 |
 | `message.ingest` | 线路 1（已解析） | **只**跑工具业务，**不** echo `message` |
 | `tool.overtime.set` / `cmd` / `sim_gift` | OvertimeTool | 规则 / 控制 / 模拟送礼 |
+| `tool.leaf.set` / `sim_gift` | LeafTool | 礼物→叶子规则 / 模拟送礼 |
 | `tool.danmu.set` | DanmuTool | 过滤开关 |
 | `tool.memo.set` | MemoTool | 过滤开关 |
 | `config.set` / `config.get` | pages/tools | 统一读写 config |
@@ -82,6 +83,7 @@ LiveAIO.exe                 C++ 薄宿主：LoadLibrary 各模块
 | `ledger` | OvertimeTool | 用户台账 |
 | `danmu.show` | DanmuTool | 已过滤条目 |
 | `memo.item` | MemoTool | 已过滤条目 |
+| `leaf.spawn` | LeafTool | 礼物匹配后的叶子增减（`count` 可为负） |
 
 `ui.focus`（`OpFocusUI`）：托盘「打开界面」或第二次启动时由 hub 广播；已运行的 Pages 抬起既有窗口。
 第二个进程只发 `ui.command` `ui.show` 然后退出，绝不自己加载 Pages。
